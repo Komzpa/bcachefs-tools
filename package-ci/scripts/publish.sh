@@ -145,4 +145,43 @@ done
 echo "--- Syncing staging to live ---"
 rsync -rlpt --delay-updates "$STAGING_ROOT/" "$PUBLISH_ROOT/"
 
+# --- Prune old snapshots --------------------------------------------------
+# Every publish creates a new timestamped snapshot (<distro>-<suite>-<date>);
+# the old ones keep their packages pinned in the pool, so `aptly db cleanup`
+# can reclaim nothing until they're dropped. Keep the most recent
+# KEEP_SNAPSHOTS per <distro>-<suite>, then run a cleanup pass. Best-effort:
+# a prune failure must not fail an otherwise-good publish.
+KEEP_SNAPSHOTS="${KEEP_SNAPSHOTS:-20}"
+set +e
+
+echo "--- Pruning snapshots (keeping $KEEP_SNAPSHOTS per repo) ---"
+aptly snapshot list -raw | sort | awk -v keep="$KEEP_SNAPSHOTS" '
+    {
+        n = split($0, f, "-")
+        if (f[n] ~ /^[0-9]+$/ && length(f[n]) == 14) {
+            prefix = substr($0, 1, length($0) - 15)
+            group[prefix] = group[prefix] $0 "\n"
+            count[prefix]++
+        }
+    }
+    END {
+        for (p in group) {
+            if (count[p] <= keep)
+                continue
+            split(group[p], a, "\n")          # oldest -> newest (input sorted)
+            for (i = 1; i <= count[p] - keep; i++)
+                print a[i]
+        }
+    }
+' | while read -r snap; do
+    [ -n "$snap" ] || continue
+    echo "  dropping $snap"
+    aptly snapshot drop "$snap" </dev/null || echo "  WARN: could not drop $snap"
+done
+
+echo "--- aptly db cleanup ---"
+aptly db cleanup </dev/null || echo "  WARN: aptly db cleanup failed"
+
+set -e
+
 echo "=== Publish complete: $SHORT ==="
