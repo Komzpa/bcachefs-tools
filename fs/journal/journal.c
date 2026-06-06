@@ -276,7 +276,7 @@ void bch2_journal_buf_put_final(struct journal *j, u64 seq)
 /*
  * Close the currently-open journal entry. No recursion — callers that want
  * the close-then-maybe-open behavior of the prior __journal_entry_close go
- * through bch2_journal_cycle() instead.
+ * through bch2_journal_cycle_locked() instead.
  */
 static void __journal_entry_close_one(struct journal *j, unsigned closed_val, bool trace)
 {
@@ -579,27 +579,36 @@ static inline bool journal_has_flush_waiters(struct journal *j)
  *
  * Returns: error from open if open was attempted and failed, else 0.
  */
-int bch2_journal_cycle(struct journal *j, bool need_fresh)
+int bch2_journal_cycle_locked(struct journal *j, enum journal_cycle_flags flags)
 {
 	lockdep_assert_held(&j->pin_resize_lock);
 	lockdep_assert_held(&j->lock);
 
 	while (1) {
-		if (!need_fresh &&
-		    !journal_has_flush_waiters(j) &&
-		    fifo_used(&j->in_flight) > 1)
+		if (!flags &&
+		    !(journal_has_flush_waiters(j) &&
+		      fifo_used(&j->in_flight) <= 1))
 			return 0;
 
 		__journal_entry_close_one(j, JOURNAL_ENTRY_CLOSED_VAL, true);
 
-		if (!need_fresh &&
+		flags &= ~JOURNAL_CYCLE_must_close;
+
+		if (!flags &&
 		    !journal_has_flush_waiters(j))
 			return 0;
 
 		try(__journal_entry_open_one(j));
 
-		need_fresh = false;
+		flags &= ~JOURNAL_CYCLE_must_open;
 	}
+}
+
+void bch2_journal_cycle(struct journal *j, enum journal_cycle_flags flags)
+{
+	guard(percpu_read)(&j->pin_resize_lock);
+	guard(spinlock)(&j->lock);
+	bch2_journal_cycle_locked(j, flags);
 }
 
 void bch2_journal_halt_locked(struct journal *j)
@@ -628,13 +637,6 @@ void bch2_journal_halt(struct journal *j)
 	bch2_journal_halt_locked(j);
 }
 
-void bch2_journal_entry_close(struct journal *j)
-{
-	guard(percpu_read)(&j->pin_resize_lock);
-	guard(spinlock)(&j->lock);
-	bch2_journal_cycle(j, false);
-}
-
 static bool journal_quiesced(struct journal *j)
 {
 	guard(percpu_read)(&j->pin_resize_lock);
@@ -642,7 +644,7 @@ static bool journal_quiesced(struct journal *j)
 	bool ret = atomic64_read(&j->seq) == j->seq_ondisk;
 
 	if (!ret)
-		bch2_journal_cycle(j, false);
+		bch2_journal_cycle_locked(j, JOURNAL_CYCLE_must_close);
 	return ret;
 }
 
@@ -796,7 +798,8 @@ retry:
 	    buf->buf_size < JOURNAL_ENTRY_SIZE_MAX)
 		j->buf_size_want = max(j->buf_size_want, buf->buf_size << 1);
 
-	ret = bch2_journal_cycle(j, true) ?: -BCH_ERR_journal_retry_open;
+	ret = bch2_journal_cycle_locked(j, JOURNAL_CYCLE_must_open) ?:
+		-BCH_ERR_journal_retry_open;
 unlock:
 	spin_unlock(&j->lock);
 	percpu_up_read(&j->pin_resize_lock);
@@ -948,7 +951,7 @@ void bch2_journal_entry_res_resize(struct journal *j,
 		/*
 		 * Not enough room in current journal entry, have to flush it:
 		 */
-		bch2_journal_cycle(j, false);
+		bch2_journal_cycle_locked(j, JOURNAL_CYCLE_must_close);
 	} else {
 		journal_cur_buf(j)->u64s_reserved += d;
 	}
@@ -1022,7 +1025,7 @@ __bch2_journal_flush_seq_async(struct journal *j, u64 seq, struct closure *cl)
 	smp_mb();
 
 	if (fifo_used(&j->in_flight) <= 1)
-		bch2_journal_entry_close(j);
+		bch2_journal_cycle(j, 0);
 
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	event_inc_trace(c, journal_flush, buf, prt_printf(&buf, "seq %llu", seq));
