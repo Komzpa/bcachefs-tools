@@ -669,16 +669,18 @@ void bch2_journal_quiesce(struct journal *j)
  */
 static bool journal_shutdown_quiesced(struct journal *j)
 {
-	guard(percpu_read)(&j->pin_resize_lock);
-	guard(spinlock)(&j->lock);
-	u64 seq = atomic64_read(&j->seq);
-	bool ret = (bch2_journal_error(j)
-		    ? seq == j->seq_ondisk
-		    : seq == j->flushed_seq_ondisk) &&
-		!j->flush_wait.list.first;
+	bool ret;
+
+	scoped_guard(spinlock, &j->lock) {
+		u64 seq = atomic64_read(&j->seq);
+		ret = (bch2_journal_error(j)
+		       ? seq == j->seq_ondisk
+		       : seq == j->flushed_seq_ondisk) &&
+			!j->flush_wait.list.first;
+	}
 
 	if (!ret)
-		bch2_journal_cycle(j, false);
+		bch2_journal_flush_async(j, NULL);
 	return ret;
 }
 
