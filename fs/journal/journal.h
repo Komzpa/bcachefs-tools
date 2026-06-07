@@ -491,7 +491,7 @@ void bch2_journal_entry_res_resize(struct journal *,
 				   struct journal_entry_res *,
 				   unsigned);
 
-void __bch2_journal_flush_seq_async(struct journal *, u64, struct closure *);
+struct closure_waitlist *__bch2_journal_flush_seq_async(struct journal *, u64, struct closure *);
 int bch2_journal_flush_seq_async(struct journal *, u64, struct closure *);
 void bch2_journal_flush_async(struct journal *, struct closure *);
 
@@ -506,9 +506,6 @@ int bch2_journal_flush(struct journal *);
 void bch2_journal_advance_rewind_seq(struct journal *, u64);
 int bch2_journal_add_rewind_range(struct bch_fs *, u64, u64);
 bool bch2_journal_noflush_seq(struct journal *, u64, u64);
-
-int __bch2_journal_meta(struct journal *);
-int bch2_journal_meta(struct journal *);
 
 void bch2_journal_halt_locked(struct journal *);
 void bch2_journal_halt(struct journal *);

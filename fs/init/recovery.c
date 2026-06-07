@@ -499,7 +499,7 @@ int bch2_journal_replay(struct bch_fs *c)
 	/* if we did any repair, flush it immediately */
 	if (immediate_flush) {
 		bch2_journal_flush_outstanding_pins(&c->journal);
-		ret = bch2_journal_meta(&c->journal);
+		bch2_journal_flush_async(&c->journal, NULL);
 	}
 
 	if (keys->nr)
@@ -888,7 +888,7 @@ use_clean:
 
 	if (errors_fixed) {
 		bch2_journal_flush_outstanding_pins(&c->journal);
-		bch2_journal_meta(&c->journal);
+		bch2_journal_flush_async(&c->journal, NULL);
 	}
 
 	/* If we fixed errors, verify that fs is actually clean now: */

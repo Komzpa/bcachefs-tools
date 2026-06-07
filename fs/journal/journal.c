@@ -370,8 +370,6 @@ static void __journal_entry_close_one(struct journal *j, unsigned closed_val, bo
 	buf->data->last_seq	= cpu_to_le64(buf->last_seq);
 	BUG_ON(buf->last_seq > le64_to_cpu(buf->data->seq));
 
-	cancel_delayed_work(&j->write_work);
-
 	/*
 	 * bch2_journal_halt may or may not be called with pin_resize_lock held,
 	 * and we don't have a recursive version of this lock.
@@ -1001,20 +999,25 @@ static bool journal_buf_wait(struct journal_buf *buf, struct closure *cl)
 	return true;
 }
 
-void __bch2_journal_flush_seq_async(struct journal *j, u64 seq, struct closure *cl)
+struct closure_waitlist *
+__bch2_journal_flush_seq_async(struct journal *j, u64 seq, struct closure *cl)
 {
 	BUG_ON(atomic_read(&cl->remaining) & CLOSURE_WAITING);
 
-	bool found = false;
+	struct closure_waitlist *wait = NULL;
 
-	for (; seq <= journal_cur_seq(j); seq++)
-		if (journal_buf_wait(&fifo_entry(&j->in_flight, seq), cl)) {
-			found = true;
+	for (; seq <= journal_cur_seq(j); seq++) {
+		struct journal_buf *buf = &fifo_entry(&j->in_flight, seq);
+		if (journal_buf_wait(buf, cl)) {
+			wait = &buf->wait;
 			break;
 		}
+	}
 
-	if (!found)
-		BUG_ON(!closure_wait(&j->flush_wait, cl));
+	if (!wait) {
+		wait = &j->flush_wait;
+		BUG_ON(!closure_wait(wait, cl));
+	}
 
 	smp_mb();
 
@@ -1023,6 +1026,7 @@ void __bch2_journal_flush_seq_async(struct journal *j, u64 seq, struct closure *
 
 	struct bch_fs *c = container_of(j, struct bch_fs, journal);
 	event_inc_trace(c, journal_flush, buf, prt_printf(&buf, "seq %llu", seq));
+	return wait;
 }
 
 /**
@@ -1060,8 +1064,18 @@ int bch2_journal_flush_seq_async(struct journal *j, u64 seq, struct closure *cl)
 	if (j->err_seq && seq > j->flushed_seq_ondisk)
 		return bch_err_throw(c, journal_flush_err);
 
-	__bch2_journal_flush_seq_async(j, seq, cl);
-	return 0;
+	struct closure_waitlist *wait = __bch2_journal_flush_seq_async(j, seq, cl);
+
+	/*
+	 * Memory barrier between wait and checking for journal error is in
+	 * __bch2_journal_flush_seq_async(); bch2_journal_res_flush() doesn't
+	 * require this check because it has a journal res
+	 */
+
+	int ret = bch2_journal_error(j);
+	if (unlikely(ret))
+		closure_wake_up(wait);
+	return ret;
 }
 
 int bch2_journal_flush_seq(struct journal *j, u64 seq, unsigned task_state)
@@ -1171,32 +1185,6 @@ int bch2_journal_add_rewind_range(struct bch_fs *c, u64 from, u64 to)
 	j->early_journal_entries.nr += jset_u64s(u64s);
 
 	return 0;
-}
-
-int __bch2_journal_meta(struct journal *j)
-{
-	CLASS(closure_stack, cl)();
-
-	struct journal_res res = {};
-	try(bch2_journal_res_get(j, &res, jset_u64s(0), 0, NULL));
-	bch2_journal_res_flush(j, &res, &cl);
-	bch2_journal_res_put(j, &res);
-
-	closure_sync(&cl);
-
-	return bch2_journal_error(j);
-}
-
-int bch2_journal_meta(struct journal *j)
-{
-	struct bch_fs *c = container_of(j, struct bch_fs, journal);
-
-	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_journal))
-		return bch_err_throw(c, erofs_no_writes);
-
-	int ret = __bch2_journal_meta(j);
-	enumerated_ref_put(&c->writes, BCH_WRITE_REF_journal);
-	return ret;
 }
 
 /* block/unlock the journal: */

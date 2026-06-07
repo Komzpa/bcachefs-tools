@@ -2099,12 +2099,17 @@ static int bch2_sync_fs(struct super_block *sb, int wait)
 	u64 start = ktime_get_ns();
 	int ret = 0;
 
+	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_journal))
+		return bch_err_throw(c, erofs_no_writes);
+
 	if (c->opts.journal_flush_disabled)
 		;
 	else if (!wait)
 		bch2_journal_flush_async(&c->journal, NULL);
 	else
 		ret = bch2_journal_flush(&c->journal);
+
+	enumerated_ref_put(&c->writes, BCH_WRITE_REF_journal);
 
 	event_inc_trace(c, sync_fs, buf, ({
 		prt_printf(&buf, "journal_flush_disabled: %u\n", c->opts.journal_flush_disabled);

@@ -430,12 +430,6 @@ void bch2_fs_journal_stop(struct journal *j)
 #endif
 	bch2_journal_flush_all_pins(j);
 
-	/*
-	 * Always write a new journal entry, to make sure the clock hands are up
-	 * to date (and match the superblock)
-	 */
-	__bch2_journal_meta(j);
-
 	bch2_journal_shutdown_quiesce(j);
 	cancel_delayed_work_sync(&j->write_work);
 
