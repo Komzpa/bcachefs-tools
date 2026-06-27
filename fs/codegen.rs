@@ -749,7 +749,8 @@ fn parent(p: &str) -> String {
 }
 
 fn pkg_config_includes(lib: &str) -> Vec<String> {
-    let o = Command::new("pkg-config").args(["--cflags-only-I", lib]).output().expect("run pkg-config");
+    let pkg_config = std::env::var_os("PKG_CONFIG").unwrap_or_else(|| "pkg-config".into());
+    let o = Command::new(pkg_config).args(["--cflags-only-I", lib]).output().expect("run pkg-config");
     String::from_utf8_lossy(&o.stdout).split_whitespace().map(String::from).collect()
 }
 
