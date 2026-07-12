@@ -325,6 +325,9 @@ struct bch_data_ctx {
 	struct bch_move_stats		stats;
 };
 
+/* Wire value consumed by scrub userspace; kept local until the ioctl ABI grows it. */
+#define BCH_IOCTL_DATA_EVENT_RET_error ((enum bch_ioctl_data_event_ret) 3)
+
 static int bch2_data_thread(void *arg)
 {
 	struct bch_data_ctx *ctx = container_of(arg, struct bch_data_ctx, thr);
@@ -332,6 +335,8 @@ static int bch2_data_thread(void *arg)
 	ctx->thr.ret = bch2_data_job(ctx->c, &ctx->stats, &ctx->arg);
 	if (ctx->thr.ret == -BCH_ERR_device_offline)
 		ctx->stats.ret = BCH_IOCTL_DATA_EVENT_RET_device_offline;
+	else if (ctx->thr.ret)
+		ctx->stats.ret = BCH_IOCTL_DATA_EVENT_RET_error;
 	else {
 		ctx->stats.ret = BCH_IOCTL_DATA_EVENT_RET_done;
 		ctx->stats.data_type = (int) DATA_PROGRESS_DATA_TYPE_done;
@@ -357,13 +362,20 @@ static ssize_t bch2_data_job_read(struct file *file, char __user *buf,
 	struct bch_ioctl_data_event e = {
 		.type				= BCH_DATA_EVENT_PROGRESS,
 		.ret				= ctx->stats.ret,
-		.p.data_type			= ctx->stats.data_type,
-		.p.btree_id			= ctx->stats.pos.btree,
-		.p.pos				= ctx->stats.pos.pos,
 		.p.sectors_done			= atomic64_read(&ctx->stats.sectors_seen),
 		.p.sectors_error_corrected	= atomic64_read(&ctx->stats.sectors_error_corrected),
 		.p.sectors_error_uncorrected	= atomic64_read(&ctx->stats.sectors_error_uncorrected),
 	};
+
+	if (ctx->stats.phys) {
+		e.p.data_type	= DATA_PROGRESS_DATA_TYPE_phys;
+		e.p.btree_id	= 0;
+		e.p.pos		= POS(ctx->stats.dev, READ_ONCE(ctx->stats.offset));
+	} else {
+		e.p.data_type	= ctx->stats.data_type;
+		e.p.btree_id	= ctx->stats.pos.btree;
+		e.p.pos		= ctx->stats.pos.pos;
+	}
 
 	if (ctx->arg.op == BCH_DATA_OP_scrub) {
 		CLASS(bch2_dev_tryget_noerror, ca)(c, ctx->arg.scrub.dev);

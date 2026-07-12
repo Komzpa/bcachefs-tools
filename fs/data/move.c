@@ -770,7 +770,8 @@ int bch2_move_data_phys(struct bch_fs *c,
 
 	if (ctxt.stats) {
 		ctxt.stats->phys = true;
-		ctxt.stats->data_type = (int) DATA_PROGRESS_DATA_TYPE_phys;
+		ctxt.stats->dev = dev;
+		ctxt.stats->offset = start;
 	}
 
 	bch2_btree_write_buffer_flush_sync(ctxt.trans);
@@ -1184,11 +1185,42 @@ int bch2_scrub_journal_do_repairs(struct bch_fs *c)
 	return 0;
 }
 
+/* The userspace static library needs this test seam without exposing an ABI. */
+#ifdef NO_BCACHEFS_CHARDEV
+#define BCH2_SCRUB_VALIDATE_RANGE_LINKAGE __attribute__((visibility("hidden")))
+#else
+#define BCH2_SCRUB_VALIDATE_RANGE_LINKAGE static
+#endif
+BCH2_SCRUB_VALIDATE_RANGE_LINKAGE int
+bch2_scrub_validate_range(u64 nr_buckets, u64 bucket_size,
+			  u64 sector_start, u64 *sector_end,
+			  unsigned extent_bp_shift)
+{
+	u64 dev_sectors, bp_sector;
+
+	if (check_mul_overflow(nr_buckets, bucket_size, &dev_sectors) ||
+	    !dev_sectors)
+		return -ERANGE;
+
+	*sector_end = *sector_end ?: dev_sectors;
+
+	if (sector_start >= dev_sectors ||
+	    *sector_end <= sector_start ||
+	    *sector_end > dev_sectors ||
+	    check_shl_overflow(sector_start, extent_bp_shift, &bp_sector) ||
+	    check_shl_overflow(*sector_end, extent_bp_shift, &bp_sector))
+		return -ERANGE;
+
+	return 0;
+}
+#undef BCH2_SCRUB_VALIDATE_RANGE_LINKAGE
+
 int bch2_data_job(struct bch_fs *c,
 		  struct bch_move_stats *stats,
 		  struct bch_ioctl_data *op)
 {
 	int ret = 0;
+	u64 scrub_end;
 
 	if (op->op >= BCH_DATA_OP_NR)
 		return bch_err_throw(c, EINVAL_data_job_bad_op);
@@ -1197,13 +1229,36 @@ int bch2_data_job(struct bch_fs *c,
 
 	switch (op->op) {
 	case BCH_DATA_OP_scrub:
+		if (!bpos_eq(op->start_pos,
+			     POS(op->scrub.dev, op->start_pos.offset)) ||
+		    (op->end_pos.offset &&
+		     !bpos_eq(op->end_pos,
+			      POS(op->scrub.dev, op->end_pos.offset))))
+			return -EINVAL;
+
+		{
+			CLASS(bch2_dev_tryget_noerror, ca)(c, op->scrub.dev);
+
+			if (!ca)
+				return -ENODEV;
+
+			scrub_end = op->end_pos.offset;
+			if (bch2_scrub_validate_range(ca->mi.nbuckets,
+						      ca->mi.bucket_size,
+						      op->start_pos.offset, &scrub_end,
+						      c->sb.extent_bp_shift))
+				return -ERANGE;
+		}
+
 		/*
 		 * prevent tests from spuriously failing, make sure we see all
 		 * btree nodes that need to be repaired
 		 */
 		bch2_btree_interior_updates_flush(c);
 
-		ret = bch2_move_data_phys(c, op->scrub.dev, 0, U64_MAX,
+		ret = bch2_move_data_phys(c, op->scrub.dev,
+					  op->start_pos.offset,
+					  scrub_end,
 					  op->scrub.data_types,
 					  NULL,
 					  stats,
