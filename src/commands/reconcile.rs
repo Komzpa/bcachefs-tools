@@ -171,16 +171,19 @@ fn cmd_reconcile_status(cli: StatusCli) -> Result<()> {
     Ok(())
 }
 
-fn cmd_reconcile_wait(cli: WaitCli) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReconcileWaitStatus {
+    Completed,
+    Cancelled,
+}
 
-    let types = if cli.types.is_empty() {
-        ReconcileType::all_except_pending()
-    } else {
-        cli.types
-    };
+pub(crate) fn wait_for_all_except_pending(filesystem: &str) -> Result<ReconcileWaitStatus> {
+    reconcile_wait(filesystem, &ReconcileType::all_except_pending())
+}
 
-    let handle = BcachefsHandle::open(&cli.filesystem)
-        .map_err(|e| anyhow!("opening filesystem '{}': {}", cli.filesystem, e))?;
+fn reconcile_wait(filesystem: &str, types: &[ReconcileType]) -> Result<ReconcileWaitStatus> {
+    let handle = BcachefsHandle::open(filesystem)
+        .map_err(|e| anyhow!("opening filesystem '{}': {}", filesystem, e))?;
     let sysfs_path = sysfs::sysfs_path_from_fd(handle.sysfs_fd())?;
 
     // Trigger reconcile wakeup so it starts processing
@@ -193,12 +196,25 @@ fn cmd_reconcile_wait(cli: WaitCli) -> Result<()> {
     }
 }
 
+fn cmd_reconcile_wait(cli: WaitCli) -> Result<()> {
+    let types = if cli.types.is_empty() {
+        ReconcileType::all_except_pending()
+    } else {
+        cli.types
+    };
+
+    reconcile_wait(&cli.filesystem, &types)?;
+    Ok(())
+}
+
 /// Interactive TUI mode: alternate screen, keyboard input, live updates.
 fn reconcile_wait_tui(
     handle: &BcachefsHandle,
     sysfs_path: &std::path::Path,
     types: &[ReconcileType],
-) -> Result<()> {
+) -> Result<ReconcileWaitStatus> {
+    let mut status = ReconcileWaitStatus::Cancelled;
+
     run_tui(|stdout| loop {
         let mut out = Printbuf::new();
         out.set_human_readable(true);
@@ -212,6 +228,7 @@ fn reconcile_wait_tui(
         stdout.flush()?;
 
         if !pending {
+            status = ReconcileWaitStatus::Completed;
             return Ok(());
         }
 
@@ -219,13 +236,17 @@ fn reconcile_wait_tui(
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
                     _ => {}
                 }
             }
             while event::poll(Duration::ZERO)? { let _ = event::read()?; }
         }
-    })
+    })?;
+
+    Ok(status)
 }
 
 /// Non-interactive mode: simple polling loop for scripts and CI.
@@ -233,7 +254,7 @@ fn reconcile_wait_headless(
     handle: &BcachefsHandle,
     sysfs_path: &std::path::Path,
     types: &[ReconcileType],
-) -> Result<()> {
+) -> Result<ReconcileWaitStatus> {
     loop {
         let mut out = Printbuf::new();
         out.set_human_readable(true);
@@ -241,7 +262,7 @@ fn reconcile_wait_headless(
         let pending = reconcile_status_to_text(&mut out, handle, sysfs_path, types)?;
 
         if !pending {
-            return Ok(());
+            return Ok(ReconcileWaitStatus::Completed);
         }
 
         thread::sleep(Duration::from_secs(1));
