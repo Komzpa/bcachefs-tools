@@ -33,7 +33,7 @@ pub fn sb_is_encrypted(sb: &bch_sb_handle) -> bool {
 }
 
 /// Target keyring for key storage.
-#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 #[clap(rename_all = "snake_case")]
 pub enum Keyring {
     Session,
@@ -67,35 +67,79 @@ pub enum UnlockPolicy {
 }
 
 impl UnlockPolicy {
-    pub fn apply(&self, sb: &bch_sb_handle) -> Result<KeyHandle> {
+    pub fn apply(&self, sb: &bch_sb_handle, keyring: Keyring) -> Result<KeyHandle> {
         let uuid = sb.sb().uuid();
 
         info!("Using filesystem unlock policy '{self}' on {uuid}");
 
         match self {
-            Self::Fail => KeyHandle::new_from_search(&uuid),
+            Self::Fail => Ok(KeyHandle::new_from_search(&uuid)?),
             Self::Wait => Ok(KeyHandle::wait_for_unlock(&uuid)?),
             Self::Ask => {
                 let passphrase = Passphrase::ask_in_terminal()?;
                 let passphrase_correct = passphrase
                     .check(sb)
                     .ok_or_else(|| anyhow!("incorrect passphrase"))?;
-                KeyHandle::new(&passphrase_correct, Keyring::User)
+                KeyHandle::new(&passphrase_correct, keyring)
             }
             Self::Stdin => {
                 let passphrase = Passphrase::read_from_stdin()?;
                 let passphrase_correct = passphrase
                     .check(sb)
                     .ok_or_else(|| anyhow!("incorrect passphrase"))?;
-                KeyHandle::new(&passphrase_correct, Keyring::User)
+                KeyHandle::new(&passphrase_correct, keyring)
             }
         }
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_keyring_has_its_own_kernel_keyring_id() {
+        assert_eq!(Keyring::Session.id(), keyutils::KEY_SPEC_SESSION_KEYRING);
+        assert_ne!(Keyring::Session.id(), Keyring::User.id());
+        assert_ne!(Keyring::Session.id(), Keyring::UserSession.id());
+    }
+}
 
 /// Proof that a bcachefs key has been added to or found in the kernel keyring.
 pub struct KeyHandle;
+
+/// Result of searching the kernel keyrings for a bcachefs key.
+#[derive(Debug)]
+pub enum KeySearchError {
+    NotFound(ErrnoError),
+    Fatal(ErrnoError),
+}
+
+impl KeySearchError {
+    fn from_errno(err: errno::Errno) -> Self {
+        if err.0 == libc::ENOKEY {
+            Self::NotFound(ErrnoError(err))
+        } else {
+            Self::Fatal(ErrnoError(err))
+        }
+    }
+}
+
+impl std::fmt::Display for KeySearchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(err) | Self::Fatal(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for KeySearchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotFound(err) | Self::Fatal(err) => Some(err),
+        }
+    }
+}
 
 impl KeyHandle {
     pub fn format_key_name(uuid: &Uuid) -> CString {
@@ -125,7 +169,10 @@ impl KeyHandle {
         }
     }
 
-    fn search_keyring(keyring: i32, key_name: &CStr) -> Result<()> {
+    fn search_keyring(
+        keyring: i32,
+        key_name: &CStr,
+    ) -> std::result::Result<(), KeySearchError> {
         let key_name = CStr::as_ptr(key_name);
         let key_type = c"user";
 
@@ -135,23 +182,32 @@ impl KeyHandle {
             info!("Found key in keyring");
             Ok(())
         } else {
-            Err(ErrnoError(errno::errno()).into())
+            Err(KeySearchError::from_errno(errno::errno()))
         }
     }
 
-    pub fn new_from_search(uuid: &Uuid) -> Result<Self> {
+    pub fn new_from_search(uuid: &Uuid) -> std::result::Result<Self, KeySearchError> {
         let key_name = Self::format_key_name(uuid);
 
-        Self::search_keyring(keyutils::KEY_SPEC_SESSION_KEYRING, &key_name)
-            .or_else(|_| Self::search_keyring(keyutils::KEY_SPEC_USER_KEYRING, &key_name))
-            .or_else(|_| Self::search_keyring(keyutils::KEY_SPEC_USER_SESSION_KEYRING, &key_name))
-            .map(|_| KeyHandle)
+        for keyring in [
+            keyutils::KEY_SPEC_SESSION_KEYRING,
+            keyutils::KEY_SPEC_USER_KEYRING,
+            keyutils::KEY_SPEC_USER_SESSION_KEYRING,
+        ] {
+            match Self::search_keyring(keyring, &key_name) {
+                Ok(()) => return Ok(KeyHandle),
+                Err(KeySearchError::NotFound(_)) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(KeySearchError::NotFound(ErrnoError(errno::Errno(libc::ENOKEY))))
     }
 
-    fn wait_for_unlock(uuid: &Uuid) -> Result<Self> {
+    fn wait_for_unlock(uuid: &Uuid) -> std::result::Result<Self, KeySearchError> {
         loop {
             match Self::new_from_search(uuid) {
-                Err(_) => thread::sleep(Duration::from_secs(1)),
+                Err(KeySearchError::NotFound(_)) => thread::sleep(Duration::from_secs(1)),
                 r => break r,
             }
         }

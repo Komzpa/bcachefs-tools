@@ -14,9 +14,11 @@ use log::{debug, error, info};
 use crate::device_scan;
 
 use crate::{
-    key::{KeyHandle, Keyring, Passphrase, UnlockPolicy},
+    key::{KeyHandle, KeySearchError, Keyring, Passphrase, UnlockPolicy},
     logging,
 };
+
+const MOUNT_KEYRING: Keyring = Keyring::Session;
 
 fn mount_inner(
     src: OsString,
@@ -144,7 +146,11 @@ pub(crate) fn parse_mountflag_options(options: impl AsRef<str>) -> ParsedMountOp
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mountflag_options;
+    use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     #[test]
     fn parse_mountflag_options_splits_kernel_and_fs_options() {
@@ -162,30 +168,165 @@ mod tests {
         assert_eq!(p.fs_opts, None);
         assert_eq!(p.flags, 0);
     }
+    #[test]
+    fn unlock_policy_is_the_first_mount_unlock_step_and_uses_the_session_keyring() {
+        handle_unlock_with(
+            Some(&UnlockPolicy::Ask),
+            Some(Path::new("/ignored")),
+            |policy, keyring| {
+                assert!(matches!(policy, UnlockPolicy::Ask));
+                assert_eq!(keyring, Keyring::Session);
+                Ok(KeyHandle)
+            },
+            |_, _| panic!("passphrase file must not override unlock policy"),
+            || panic!("keyring search must not run after explicit unlock policy"),
+            |_| panic!("prompt fallback must not run after explicit unlock policy"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn passphrase_file_precedes_search_and_uses_the_session_keyring() {
+        handle_unlock_with(
+            None,
+            Some(Path::new("/mock-passphrase")),
+            |_, _| panic!("unlock policy must not run when it is absent"),
+            |path, keyring| {
+                assert_eq!(path, Path::new("/mock-passphrase"));
+                assert_eq!(keyring, Keyring::Session);
+                Ok(KeyHandle)
+            },
+            || panic!("keyring search must not run after explicit passphrase file"),
+            |_| panic!("prompt fallback must not run after explicit passphrase file"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn searched_key_short_circuits_the_prompt() {
+        handle_unlock_with(
+            None,
+            None,
+            |_, _| panic!("unlock policy must not run when it is absent"),
+            |_, _| panic!("passphrase file must not run when it is absent"),
+            || Ok(KeyHandle),
+            |_| panic!("prompt must not run when a key is already visible"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn missing_key_prompts_after_search_and_inserts_into_the_session_keyring() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let search_calls = Rc::clone(&calls);
+        let prompt_calls = Rc::clone(&calls);
+
+        handle_unlock_with(
+            None,
+            None,
+            |_, _| panic!("unlock policy must not run when it is absent"),
+            |_, _| panic!("passphrase file must not run when it is absent"),
+            move || {
+                search_calls.borrow_mut().push("search");
+                Err(KeySearchError::NotFound(crate::ErrnoError(errno::Errno(
+                    libc::ENOKEY,
+                ))))
+            },
+            move |keyring| {
+                prompt_calls.borrow_mut().push("prompt");
+                assert_eq!(keyring, Keyring::Session);
+                Ok(KeyHandle)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*calls.borrow(), ["search", "prompt"]);
+    }
+
+    #[test]
+    fn fatal_keyring_search_error_is_returned_without_prompting() {
+        let prompted = Rc::new(Cell::new(false));
+        let prompt_called = Rc::clone(&prompted);
+
+        let result = handle_unlock_with(
+            None,
+            None,
+            |_, _| panic!("unlock policy must not run when it is absent"),
+            |_, _| panic!("passphrase file must not run when it is absent"),
+            || {
+                Err(KeySearchError::Fatal(crate::ErrnoError(errno::Errno(
+                    libc::EACCES,
+                ))))
+            },
+            move |_| {
+                prompt_called.set(true);
+                Ok(KeyHandle)
+            },
+        );
+
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("fatal keyring-search error must be returned"),
+        };
+
+        assert!(matches!(
+            err.downcast_ref::<KeySearchError>(),
+            Some(KeySearchError::Fatal(crate::ErrnoError(err))) if err.0 == libc::EACCES
+        ));
+        assert!(!prompted.get());
+    }
 }
 
 /// If a user explicitly specifies `unlock_policy` or `passphrase_file` then use
 /// that without falling back to other mechanisms. If these options are not
 /// used, then search for the key or ask for it.
 fn handle_unlock(cli: &Cli, sb: &bch_sb_handle) -> Result<KeyHandle> {
-    if let Some(policy) = cli.unlock_policy.as_ref() {
-        return policy.apply(sb);
-    }
-
-    if let Some(path) = cli.passphrase_file.as_deref() {
-        let passphrase_correct = Passphrase::read_from_file(path)?
-            .check(sb)
-            .ok_or_else(|| anyhow::anyhow!("incorrect passphrase"))?;
-        return KeyHandle::new(&passphrase_correct, Keyring::User);
-    }
-
     let uuid = sb.sb().uuid();
-    if let Ok(handle) = KeyHandle::new_from_search(&uuid) {
-        return Ok(handle);
+    handle_unlock_with(
+        cli.unlock_policy.as_ref(),
+        cli.passphrase_file.as_deref(),
+        |policy, keyring| policy.apply(sb, keyring),
+        |path, keyring| {
+            let passphrase_correct = Passphrase::read_from_file(path)?
+                .check(sb)
+                .ok_or_else(|| anyhow::anyhow!("incorrect passphrase"))?;
+            KeyHandle::new(&passphrase_correct, keyring)
+        },
+        || KeyHandle::new_from_search(&uuid),
+        |keyring| {
+            let passphrase_correct = Passphrase::ask_and_check(sb)?;
+            KeyHandle::new(&passphrase_correct, keyring)
+        },
+    )
+}
+
+fn handle_unlock_with<Policy, PassphraseFile, Search, Prompt>(
+    policy: Option<&UnlockPolicy>,
+    passphrase_file: Option<&Path>,
+    apply_policy: Policy,
+    unlock_file: PassphraseFile,
+    search: Search,
+    prompt: Prompt,
+) -> Result<KeyHandle>
+where
+    Policy: FnOnce(&UnlockPolicy, Keyring) -> Result<KeyHandle>,
+    PassphraseFile: FnOnce(&Path, Keyring) -> Result<KeyHandle>,
+    Search: FnOnce() -> std::result::Result<KeyHandle, KeySearchError>,
+    Prompt: FnOnce(Keyring) -> Result<KeyHandle>,
+{
+    if let Some(policy) = policy {
+        return apply_policy(policy, MOUNT_KEYRING);
     }
 
-    let passphrase_correct = Passphrase::ask_and_check(sb)?;
-    KeyHandle::new(&passphrase_correct, Keyring::User)
+    if let Some(path) = passphrase_file {
+        return unlock_file(path, MOUNT_KEYRING);
+    }
+
+    match search() {
+        Ok(handle) => Ok(handle),
+        Err(KeySearchError::NotFound(_)) => prompt(MOUNT_KEYRING),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn cmd_mount_inner(cli: &Cli) -> Result<()> {
@@ -251,8 +392,9 @@ entirely in userspace.\n\n\
 Use OLD_BLKID_UUID=<uuid> in fstab entries when systemd consumes \
 UUID=<uuid> before the bcachefs mount helper can scan all members.\n\n\
 If the filesystem is encrypted, the passphrase will be looked up in \
-the kernel keyring first; if not found, the user is prompted \
-interactively (or reads from stdin if not a terminal). Use -k or --passphrase-file \
+the kernel keyrings first; if not found, the user is prompted \
+interactively (or reads from stdin if not a terminal) and the key is added \
+to the session keyring for the mount. Use -k or --passphrase-file \
 to specify alternative unlock methods.")]
 pub struct Cli {
     /// Path to passphrase file
