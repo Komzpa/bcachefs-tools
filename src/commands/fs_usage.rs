@@ -1,17 +1,18 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as FmtWrite;
+use std::os::unix::fs::MetadataExt;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bch_bindgen::c;
 use clap::Parser;
 use serde::Serialize;
 
 use crate::commands::DeviceNameArgs;
 use crate::wrappers::accounting::{
-    data_type, data_type_is_empty, disk_accounting_type, AccountingEntry, DiskAccountingKind,
+    AccountingEntry, DiskAccountingKind, data_type, data_type_is_empty, disk_accounting_type,
 };
 use crate::wrappers::handle::BcachefsHandle;
-use crate::wrappers::sysfs::{self, bcachefs_kernel_version, DevInfo, DeviceNameMode};
+use crate::wrappers::sysfs::{self, DevInfo, DeviceNameMode, bcachefs_kernel_version};
 use bcachefs_kernel::opts::{prt_compression_type, prt_data_type, prt_reconcile_type};
 use bcachefs_kernel::util::printbuf::Printbuf;
 use bcachefs_kernel::{btree, metadata_version};
@@ -22,6 +23,7 @@ enum Field {
     Replicas,
     Btree,
     Compression,
+    Inodes,
     RebalanceWork,
     Devices,
 }
@@ -32,6 +34,7 @@ impl Field {
             Self::Replicas => "replicas",
             Self::Btree => "btree",
             Self::Compression => "compression",
+            Self::Inodes => "inodes",
             Self::RebalanceWork => "rebalance_work",
             Self::Devices => "devices",
         }
@@ -44,7 +47,8 @@ impl Field {
     about = "Display detailed filesystem usage",
     long_about = "Displays filesystem space usage broken down by category. \
 Output modes: replicas (data/metadata replication), btree (per-btree \
-space), compression (ratios and savings), rebalance_work (pending \
+space), compression (ratios and savings), inodes (selected path inode \
+usage, not recursive directory totals), rebalance_work (pending \
 reconcile work), devices (per-device breakdown). Use -f to select \
 specific fields, -a for all, -h for human-readable sizes.",
     disable_help_flag = true
@@ -84,6 +88,7 @@ fn fs_usage(cli: Cli) -> Result<()> {
             Field::Replicas,
             Field::Btree,
             Field::Compression,
+            Field::Inodes,
             Field::RebalanceWork,
             Field::Devices,
         ]
@@ -141,6 +146,8 @@ struct FsUsage {
     compression: Vec<CompressionUsage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     btree: Vec<BtreeUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inode_usage: Option<InodeUsage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rebalance_work: Vec<SectorUsage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -204,6 +211,15 @@ struct BtreeUsage {
 }
 
 #[derive(Serialize)]
+struct InodeUsage {
+    path: String,
+    inum: u64,
+    extents: u64,
+    logical_sectors: u64,
+    on_disk_sectors: u64,
+}
+
+#[derive(Serialize)]
 struct ReconcileWork {
     work_type: String,
     data_sectors: u64,
@@ -242,6 +258,14 @@ struct DeviceDataTypeUsage {
 
 impl FsUsage {
     fn load(path: &str, fields: &[Field], name_mode: DeviceNameMode) -> Result<Self> {
+        let selected_inum = fields
+            .contains(&Field::Inodes)
+            .then(|| {
+                std::fs::metadata(path)
+                    .map(|metadata| metadata.ino())
+                    .map_err(|e| anyhow!("reading metadata for selected path '{}': {}", path, e))
+            })
+            .transpose()?;
         let handle = BcachefsHandle::open(path)
             .map_err(|e| anyhow!("opening filesystem '{}': {}", path, e))?;
         let sysfs_path = sysfs::sysfs_path_from_fd(handle.sysfs_fd())?;
@@ -256,6 +280,7 @@ impl FsUsage {
         let include_replicas = fields.contains(&Field::Replicas);
         let include_compression = fields.contains(&Field::Compression);
         let include_btree = fields.contains(&Field::Btree);
+        let include_inodes = fields.contains(&Field::Inodes);
         let include_work = fields.contains(&Field::RebalanceWork);
         let include_device_types = fields.contains(&Field::Devices);
         let mut replicas_summary = ReplicasSummaryBuilder::default();
@@ -263,6 +288,13 @@ impl FsUsage {
         let mut persistent_reserved = Vec::new();
         let mut compression = Vec::new();
         let mut btree_usage = Vec::new();
+        let mut inode_usage = selected_inum.map(|inum| InodeUsage {
+            path: path.to_string(),
+            inum,
+            extents: 0,
+            logical_sectors: 0,
+            on_disk_sectors: 0,
+        });
         let mut rebalance_work = Vec::new();
         let mut reconcile_work = Vec::new();
         let mut leaving_by_device = BTreeMap::new();
@@ -323,6 +355,15 @@ impl FsUsage {
                         sectors: entry.counter(0),
                     });
                 }
+                DiskAccountingKind::Inum { inum }
+                    if include_inodes && selected_inum == Some(inum) =>
+                {
+                    if let Some(usage) = &mut inode_usage {
+                        usage.extents = entry.counter(0);
+                        usage.logical_sectors = entry.counter(1);
+                        usage.on_disk_sectors = entry.counter(2);
+                    }
+                }
                 DiskAccountingKind::RebalanceWork if include_work => {
                     rebalance_work.push(SectorUsage {
                         sectors: entry.counter(0),
@@ -374,6 +415,7 @@ impl FsUsage {
             persistent_reserved,
             compression,
             btree: btree_usage,
+            inode_usage,
             rebalance_work,
             reconcile_work,
             devices,
@@ -389,6 +431,9 @@ fn accounting_types_for_fields(fields: &[Field]) -> u32 {
     }
     if fields.contains(&Field::Btree) {
         types |= disk_accounting_type::btree.bit();
+    }
+    if fields.contains(&Field::Inodes) {
+        types |= disk_accounting_type::inum.bit();
     }
 
     let supports_reconcile =
@@ -677,6 +722,24 @@ fn fs_usage_to_text(out: &mut Printbuf, usage: &FsUsage) {
                 sub.units_sectors(entry.sectors);
                 write!(sub, "\r\n").unwrap();
             }
+        });
+    }
+
+    if let Some(inode) = &usage.inode_usage {
+        write!(
+            out,
+            "\nInode usage for selected path (inum {}):\n",
+            inode.inum
+        )
+        .unwrap();
+        writeln!(out, "not recursive directory totals").unwrap();
+        out.aligned(|sub| {
+            write!(sub, "Path\tExtents\tLogical\rOn disk\r\n").unwrap();
+            write!(sub, "{}:\t{}\t", inode.path, inode.extents).unwrap();
+            sub.units_sectors(inode.logical_sectors);
+            write!(sub, "\r").unwrap();
+            sub.units_sectors(inode.on_disk_sectors);
+            write!(sub, "\r\n").unwrap();
         });
     }
 
