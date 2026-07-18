@@ -499,7 +499,9 @@ STORE(bch2_fs)
 		bch2_gc_gens(c);
 
 	if (attr == &sysfs_trigger_delete_dead_snapshots)
-		__bch2_delete_dead_snapshots(c);
+		/* debug force: bypass auto_snapshot_deletion; serialize via run_lock */
+		scoped_guard(mutex, &c->recovery.run_lock)
+			__bch2_delete_dead_snapshots(c);
 
 	if (attr == &sysfs_trigger_emergency_read_only) {
 		CLASS(bch_log_msg, msg)(c);
