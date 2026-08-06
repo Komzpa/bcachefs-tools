@@ -128,6 +128,7 @@ enum set_needs_reconcile_ctx {
 	SET_NEEDS_RECONCILE_opt_change,
 	SET_NEEDS_RECONCILE_opt_change_indirect,
 	SET_NEEDS_RECONCILE_foreground,
+	SET_NEEDS_RECONCILE_worker,
 	SET_NEEDS_RECONCILE_other,
 };
 

@@ -941,9 +941,12 @@ int bch2_update_reconcile_opts(struct btree_trans *trans,
 		 * A scan may be replaying after the reconcile work indexes were
 		 * lost or never created. If the extent's reconcile opts already
 		 * match, the trigger path won't fire; make the work bit match the
-		 * extent metadata here.
+		 * extent metadata here. Reconcile workers are already consuming a
+		 * selected work item; re-adding the logical work bit from the worker
+		 * path turns a successful lazy commit into an endless restart before
+		 * the data move can run.
 		 */
-		if (!level) {
+		if (ctx != SET_NEEDS_RECONCILE_worker && !level) {
 			enum reconcile_work_id w = bch2_bkey_reconcile_work_id(c, k);
 
 			if (w)

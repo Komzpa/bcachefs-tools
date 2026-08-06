@@ -843,7 +843,7 @@ static int __do_reconcile_extent(struct moving_context *ctxt,
 
 	try(bch2_bkey_get_io_opts(trans, snapshot_io_opts, k, opts));
 	try(bch2_update_reconcile_opts(trans, snapshot_io_opts, opts, iter, level, k,
-				       SET_NEEDS_RECONCILE_other));
+				       SET_NEEDS_RECONCILE_worker));
 
 	CLASS(disk_reservation, res)(c);
 	try(bch2_trans_commit_lazy(trans, &res.r, NULL, BCH_TRANS_COMMIT_no_enospc));
