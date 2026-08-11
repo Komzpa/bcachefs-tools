@@ -1064,6 +1064,8 @@ static struct dentry *bch2_lookup(struct inode *vdir, struct dentry *dentry,
 		 * We should come back to this when VFS has a method to handle
 		 * this edgecase.
 		 */
+		d_splice_alias(NULL, dentry);
+		d_drop(dentry);
 		return NULL;
 	}
 
