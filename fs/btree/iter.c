@@ -2086,8 +2086,8 @@ static noinline btree_path_idx_t btree_paths_realloc(struct btree_trans *trans,
 #ifdef CONFIG_BCACHEFS_DEBUG
 	for (unsigned i = 0; i < trans->nr_paths; i++)
 		for (unsigned l = 0; l < BTREE_MAX_DEPTH; l++)
-			trans->paths[i].l[l].b =
-				ERR_PTR(-BCH_ERR_no_btree_node_stale_paths);
+			WRITE_ONCE(trans->paths[i].l[l].b,
+				   ERR_PTR(-BCH_ERR_no_btree_node_stale_paths));
 #endif
 
 	rcu_assign_pointer(trans->paths_allocated,	paths_allocated);
