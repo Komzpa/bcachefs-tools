@@ -8,8 +8,8 @@
 #ifndef _BUCKETS_H
 #define _BUCKETS_H
 
-#include "alloc/buckets_types.h"
-#include "alloc/format.h"
+#include "alloc/buckets_gen.h"
+#include "alloc/format_gen.h"
 #include "data/extents.h"
 #include "sb/members.h"
 
@@ -235,7 +235,6 @@ static inline struct bch_dev_usage bch2_dev_usage_read(struct bch_dev *ca)
 	return ret;
 }
 
-void bch2_dev_usage_full_read_fast(struct bch_dev *, struct bch_dev_usage_full *);
 static inline struct bch_dev_usage_full bch2_dev_usage_full_read(struct bch_dev *ca)
 {
 	struct bch_dev_usage_full ret;
@@ -285,12 +284,21 @@ static inline bool bch2_dev_is_rw(struct bch_dev *ca)
 }
 
 /*
+ * What a new copy written to @ca would be worth: nothing unless it's rw. For
+ * what a copy already there is worth, bch2_dev_durability().
+ */
+static inline unsigned bch2_dev_rw_durability(struct bch_dev *ca)
+{
+	return bch2_dev_is_rw(ca) ? ca->mi.durability : 0;
+}
+
+/*
  * Everything that divides c->capacity.capacity up per device has to agree with
  * bch2_recalc_capacity() about which devices are in the sum.
  */
 static inline bool dev_has_capacity(struct bch_dev *ca)
 {
-	return bch2_dev_is_rw(ca) && ca->mi.durability;
+	return bch2_dev_rw_durability(ca) != 0;
 }
 
 static inline u64 dev_capacity_sectors(struct bch_dev *ca)
@@ -340,9 +348,6 @@ static inline u64 dev_buckets_available(struct bch_dev *ca,
 }
 
 /* Filesystem usage: */
-
-struct bch_fs_usage_short
-bch2_fs_usage_read_short(struct bch_fs *);
 
 /* raw sectors: they land somewhere whatever count they were taken at */
 static inline u64 bch2_online_reserved(struct bch_fs *c)
@@ -406,8 +411,6 @@ void bch2_trans_account_disk_usage_change(struct btree_trans *);
 int bch2_trans_mark_metadata_bucket(struct btree_trans *, struct bch_dev *, u64,
 				    enum bch_data_type, unsigned,
 				    enum btree_iter_update_trigger_flags);
-int bch2_trans_mark_dev_sb(struct bch_fs *, struct bch_dev *,
-				    enum btree_iter_update_trigger_flags);
 int bch2_trans_mark_dev_sbs_flags(struct bch_fs *,
 				    enum btree_iter_update_trigger_flags);
 int bch2_trans_mark_dev_sbs(struct bch_fs *);
@@ -448,10 +451,7 @@ static inline void bch2_disk_reservation_put(struct bch_fs *c,
 	}
 }
 
-enum bch_reservation_flags {
-	BCH_DISK_RESERVATION_NOFAIL	= 1 << 0,
-	BCH_DISK_RESERVATION_PARTIAL	= 1 << 1,
-};
+#include "alloc/buckets_defs_gen.h"
 
 int bch2_disk_reservation_add_slowpath(struct bch_fs *, struct disk_reservation *,
 				       u64, enum bch_reservation_flags);
@@ -578,11 +578,6 @@ static inline int bch2_disk_reservation_add(struct bch_fs *c,
 	}
 }
 
-struct disk_reservation_destructable {
-	struct bch_fs			*c;
-	struct disk_reservation		r;
-};
-
 DEFINE_CLASS(disk_reservation, struct disk_reservation_destructable,
 	     bch2_disk_reservation_put(_T.c, &_T.r),
 	     (struct disk_reservation_destructable) { .c = c },
@@ -596,7 +591,6 @@ static inline u64 avail_factor(u64 r)
 }
 
 void bch2_buckets_nouse_free(struct bch_fs *);
-int bch2_buckets_nouse_alloc(struct bch_fs *);
 
 static inline bool bch2_bucket_nouse(struct bch_dev *ca, u64 bucket)
 {

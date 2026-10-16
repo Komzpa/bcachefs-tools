@@ -18,6 +18,7 @@
 #include "data/compress.h"
 #include "data/keylist.h"
 #include "data/extents.h"
+#include "data/ec/create.h"
 #include "data/ec/init.h"
 #include "data/ec/io.h"
 #include "data/ec/trigger.h"
@@ -78,6 +79,7 @@ static void move_write_done(struct bch_write_op *op)
 
 	atomic_sub(u->k.k->k.size, &ctxt->write_sectors);
 	atomic_dec(&ctxt->write_ios);
+	wake_up(&ctxt->wait);
 
 	/*
 	 * EC allocation failed — the write never happened but the extent
@@ -102,20 +104,36 @@ static void move_write(struct data_update *u)
 	struct moving_context *ctxt = u->ctxt;
 	struct bch_read_bio *rbio = &u->rbio;
 
+	/* Keep completed reads charged until their writes can be submitted. */
+	atomic_sub(u->k.k->k.size, &ctxt->read_sectors);
+	atomic_dec(&ctxt->read_ios);
+
 	if (ctxt->stats) {
-		if (rbio->ret) {
-			atomic64_add(u->rbio.bvec_iter.bi_size >> 9,
+		/*
+		 * A poisoned extent is data we've already lost, even when it
+		 * reads back clean: a move gives it a new checksum over the bad
+		 * data. Not for the journal scrub, where uncorrected means a
+		 * rewind, and a rewind can't bring this back.
+		 */
+		bool poisoned = u->opts.type == BCH_DATA_UPDATE_scrub &&
+			(bch2_bkey_extent_flags(bkey_i_to_s_c(u->k.k)) &
+			 BIT_ULL(BCH_EXTENT_FLAG_poisoned));
+
+		/*
+		 * Not rbio->bvec_iter: that's only set when the read went
+		 * straight into this rbio, not through a bounce or a clone
+		 */
+		if (bch2_data_update_read_err_benign(rbio->ret)) {
+			/* nothing was read, and nothing was lost */
+		} else if (rbio->ret || poisoned) {
+			atomic64_add(u->k.k->k.size,
 				     &ctxt->stats->sectors_error_uncorrected);
 			set_bit(rbio->pick.ptr.dev,
 				ctxt->stats->devs_error_uncorrected.d);
 		} else if (rbio->saw_error)
-			atomic64_add(u->rbio.bvec_iter.bi_size >> 9,
+			atomic64_add(u->k.k->k.size,
 				     &ctxt->stats->sectors_error_corrected);
 	}
-
-	closure_get(&ctxt->cl);
-	atomic_add(u->k.k->k.size, &ctxt->write_sectors);
-	atomic_inc(&ctxt->write_ios);
 
 	bch2_data_update_read_done(u);
 }
@@ -128,13 +146,74 @@ struct data_update *bch2_moving_ctxt_next_pending_write(struct moving_context *c
 	return u && u->read_done ? u : NULL;
 }
 
+static bool bch2_moving_ctxt_can_submit_write(struct moving_context *ctxt,
+					      struct data_update *u)
+{
+	u32 sectors = u ? u->k.k->k.size : 0;
+	u32 write_sectors = atomic_read(&ctxt->write_sectors);
+
+	return atomic_read(&ctxt->write_ios) < ctxt->max_ios_in_flight &&
+		(!write_sectors ||
+		 (write_sectors < ctxt->max_sectors_in_flight &&
+		  sectors <= ctxt->max_sectors_in_flight - write_sectors));
+}
+
+static bool bch2_moving_ctxt_reserve_io(struct moving_context *ctxt,
+					atomic_t *sectors_in_flight,
+					atomic_t *ios_in_flight,
+					u32 sectors)
+{
+	u32 old, new;
+
+	/* Reserve before submitting; check-then-add can overshoot under completion. */
+	do {
+		old = atomic_read(sectors_in_flight);
+		if (old && (old >= ctxt->max_sectors_in_flight ||
+			    sectors > ctxt->max_sectors_in_flight - old))
+			return false;
+		new = old + sectors;
+	} while (atomic_cmpxchg(sectors_in_flight, old, new) != old);
+
+	do {
+		old = atomic_read(ios_in_flight);
+		if (old >= ctxt->max_ios_in_flight) {
+			atomic_sub(sectors, sectors_in_flight);
+			return false;
+		}
+		new = old + 1;
+	} while (atomic_cmpxchg(ios_in_flight, old, new) != old);
+
+	return true;
+}
+
+static bool bch2_moving_ctxt_reserve_write(struct moving_context *ctxt,
+					   struct data_update *u)
+{
+	if (!bch2_moving_ctxt_reserve_io(ctxt,
+			&ctxt->write_sectors, &ctxt->write_ios,
+			u->k.k->k.size))
+		return false;
+
+	closure_get(&ctxt->cl);
+	return true;
+}
+
+bool bch2_moving_ctxt_pending_write_ready(struct moving_context *ctxt)
+{
+	struct data_update *u = bch2_moving_ctxt_next_pending_write(ctxt);
+
+	return u && bch2_moving_ctxt_can_submit_write(ctxt, u);
+}
+
 static void move_read_endio(struct bio *bio)
 {
 	struct data_update *u = container_of(bio, struct data_update, rbio.bio);
 	struct moving_context *ctxt = u->ctxt;
 
-	atomic_sub(u->k.k->k.size, &ctxt->read_sectors);
-	atomic_dec(&ctxt->read_ios);
+	/*
+	 * Keep the read's window reservation until its queued write can be
+	 * submitted, so completed buffers continue to provide backpressure.
+	 */
 	u->read_done = true;
 
 	wake_up(&ctxt->wait);
@@ -145,7 +224,8 @@ void bch2_moving_ctxt_do_pending_writes(struct moving_context *ctxt)
 {
 	struct data_update *u;
 
-	while ((u = bch2_moving_ctxt_next_pending_write(ctxt))) {
+	while ((u = bch2_moving_ctxt_next_pending_write(ctxt)) &&
+	       bch2_moving_ctxt_reserve_write(ctxt, u)) {
 		bch2_trans_unlock_long(ctxt->trans);
 		list_del(&u->read_list);
 		move_write(u);
@@ -213,6 +293,7 @@ void bch2_moving_ctxt_init(struct moving_context *ctxt,
 	ctxt->stats	= stats;
 	ctxt->wp	= wp;
 	ctxt->wait_on_copygc = wait_on_copygc;
+	bch2_moving_ctxt_reset_limits(ctxt);
 
 	closure_init_stack(&ctxt->cl);
 
@@ -223,6 +304,47 @@ void bch2_moving_ctxt_init(struct moving_context *ctxt,
 
 	scoped_guard(mutex, &c->moving_context_lock)
 		list_add(&ctxt->list, &c->moving_context_list);
+}
+
+#define MOVE_ROTATIONAL_BG_IOS_IN_FLIGHT	8U
+#define MOVE_ROTATIONAL_BG_BYTES_IN_FLIGHT	(1U << 20)
+
+#define MOVE_ROTATIONAL_HIPRI_IOS_IN_FLIGHT	128U
+#define MOVE_ROTATIONAL_HIPRI_BYTES_IN_FLIGHT	(16U << 20)
+
+static void bch2_moving_ctxt_refresh_limits(struct moving_context *ctxt)
+{
+	struct bch_fs *c = ctxt->trans->c;
+
+	ctxt->max_sectors_in_flight = min(c->opts.move_bytes_in_flight >> 9,
+					  ctxt->rotational_max_sectors_in_flight ?: UINT_MAX);
+	ctxt->max_ios_in_flight = min(c->opts.move_ios_in_flight,
+				      ctxt->rotational_max_ios_in_flight ?: UINT_MAX);
+}
+
+void bch2_moving_ctxt_reset_limits(struct moving_context *ctxt)
+{
+	ctxt->rotational_max_sectors_in_flight = 0;
+	ctxt->rotational_max_ios_in_flight = 0;
+	bch2_moving_ctxt_refresh_limits(ctxt);
+	ctxt->limit_source = MOVE_LIMITS_default;
+	ctxt->limit_source_id = 0;
+}
+
+void bch2_moving_ctxt_set_rotational_limits(struct moving_context *ctxt,
+					    enum move_rotational_limit limit,
+					    enum move_limit_source source,
+					    unsigned source_id)
+{
+	ctxt->rotational_max_ios_in_flight = limit == MOVE_ROTATIONAL_LIMIT_hipri
+		? MOVE_ROTATIONAL_HIPRI_IOS_IN_FLIGHT
+		: MOVE_ROTATIONAL_BG_IOS_IN_FLIGHT;
+	ctxt->rotational_max_sectors_in_flight = (limit == MOVE_ROTATIONAL_LIMIT_hipri
+		? MOVE_ROTATIONAL_HIPRI_BYTES_IN_FLIGHT
+		: MOVE_ROTATIONAL_BG_BYTES_IN_FLIGHT) >> 9;
+	bch2_moving_ctxt_refresh_limits(ctxt);
+	ctxt->limit_source = source;
+	ctxt->limit_source_id = source_id;
 }
 
 void bch2_move_stats_exit(struct bch_move_stats *stats, struct bch_fs *c)
@@ -272,15 +394,16 @@ static int __bch2_move_extent(struct moving_context *ctxt,
 
 	u32 size = k.k->size;
 
+	move_ctxt_wait_event(ctxt,
+		bch2_moving_ctxt_reserve_io(ctxt,
+			&ctxt->read_sectors, &ctxt->read_ios, size));
+
 	if (bucket_in_flight) {
 		u->b = bucket_in_flight;
 		atomic_inc(&u->b->count);
 	}
 
 	scoped_guard(mutex, &ctxt->lock) {
-		atomic_add(u->k.k->k.size, &ctxt->read_sectors);
-		atomic_inc(&ctxt->read_ios);
-
 		list_add_tail(&u->read_list, &ctxt->reads);
 		list_add_tail(&u->io_list, &ctxt->ios);
 
@@ -515,15 +638,12 @@ int bch2_move_ratelimit(struct moving_context *ctxt)
 		}
 	} while (delay);
 
-	/*
-	 * XXX: these limits really ought to be per device, SSDs and hard drives
-	 * will want different limits
-	 */
+	bch2_moving_ctxt_refresh_limits(ctxt);
 	move_ctxt_wait_event(ctxt,
-		atomic_read(&ctxt->write_sectors) < c->opts.move_bytes_in_flight >> 9 &&
-		atomic_read(&ctxt->read_sectors) < c->opts.move_bytes_in_flight >> 9 &&
-		atomic_read(&ctxt->write_ios) < c->opts.move_ios_in_flight &&
-		atomic_read(&ctxt->read_ios) < c->opts.move_ios_in_flight);
+		atomic_read(&ctxt->write_sectors) < ctxt->max_sectors_in_flight &&
+		atomic_read(&ctxt->read_sectors) < ctxt->max_sectors_in_flight &&
+		atomic_read(&ctxt->write_ios) < ctxt->max_ios_in_flight &&
+		atomic_read(&ctxt->read_ios) < ctxt->max_ios_in_flight);
 
 	return 0;
 }
@@ -655,16 +775,16 @@ static int stripe_block_at_bp(struct bch_dev *ca, struct bkey_s_c_stripe s,
 }
 
 /*
- * A bad stripe block: point the stripe's pointer to it at
- * BCH_SB_MEMBER_INVALID, as removing its device would. The stripe is then
- * degraded, and reconcile rebuilds it. Refused if the stripe couldn't be
- * rebuilt without it, or is open - being rewritten already.
+ * A bad stripe block: repair the stripe, as reconcile would a degraded one. Not
+ * by invalidating the block - its extents outside the bad granule are intact,
+ * and may be needed if the stripe can't be reconstructed.
  */
-static int scrub_invalidate_stripe_block(struct btree_trans *trans,
-					 struct ec_stripe_buf *buf, unsigned block,
-					 bool *gone, bool *invalidated,
-					 struct printbuf *err)
+static int scrub_repair_stripe(struct moving_context *ctxt,
+			       struct ec_stripe_buf *buf, unsigned block,
+			       bool *gone)
 {
+	struct btree_trans *trans = ctxt->trans;
+
 	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, buf->key.k.p, BTREE_ITER_intent);
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
 
@@ -677,13 +797,15 @@ static int scrub_invalidate_stripe_block(struct btree_trans *trans,
 		return 0;
 	}
 
-	bool had_open = false;
-	u64 recorded = 0;
-	try(bch2_invalidate_stripe_to_dev(trans, &iter, k, buf->key.v.ptrs[block].dev,
-					  BCH_FORCE_IF_DATA_DEGRADED, err,
-					  &had_open, &recorded));
-	*invalidated = !had_open;
-	return 0;
+	/* repair drops our locks: it needs a copy */
+	struct bkey_buf sk __cleanup(bch2_bkey_buf_exit);
+	bch2_bkey_buf_init(&sk);
+	bch2_bkey_buf_reassemble(&sk, k);
+
+	int ret = bch2_stripe_repair_damaged(ctxt, &iter, bkey_i_to_s_c_stripe(sk.k), block);
+
+	/* narrowing: evacuating, and reconcile finishes it */
+	return ret == -BCH_ERR_stripe_needs_block_evacuate ? 0 : ret;
 }
 
 static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
@@ -712,6 +834,9 @@ static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
 	bch2_trans_unlock(trans);
 
 	s64 bad = bch2_ec_scrub_block(c, buf, block);
+
+	try(bch2_trans_relock(trans));
+
 	if (bad <= 0) {
 		/*
 		 * Couldn't read it: an IO error is counted by the device, and a
@@ -720,16 +845,14 @@ static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
 		return bad == -BCH_ERR_ENOMEM_stripe_buf ? bad : 0;
 	}
 
-	bool gone = false, invalidated = false;
-	CLASS(printbuf, err)();
-	int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
-			    scrub_invalidate_stripe_block(trans, buf, block, &gone,
-							  &invalidated, &err));
-	if (gone)
-		return 0;
+	/* a restart goes back to the backpointer walk, which retries the block: */
+	bool gone = false;
+	int ret = scrub_repair_stripe(ctxt, buf, block, &gone);
+	if (gone || bch2_err_matches(ret, BCH_ERR_transaction_restart))
+		return ret;
 
 	if (ctxt->stats)
-		atomic64_add(bad, invalidated
+		atomic64_add(bad, !ret
 			     ? &ctxt->stats->sectors_error_corrected
 			     : &ctxt->stats->sectors_error_uncorrected);
 
@@ -743,17 +866,13 @@ static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
 	bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(&buf->key.k_i));
 	prt_newline(&msg.m);
 
-	if (invalidated)
-		prt_str(&msg.m, "block invalidated, reconcile will rebuild the stripe");
-	else if (ret)
-		prt_printf(&msg.m, "error invalidating block: %s", bch2_err_str(ret));
+	if (ret)
+		prt_printf(&msg.m, "error repairing stripe: %s", bch2_err_str(ret));
 	else
-		prt_str(&msg.m, "not repaired: stripe is open");
+		prt_str(&msg.m, "repairing stripe");
 	prt_newline(&msg.m);
-	if (err.pos)
-		prt_str(&msg.m, err.buf);
 
-	return bch2_err_matches(ret, BCH_ERR_remove_would_lose_data) ? 0 : ret;
+	return ret;
 }
 
 static int __bch2_move_data_phys(struct moving_context *ctxt,
@@ -940,6 +1059,11 @@ int bch2_move_data_phys(struct bch_fs *c,
 {
 	struct moving_context ctxt __cleanup(bch2_moving_ctxt_exit);
 	bch2_moving_ctxt_init(&ctxt, c, rate, stats, wp, wait_on_copygc);
+
+	if (bch2_dev_rotational(c, dev))
+		bch2_moving_ctxt_set_rotational_limits(&ctxt,
+				MOVE_ROTATIONAL_LIMIT_background,
+				MOVE_LIMITS_phys_dev, dev);
 
 	if (ctxt.stats) {
 		ctxt.stats->phys = true;
@@ -1291,24 +1415,42 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 	CLASS(darray_u64, flushes)();
 	int ret = 0;
 
-	u64 last_entry_time = 0;
 	*rewind_seq = 0;
 
 	struct journal_replay **_i;
 	struct genradix_iter radix_iter;
+
+	/*
+	 * The window is measured back from the newest flush entry, so we need
+	 * that before we can decide what falls inside it - genradix_for_each()
+	 * runs oldest-first, and the scrub loop below requires @flushes in
+	 * ascending seq order, so take two passes rather than reversing.
+	 */
+	u64 newest_time = 0;
 	genradix_for_each(&c->journal_entries, radix_iter, _i) {
 		struct journal_replay *i = *_i;
 
-		if (!journal_replay_ignore(i) &&
-		    !JSET_NO_FLUSH(&i->j)) {
-			u64 t = jset_datetime(&i->j);
-			if (!last_entry_time)
-				last_entry_time = t;
-			else if (time_before64(t + c->opts.scrub_journal_max_rewind_secs, last_entry_time))
-				break;
+		if (!journal_replay_ignore(i) && !JSET_NO_FLUSH(&i->j))
+			newest_time = max(newest_time, (u64) jset_datetime(&i->j));
+	}
 
-			try(darray_push(&flushes, le64_to_cpu(i->j.seq)));
-		}
+	genradix_for_each(&c->journal_entries, radix_iter, _i) {
+		struct journal_replay *i = *_i;
+
+		if (journal_replay_ignore(i) || JSET_NO_FLUSH(&i->j))
+			continue;
+
+		/*
+		 * Entries with no datetime entry (t == 0) are always included:
+		 * we can't tell how old they are, and excluding them would
+		 * silently shrink the scrub window.
+		 */
+		u64 t = jset_datetime(&i->j);
+		if (t && newest_time &&
+		    time_before64(t + c->opts.scrub_journal_max_rewind_secs, newest_time))
+			continue;
+
+		try(darray_push(&flushes, le64_to_cpu(i->j.seq)));
 	}
 
 	if (!flushes.nr) {
@@ -1612,10 +1754,11 @@ static int scrub_journal_repair_one(struct moving_context *ctxt,
 
 	/* Repair it from whatever replica is good */
 	struct bch_inode_opts io_opts;
-	bch2_inode_opts_get(c, &io_opts, bkey_is_btree_ptr(k.k));
+	try(bch2_bkey_get_io_opts(trans, NULL, k, &io_opts));
 
 	struct data_update_opts data_opts = {
 		.type		= BCH_DATA_UPDATE_self_heal,
+		.target		= io_opts.background_target,
 		.ptrs_io_error	= bad_devs,
 		.ptrs_kill	= bad_devs,
 	};
@@ -1729,15 +1872,33 @@ static __cold void bch2_moving_ctxt_to_text(struct printbuf *out, struct bch_fs 
 
 	prt_printf(out, "reads: ios %u/%u sectors %u/%u\n",
 		   atomic_read(&ctxt->read_ios),
-		   c->opts.move_ios_in_flight,
+		   ctxt->max_ios_in_flight,
 		   atomic_read(&ctxt->read_sectors),
-		   c->opts.move_bytes_in_flight >> 9);
+		   ctxt->max_sectors_in_flight);
 
 	prt_printf(out, "writes: ios %u/%u sectors %u/%u\n",
 		   atomic_read(&ctxt->write_ios),
-		   c->opts.move_ios_in_flight,
+		   ctxt->max_ios_in_flight,
 		   atomic_read(&ctxt->write_sectors),
-		   c->opts.move_bytes_in_flight >> 9);
+		   ctxt->max_sectors_in_flight);
+
+	prt_str(out, "limit source:\t");
+	switch (ctxt->limit_source) {
+	case MOVE_LIMITS_default:
+		prt_str(out, "global\n");
+		break;
+	case MOVE_LIMITS_copygc_bucket:
+		prt_printf(out, "copygc bucket dev %u\n", ctxt->limit_source_id);
+		break;
+	case MOVE_LIMITS_reconcile_target:
+		prt_str(out, "reconcile target ");
+		bch2_target_to_text(out, c, ctxt->limit_source_id);
+		prt_newline(out);
+		break;
+	case MOVE_LIMITS_phys_dev:
+		prt_printf(out, "physical dev %u\n", ctxt->limit_source_id);
+		break;
+	}
 
 	guard(printbuf_indent)(out);
 

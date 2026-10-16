@@ -7,53 +7,9 @@
 #include "btree/bbpos.h"
 #include "btree/iter.h"
 #include "data/update.h"
-#include "move_types.h"
+#include "data/move_gen.h"
 
-struct bch_read_bio;
-
-/*
- * Tracks in-flight data movement IO for ratelimiting.
- *
- * Four atomic counters track sectors and IOs in flight:
- *  - read_sectors/read_ios: extent read submit -> read completion
- *  - write_sectors/write_ios: read completion -> write completion
- *
- * bch2_move_ratelimit() blocks the caller until all counters are below
- * c->opts.move_bytes_in_flight / move_ios_in_flight.
- *
- * Extent moves (bch2_move_extent) and stripe repairs (bch2_stripe_repair)
- * both account through these counters.
- *
- * Lifetime: every in-flight IO holds closure_get(&ctxt->cl).
- * bch2_moving_ctxt_flush_all() waits for all IO via closure_sync(),
- * and bch2_moving_ctxt_exit() asserts all counters are zero.
- */
-struct moving_context {
-	struct btree_trans	*trans;
-	struct list_head	list;
-	void			*fn;
-
-	struct bch_ratelimit	*rate;
-	struct bch_move_stats	*stats;
-	struct write_point_specifier wp;
-	bool			wait_on_copygc;
-
-	/* For waiting on outstanding reads and writes: */
-	struct closure		cl;
-
-	struct mutex		lock;
-	struct list_head	reads;
-	struct list_head	ios;
-	u64			io_seq;
-
-	/* in flight sectors: */
-	atomic_t		read_sectors;
-	atomic_t		write_sectors;
-	atomic_t		read_ios;
-	atomic_t		write_ios;
-
-	wait_queue_head_t	wait;
-};
+#include "data/move_defs_gen.h"
 
 /*
  * Movers wait on IO they issued, and the completions (index updates) run on
@@ -79,7 +35,7 @@ struct moving_context {
 		bch2_trans_unlock_long((_ctxt)->trans);				\
 		_ret = ___wait_event((_ctxt)->wait,				\
 			     ___wait_cond_timeout(				\
-				bch2_moving_ctxt_next_pending_write(_ctxt) ||	\
+				bch2_moving_ctxt_pending_write_ready(_ctxt) ||	\
 				(cond_finished = (_cond))),			\
 			     MOVE_CTXT_WAIT_STATE, 0, _timeout,			\
 			     __ret = schedule_timeout(__ret));			\
@@ -98,23 +54,21 @@ do {									\
 		break;							\
 	bch2_trans_unlock_long((_ctxt)->trans);				\
 	(void) ___wait_event((_ctxt)->wait,				\
-		     bch2_moving_ctxt_next_pending_write(_ctxt) ||	\
+		     bch2_moving_ctxt_pending_write_ready(_ctxt) ||	\
 		     (cond_finished = (_cond)),				\
 		     MOVE_CTXT_WAIT_STATE, 0, 0, schedule());		\
 	if (cond_finished)						\
 		break;							\
 } while (1)
 
-typedef int (*move_pred_fn)(struct btree_trans *, void *, enum btree_id, struct bkey_s_c,
-			    struct bch_inode_opts *, struct data_update_opts *);
-
 extern const char * const bch2_data_ops_strs[];
 
-void bch2_moving_ctxt_exit(struct moving_context *);
-void bch2_moving_ctxt_init(struct moving_context *, struct bch_fs *,
-			   struct bch_ratelimit *, struct bch_move_stats *,
-			   struct write_point_specifier, bool);
+void bch2_moving_ctxt_reset_limits(struct moving_context *);
+void bch2_moving_ctxt_set_rotational_limits(struct moving_context *,
+					    enum move_rotational_limit,
+					    enum move_limit_source, unsigned);
 struct data_update *bch2_moving_ctxt_next_pending_write(struct moving_context *);
+bool bch2_moving_ctxt_pending_write_ready(struct moving_context *);
 void bch2_moving_ctxt_do_pending_writes(struct moving_context *);
 void bch2_moving_ctxt_flush_all(struct moving_context *);
 void bch2_move_ctxt_wait_for_io(struct moving_context *);
@@ -125,9 +79,6 @@ int bch2_move_extent(struct moving_context *,
 		     struct bch_inode_opts *,
 		     struct data_update_opts *,
 		     struct btree_iter *, unsigned, struct bkey_s_c);
-
-int bch2_move_data_btree(struct moving_context *, struct bpos, struct bpos,
-			 move_pred_fn, void *, enum btree_id, unsigned);
 
 int bch2_move_data_phys(struct bch_fs *, unsigned, u64, u64, unsigned,
 			struct bch_ratelimit *, struct bch_move_stats *,

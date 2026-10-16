@@ -2,7 +2,8 @@
 #ifndef _BCACHEFS_DISK_GROUPS_H
 #define _BCACHEFS_DISK_GROUPS_H
 
-#include "disk_groups_types.h"
+#include "init/dev_gen.h"
+#include "alloc/disk_groups_gen.h"
 
 extern const struct bch_sb_field_ops bch_sb_field_ops_disk_groups;
 
@@ -14,17 +15,7 @@ static inline unsigned disk_groups_nr(struct bch_sb_field_disk_groups *groups)
 		: 0;
 }
 
-struct target {
-	enum {
-		TARGET_NULL,
-		TARGET_DEV,
-		TARGET_GROUP,
-	}			type;
-	union {
-		unsigned	dev;
-		unsigned	group;
-	};
-};
+#include "alloc/disk_groups_defs_gen.h"
 
 #define TARGET_DEV_START	1
 #define TARGET_GROUP_START	(256 + TARGET_DEV_START)
@@ -89,11 +80,6 @@ static inline bool bch2_dev_in_target(struct bch_fs *c, unsigned dev, unsigned t
 	guard(rcu)();
 	return bch2_dev_in_target_rcu(c, dev, target);
 }
-
-int bch2_disk_path_find(struct bch_sb_handle *, const char *);
-
-/* Exported for userspace bcachefs-tools: */
-int bch2_disk_path_find_or_create(struct bch_sb_handle *, const char *);
 
 void bch2_disk_path_to_text(struct printbuf *, struct bch_fs *, unsigned);
 void bch2_disk_path_to_text_sb(struct printbuf *, struct bch_sb *, unsigned);

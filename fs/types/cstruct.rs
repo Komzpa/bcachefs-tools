@@ -1,0 +1,3054 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// Parsing the C-shared items of Rust source, and writing their C - shared by
+// the two halves of CStruct (see lib.rs), which must agree on every one:
+//   - the macros (fs/cstruct-macros), which parse their input when the fs
+//     crate compiles, and record it;
+//   - rust_types_gen (main.rs), which parses the recorded text again and
+//     writes the C.
+//
+// Both include!() this file, so it's plain `//` comments, and it depends on
+// nothing: the kernel build compiles the macros with a bare rustc.
+//
+// The macros get their input as a TokenStream and record its to_string(), so
+// an item is parsed by the same code from the same text both times.
+//
+// The items, each with an optional #[cfg(...)] - which C gets as #if:
+//
+//   #[derive(CStruct)] struct / union, named fields - #[repr(C)], optionally
+//   packed and align(N). A field's #[c("...")] is its C declaration, name
+//   included, as C's declarator syntax puts the name inside the type (arrays,
+//   function pointers); #[c_anon("...")] a C declaration that doesn't name the
+//   field (an anonymous union, a run of bitfields), whose layout only the
+//   fields around it check; a field with neither is Rust's alone, and C gets
+//   opaque storage for it. Fields can have #[cfg] too.
+//
+//   A bare #[c_anon] is C's anonymous struct or union: the field's type, a
+//   CStruct of the same file - nest! defines it in place - is written where
+//   the field is, without a name, and has no definition of its own. Its
+//   fields are asserted through the struct it's in. #[c_inline] is the same
+//   for a member C names, of a type it doesn't - struct { ... } name - whose
+//   fields are asserted as name.field; #[c_struct_group] for the kernel's
+//   struct_group(name, ...), its members both name's and the struct's own.
+//
+//   #[c_name(NAME)] on the struct: C's name for it, where Rust's differs - a
+//   family's C definition, X__head, whose name the family's type X<S> has in
+//   Rust (util/vstructs.rs). C knows it only as NAME.
+//
+//   c_verbatim!(r#"..."#): C, carried as is - what hasn't been converted.
+//
+//   c_xmacro! { NAME(x) { (args), (args), ... } }: an x-macro list. C gets
+//   #define NAME() x(args) x(args)... with each entry's text as written;
+//   Rust a macro, NAME!(cb), that hands the whole list to cb!.
+//
+//   c_bitmask! { LE64_BITMASK(struct foo, field), strip PREFIX_ {
+//       NAME(start, end), ... } }: bitfields in a flags word. C gets
+//   LE64_BITMASK(NAME, struct foo, field, start, end) for each; Rust,
+//   accessors on foo named for NAME without PREFIX_, lowercased.
+//
+//   c_ioctl! { NAME = _IOW(type, nr, ARG), ... }: ioctl numbers. C gets
+//   #define NAME _IOW(type, nr, struct arg) for each; Rust, a marker type
+//   binding the opcode to ARG, the opcode computed from the target's own
+//   _IOC constants (fs/util/ioctl.rs) - and the record carries it, for the
+//   generated header to assert C's _IOW() makes the same number.
+
+/// A cfg() predicate - for C, the #if condition it is.
+#[derive(Debug, Clone)]
+pub enum Cfg {
+    Name(String),
+    KeyValue(String, String),
+    Not(Box<Cfg>),
+    All(Vec<Cfg>),
+    Any(Vec<Cfg>),
+}
+
+impl Cfg {
+    /// The C preprocessor condition: a name is defined(NAME); target_endian
+    /// is __BYTE_ORDER__, target_pointer_width __BITS_PER_LONG.
+    #[allow(dead_code)]
+    pub fn to_c(&self) -> Result<String, String> {
+        Ok(match self {
+            Cfg::Name(n) => format!("defined({n})"),
+            Cfg::KeyValue(k, v) if k == "target_endian" && (v == "little" || v == "big") =>
+                format!("__BYTE_ORDER__ == __ORDER_{}_ENDIAN__", v.to_uppercase()),
+            Cfg::KeyValue(k, v) if k == "target_pointer_width" && (v == "32" || v == "64") =>
+                format!("__BITS_PER_LONG == {v}"),
+            Cfg::KeyValue(k, v) => return Err(format!("cfg({k} = \"{v}\") has no C equivalent")),
+            Cfg::Not(c) => format!("!({})", c.to_c()?),
+            Cfg::All(cs) => cs.iter().map(|c| c.to_c().map(|s| format!("({s})")))
+                .collect::<Result<Vec<_>, _>>()?.join(" && "),
+            Cfg::Any(cs) => cs.iter().map(|c| c.to_c().map(|s| format!("({s})")))
+                .collect::<Result<Vec<_>, _>>()?.join(" || "),
+        })
+    }
+
+    /// As Rust source, for a #[cfg(...)].
+    #[allow(dead_code)]
+    pub fn to_rust(&self) -> String {
+        match self {
+            Cfg::Name(n) => n.clone(),
+            Cfg::KeyValue(k, v) => format!("{k} = \"{v}\""),
+            Cfg::Not(c) => format!("not({})", c.to_rust()),
+            Cfg::All(cs) => format!("all({})", cs.iter().map(Cfg::to_rust).collect::<Vec<_>>().join(", ")),
+            Cfg::Any(cs) => format!("any({})", cs.iter().map(Cfg::to_rust).collect::<Vec<_>>().join(", ")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CKind {
+    Struct,
+    Union,
+}
+
+impl CKind {
+    #[allow(dead_code)]
+    pub fn keyword(self) -> &'static str {
+        match self {
+            CKind::Struct => "struct",
+            CKind::Union => "union",
+        }
+    }
+}
+
+/// A struct's repr: C's packing and alignment attributes. packed is "1" for
+/// plain packed.
+///
+/// c_packed, #[c_packed]: C's is __packed though Rust's isn't. Every field sits
+/// where C's packing puts it - at its own alignment, as the layout asserts
+/// check; a field C packs off its alignment is one of zerocopy's le:: types,
+/// aligned to 1. For __packed __aligned(N), which Rust's repr can't say:
+/// align(N) and #[c_packed].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CRepr {
+    pub repr_c:   bool,
+    pub packed:   Option<String>,
+    pub align:    Option<String>,
+    pub c_packed: bool,
+}
+
+impl CRepr {
+    /// As C attributes, after a struct's closing brace: repr(packed(N)) is
+    /// __packed __aligned(N) - Rust can't say packed and align at once.
+    #[allow(dead_code)]
+    pub fn to_c(&self) -> String {
+        let mut out = String::new();
+        match self.packed.as_deref() {
+            Some("1") => out.push_str(" __packed"),
+            Some(n) => out.push_str(&format!(" __packed __aligned({n})")),
+            None if self.c_packed => out.push_str(" __packed"),
+            None => {}
+        }
+        if let Some(n) = &self.align {
+            out.push_str(&format!(" __aligned({n})"));
+        }
+        out
+    }
+}
+
+/// A #[derive(CStruct)] struct or union: its name and fields, in order. Its
+/// repr may be per configuration: cfg_attr(PRED, repr(...)).
+#[derive(Debug)]
+pub struct CStructDef {
+    /// C's name - its Rust one too, but for #[c_name]: rust_name.
+    pub name:      String,
+    /// Its Rust name, where C's differs - #[c_name(NAME)]: a family's C
+    /// definition, X__head, whose own name the family's type X<S> takes (see
+    /// util/vstructs.rs). rust_ident() is the name to impl and lay out by.
+    pub rust_name: Option<String>,
+    pub kind:      CKind,
+    pub cfg:       Option<Cfg>,
+    pub repr:      CRepr,
+    pub cfg_reprs: Vec<(Cfg, CRepr)>,
+    pub fields:    Vec<CFieldDef>,
+    /// C has it as a typedef of this name: #[c_typedef], the struct's own name,
+    /// for typedef struct { ... } name; #[c_typedef(NAME)] for typedef struct
+    /// tag { ... } NAME - the tag the struct's name, NAME the same or not.
+    pub typedef:   Option<String>,
+    /// The typedef's struct has no tag: #[c_typedef], not #[c_typedef(NAME)].
+    pub typedef_anon: bool,
+    /// C's alignment as C spells it - SMP_CACHE_BYTES, sizeof(long) - from
+    /// an alignment marker leading the struct: Rust's repr(align) takes only
+    /// a literal. The generated header asserts the two agree.
+    pub c_align:   Option<String>,
+}
+
+impl CStructDef {
+    /// Its Rust name: C's, but for #[c_name].
+    pub fn rust_ident(&self) -> &str {
+        self.rust_name.as_deref().unwrap_or(&self.name)
+    }
+
+    /// #[repr(C)], in every configuration.
+    pub fn repr_c(&self) -> bool {
+        self.repr.repr_c || (!self.cfg_reprs.is_empty() && self.cfg_reprs.iter().all(|(_, r)| r.repr_c))
+    }
+
+    /// The type as C names it: struct foo, or a typedef's name.
+    #[allow(dead_code)]
+    pub fn c_type(&self) -> String {
+        match &self.typedef {
+            Some(t) => t.clone(),
+            None => format!("{} {}", self.kind.keyword(), self.name),
+        }
+    }
+}
+
+/// A bitfield-struct type (#[bitfield(uN)]): its storage, C's declared type of
+/// its integer members (ty), and its members least significant first - (name,
+/// Rust type, width). A member as wide as its C type is a plain member in C;
+/// narrower, a bitfield of that unit.
+#[derive(Debug)]
+#[allow(dead_code)] // cfg and storage: read by rust_types_gen, not the macros
+pub struct CBitfieldDef {
+    pub name:    String,
+    pub cfg:     Option<Cfg>,
+    pub storage: String,
+    pub ty:      String,
+    pub fields:  Vec<(String, String, u32)>,
+}
+
+impl CBitfieldDef {
+    /// The type C declares a member of Rust type @rust_ty: an integer, the
+    /// bitfield's ty - C lays a bitfield out by its members' declared type,
+    /// Rust reads each at its width rounded up; bool and enums, themselves.
+    #[allow(dead_code)] // rust_types_gen's
+    pub fn c_type<'a>(&'a self, rust_ty: &'a str) -> &'a str {
+        let t = rust_ty.trim();
+        if t.starts_with('u') && int_bits(t).is_some() { &self.ty } else { rust_ty }
+    }
+}
+
+/// One field: its name (as C has it - type, not type_), its Rust type as written, its C
+/// declaration if C sees it, and whether that declaration names it.
+#[derive(Debug)]
+pub struct CFieldDef {
+    pub name:     String,
+    pub ty:       String,
+    /// Its visibility, as written: `pub`, `pub(crate)`, or empty.
+    pub vis:      String,
+    pub c_decl:   Option<String>,
+    /// C doesn't name it: #[c_anon("...")], C's declaration in c_decl, or a
+    /// bare #[c_anon], its type written in its place - see in_place_def().
+    // Read by rust_types_gen, not the macros.
+    #[allow(dead_code)]
+    pub anon:     bool,
+    /// #[c_inline]: C names it, but not its type, which is written in its
+    /// place.
+    #[allow(dead_code)]
+    pub inline:   bool,
+    /// #[c_struct_group]: likewise, as the kernel's struct_group(name, ...) -
+    /// its members C's directly too.
+    #[allow(dead_code)]
+    pub group:    bool,
+    /// #[c_bitfield]: its type is a bitfield-struct type, whose members C
+    /// declares in its place.
+    pub bitfield: bool,
+    /// #[bits(N)], in a bitfield-struct type: its width.
+    pub bits:     Option<u32>,
+    /// #[counted_by(FIELD)], on a trailing `[T; 0]`: the field its length
+    /// is - C's __counted_by(), as the struct's FlexArray impl.
+    pub counted_by: Option<String>,
+    pub cfg:      Option<Cfg>,
+    /// C's __aligned() on the member: from an alignment marker before it.
+    #[allow(dead_code)]
+    pub c_align:  Option<String>,
+}
+
+impl CFieldDef {
+    /// The last segment of the field's type path, generics dropped:
+    /// `bcachefs_types::Foo<T>` -> `Foo`.
+    #[allow(dead_code)]
+    pub fn ty_name(&self) -> &str {
+        let base = self.ty.split('<').next().unwrap_or(&self.ty);
+        base.rsplit("::").next().unwrap_or(base).trim()
+    }
+
+    /// The field's name as Rust spells it: a keyword gets a _.
+    #[allow(dead_code)]
+    pub fn rust_name(&self) -> String {
+        rust_ident(&self.name)
+    }
+}
+
+/// C carried as is.
+#[derive(Debug)]
+pub struct CVerbatim {
+    pub cfg:  Option<Cfg>,
+    pub text: String,
+}
+
+/// An x-macro list.
+#[derive(Debug)]
+pub struct CXMacro {
+    pub cfg:      Option<Cfg>,
+    pub name:     String,
+    pub callback: String,
+    pub entries:  Vec<CXEntry>,
+}
+
+/// An entry of an x-macro list.
+#[derive(Debug)]
+pub enum CXEntry {
+    /// (args): its arguments' C text.
+    Args(String),
+    /// SUB() - another list's entries, here - or SUB(MAP(params) =>
+    /// (template)): SUB's entries, each passed through MAP, which C defines
+    /// as #define MAP(params) x(template).
+    Sub { list: String, map: Option<CXMap> },
+}
+
+#[derive(Debug)]
+pub struct CXMap {
+    pub name:     String,
+    pub params:   Vec<String>,
+    /// The arguments MAP gives x, as C text: params, and ## pastes.
+    pub template: String,
+}
+
+/// Bitfields in one flags word: @macro_name is LE64_BITMASK, LE32_BITMASK,
+/// LE16_BITMASK or BITMASK; @c_type the C struct type, "struct foo"; @field
+/// the flags word, as C and Rust both write it: "flags[0]".
+#[derive(Debug)]
+pub struct CBitmask {
+    pub cfg:        Option<Cfg>,
+    pub macro_name: String,
+    /// The struct as written, "struct foo": Rust's name, which the header
+    /// generator renders as C's.
+    pub c_type:     String,
+    /// The type the accessors are on: "foo" - or for `struct Head<foo>`, a
+    /// family's C definition, "foo__head".
+    pub rust_type:  String,
+    pub field:      String,
+    pub strip:      Option<String>,
+    pub entries:    Vec<CBitmaskEntry>,
+}
+
+#[derive(Debug)]
+pub struct CBitmaskEntry {
+    pub name:  String,
+    pub start: String,
+    pub end:   String,
+}
+
+impl CBitmask {
+    /// The Rust accessor for @name: PREFIX_ stripped, lowercased - and with a
+    /// leading _ if that starts with a digit: BCH_SB_128_BIT_MACS.
+    #[allow(dead_code)]
+    pub fn method(&self, name: &str) -> String {
+        let n = self.strip.as_deref().and_then(|p| name.strip_prefix(p)).unwrap_or(name);
+        let n = n.to_lowercase();
+        if n.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("_{n}")
+        } else {
+            rust_ident(&n)
+        }
+    }
+}
+
+/// c_ioctl!: ioctl numbers, C's #define NAME _IOW(type, nr, arg).
+#[derive(Debug)]
+pub struct CIoctl {
+    pub cfg:     Option<Cfg>,
+    pub entries: Vec<CIoctlEntry>,
+}
+
+/// One ioctl: @dir is its _IO*() macro - _IO, _IOR, _IOW or _IOWR - and
+/// @ty and @nr its type and number, as written. @arg is the argument's Rust
+/// type, None for _IO; @c_arg its C type, from #[c("...")], when the Rust
+/// type doesn't say it.
+#[derive(Debug)]
+pub struct CIoctlEntry {
+    pub name:  String,
+    pub dir:   String,
+    pub ty:    String,
+    pub nr:    String,
+    pub arg:   Option<String>,
+    pub c_arg: Option<String>,
+}
+
+/// What an enum's values can be - fs/enum_kind.h's markers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CEnumKind {
+    /// Only ever those listed: a Rust enum.
+    Closed,
+    /// Anything, from outside: a newtype with the values as constants.
+    Open,
+    /// Masks, or'd: a bitflags type.
+    Flags,
+}
+
+impl CEnumKind {
+    #[allow(dead_code)]
+    pub fn marker(self) -> &'static str {
+        match self {
+            CEnumKind::Closed => "__enum_closed",
+            CEnumKind::Open   => "__enum_open",
+            CEnumKind::Flags  => "__enum_flags",
+        }
+    }
+
+    /// The attribute that says it: #[closed], #[open], #[flags].
+    pub fn attr(self) -> &'static str {
+        match self {
+            CEnumKind::Closed => "closed",
+            CEnumKind::Open   => "open",
+            CEnumKind::Flags  => "flags",
+        }
+    }
+}
+
+/// Items from an x-macro list: `LIST(params) => template`. Each entry's
+/// arguments are bound to the params - `..` the rest - and `A ## B` in the
+/// template is pasted into one identifier: spaced, as Rust 2021 lexes `a##b`
+/// as a reserved prefix.
+#[derive(Debug, Clone)]
+pub struct CFromList {
+    pub list:     String,
+    pub params:   Vec<String>,
+    pub template: String,
+}
+
+/// c_enum!: an enum, and what its values can be. @name is None for an
+/// anonymous one: constants. A variant's value is Rust source, or none for
+/// the one after the last; the generator replaces them with what they
+/// evaluate to.
+#[derive(Debug)]
+pub struct CEnumDef {
+    pub cfg:      Option<Cfg>,
+    pub kind:     CEnumKind,
+    pub name:     Option<String>,
+    /// The integer type: u32, i32, u64.
+    pub repr:     String,
+    pub variants: Vec<(String, Option<String>)>,
+    /// `LIST(params) => VARIANT [= value]`: variants from lists, each in
+    /// place before the written one at its index - expand_enum_list() makes
+    /// them, a list at a time.
+    pub from:     Vec<(usize, CFromList)>,
+}
+
+/// c_typedef!: a type alias, C's typedef. @c_decl is its C declarator - the
+/// declaration less `typedef` - where the canonical rendering of @ty isn't.
+#[derive(Debug)]
+pub struct CTypedef {
+    pub cfg:    Option<Cfg>,
+    pub name:   String,
+    pub ty:     String,
+    pub c_decl: Option<String>,
+}
+
+/// c_same!: a Rust type with the layout of a C type. The generator checks it:
+/// size, alignment, and the offsets of @fields, which both name. (No cfg: a
+/// c_same! a build leaves out has no record, so nothing to check.)
+#[derive(Debug)]
+pub struct CSame {
+    #[allow(dead_code)]
+    pub c_type:  String,
+    pub rust_ty: String,
+    pub fields:  Vec<String>,
+}
+
+/// c_const!: an integer constant, C's #define.
+#[derive(Debug)]
+pub struct CConst {
+    pub cfg:    Option<Cfg>,
+    pub name:   String,
+    pub ty:     String,
+    /// The #define's type: @ty's, or int under #[c_int].
+    pub c_type: String,
+    pub value:  String,
+}
+
+impl CConst {
+    /// The #define's value: the number rustc evaluated, written so C gives
+    /// it c_type: `5U`, `5ULL`, `((size_t) 5)`. A
+    /// constant's type is what C does with it - %zu, integer promotion,
+    /// signed against unsigned - and a bare number would be int, or
+    /// whatever's wide enough.
+    fn c_value(&self) -> Result<String, String> {
+        let v = self.value.parse::<i128>()
+            .map_err(|_| format!("{}: value {} isn't a number - the records path evaluates every constant",
+                                 self.name, self.value))?;
+        let suffix = match self.c_type.as_str() {
+            "int" | "s32"                   => Some(("", i32::MIN as i128, i32::MAX as i128)),
+            "unsigned" | "u32"              => Some(("U", 0, u32::MAX as i128)),
+            "long"                          => Some(("L", i64::MIN as i128, i64::MAX as i128)),
+            "unsigned long"                 => Some(("UL", 0, u64::MAX as i128)),
+            "long long" | "s64"             => Some(("LL", i64::MIN as i128, i64::MAX as i128)),
+            "unsigned long long" | "u64"    => Some(("ULL", 0, u64::MAX as i128)),
+            _                               => None,
+        };
+        Ok(match suffix {
+            Some((_, min, max)) if v < min || v > max =>
+                return Err(format!("c_const! {}: {v} isn't a {}, its C type", self.name, self.c_type)),
+            // C's negative numbers are a positive literal negated: the
+            // type's minimum has no literal of the type
+            Some((_, min, _)) if v == min && v < 0 =>
+                return Err(format!("c_const! {}: {v}, the minimum of {}, has no C literal", self.name, self.c_type)),
+            Some((s, _, _)) => format!("{v}{s}"),
+            None => {
+                let wide = if i32::try_from(v).is_ok() { "" } else if v < 0 { "LL" } else { "ULL" };
+                format!("(({}) {v}{wide})", self.c_type)
+            }
+        })
+    }
+}
+
+/// Whether integer type @ty, a Rust one, is signed: how a constant's
+/// record, `as u64`, reads back.
+#[allow(dead_code)]
+fn rust_int_signed(ty: &str) -> bool {
+    let last = ty.rsplit("::").next().unwrap_or(ty).trim();
+    last.starts_with('i') || matches!(last, "c_schar" | "c_short" | "c_int" | "c_long" | "c_longlong")
+}
+
+/// A C function Rust calls, from c_extern!. #[must_use] is C's
+/// __must_check, #[cold] its __cold, and a return type of ! its __noreturn;
+/// #[c_printf(FMT, ARGS)], C's alone, is its __printf(FMT, ARGS).
+#[derive(Debug)]
+pub struct CFnDecl {
+    pub cfg:      Option<Cfg>,
+    pub name:     String,
+    /// Each parameter's name and Rust type.
+    pub params:   Vec<(String, String)>,
+    pub variadic: bool,
+    pub ret:      Option<String>,
+    pub must_use: bool,
+    pub cold:     bool,
+    pub printf:   Option<String>,
+}
+
+/// A C variable Rust uses, from c_extern!. One that isn't `mut` is C's
+/// const; #[c("...")] is its C declaration where the Rust type doesn't say
+/// it.
+#[derive(Debug)]
+pub struct CStaticDecl {
+    pub cfg:     Option<Cfg>,
+    pub name:    String,
+    pub ty:      String,
+    pub mutable: bool,
+    pub c_decl:  Option<String>,
+}
+
+/// c_extern!: what Rust calls of a C header - fs/foo/bar_c.rs, of
+/// fs/foo/bar.h. Rust gets an extern "C" block; C, the prototypes, which
+/// bar.h includes, so a declaration that has drifted from the C one is a
+/// conflicting-types error in the C build. And a #[c_export] fn: what C calls
+/// of Rust - its prototype, Rust's side the definition.
+#[derive(Debug)]
+pub struct CExtern {
+    pub cfg:     Option<Cfg>,
+    pub fns:     Vec<CFnDecl>,
+    pub statics: Vec<CStaticDecl>,
+    /// A #[c_export] fn's: a run of them is one block of prototypes.
+    pub export:  bool,
+}
+
+/// One arm of a tagged_union!: its name, payload type, and tag value.
+#[derive(Debug, Clone)]
+pub struct CTaggedArm {
+    pub name:  String,
+    pub ty:    String,
+    pub value: String,
+}
+
+/// tagged_union!: a tagged union with a stable representation.
+///
+///   tagged_union! {
+///       pub struct disk_accounting_pos {
+///           tag type_: u8 = disk_accounting_type,
+///           arms from BCH_DISK_ACCOUNTING_TYPES(f, nr, ..) => f: bch_acct_ ## f = nr,
+///           pad: c::bpos,
+///           size: pad,
+///           packed,
+///       }
+///   }
+///
+/// The storage is what C has: the tag, then a union of the arms, overlaid
+/// with the pad, if any. The arms come from an x-macro list, `arms from
+/// LIST(params) => template`, its entries bound to the params and `##`
+/// pasting tokens - or are written out, `arm name: Type = value`, which is
+/// the form its record has. The arms' types can be defined in the block too,
+/// `[#[...]] [pub] struct|union NAME { ... }`: they go to nestify::nest!,
+/// with the declaration's `#[...]*`.
+///
+/// `size: pad` says what its size is a function of: nothing, a constant,
+/// the pad's. Or it's the header's count, `size: header` - the storage is
+/// another's, `union NAME in STORAGE { .., size: header }`, a header its
+/// arms embed and run past - and what's generated is only the typed view of
+/// it; its arms' types are another's too. Or it's the tag's, `size: arm`,
+/// `union NAME in HEAD { .., size: arm }`: each value as long as the arm its
+/// tag selects, the head the start of every arm.
+#[derive(Debug)]
+pub struct CTaggedUnion {
+    pub cfg:       Option<Cfg>,
+    pub name:      String,
+    /// `union NAME in STORAGE`: unsized, over another's storage - see
+    /// storage; else `struct NAME`, its own sized storage, which this
+    /// defines.
+    pub union:     bool,
+    /// `in STORAGE`: the storage is that type, defined elsewhere, and its C
+    /// too; what's generated is the typed view of it.
+    pub storage:   Option<String>,
+    /// The tag's name: its field, and the accessor.
+    pub tag_field: String,
+    pub tag_ty:    String,
+    /// `= TAG_ENUM`: the tag as handed out, a newtype over an integer the
+    /// tag widens to - or empty, the tag as it is.
+    pub tag_enum:  String,
+    /// `arms from LIST(params) => template`.
+    pub from:      Option<CFromList>,
+    pub arms:      Vec<CTaggedArm>,
+    pub pad:       Option<String>,
+    /// `packed`: C's __packed - for a struct, the payload right after the
+    /// tag whatever the arms' alignment, which is what the format says.
+    pub packed:    bool,
+    /// `size: ..`: what its size is a function of.
+    pub size:      CTaggedSize,
+    /// Arm types defined in the block, for nestify::nest!.
+    pub defs:      Vec<CTaggedDef>,
+}
+
+/// What a tagged_union!'s size is a function of, `size: pad|header|arm`:
+/// the rest follows from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CTaggedSize {
+    /// Nothing - a constant, its pad's: a struct, its own storage, which
+    /// holds every arm, and a value of plain data.
+    Pad,
+    /// Its header's count: a union over another's storage, an unsized
+    /// vstruct, its arms embedding the header and running past it as far as
+    /// the count says - a family (util/vstructs.rs), each state's reference
+    /// to which has its arm's bytes.
+    Header,
+    /// Its tag: the arm the tag selects, whose size it is - a union, its
+    /// storage the head every arm starts with, the tag in it; a value read
+    /// off bytes and written back to them, no C of its own (ArmSized).
+    Arm,
+}
+
+impl CTaggedSize {
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Pad    => "pad",
+            Self::Header => "header",
+            Self::Arm    => "arm",
+        }
+    }
+}
+
+/// An arm's type, defined in its tagged_union!'s block.
+#[derive(Debug, Clone)]
+pub struct CTaggedDef {
+    pub name: String,
+}
+
+/// Where a definition's `struct|union NAME { ... }` starts in @item, past its
+/// attributes and visibility - if it is one.
+fn tagged_def_at(item: &[Tok]) -> Option<usize> {
+    let j = skip_vis(item, skip_attrs(item, 0).ok()?).ok()?;
+    match (item.get(j), item.get(j + 1), item.get(j + 2)) {
+        (Some(Tok::Ident(kw)), Some(Tok::Ident(_)), Some(Tok::Punct('{')))
+            if kw == "struct" || kw == "union" => Some(j),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+pub enum CItem {
+    Extern(CExtern),
+    TaggedUnion(CTaggedUnion),
+    Struct(CStructDef),
+    Bitfield(CBitfieldDef),
+    Verbatim(CVerbatim),
+    XMacro(CXMacro),
+    Bitmask(CBitmask),
+    Ioctl(CIoctl),
+    Enum(CEnumDef),
+    Const(CConst),
+    Typedef(CTypedef),
+    Same(CSame),
+}
+
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+    "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do", "final",
+    "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "union",
+    "gen",
+];
+
+/// A C name as Rust spells it: a keyword gets a _ - type is type_, as
+/// bindgen has it.
+pub fn rust_ident(name: &str) -> String {
+    if RUST_KEYWORDS.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
+/// The C name of Rust identifier @name: rust_ident() undone.
+pub fn c_ident(name: &str) -> String {
+    match name.strip_suffix('_') {
+        Some(kw) if RUST_KEYWORDS.contains(&kw) => kw.to_string(),
+        _ => name.to_string(),
+    }
+}
+
+// ---- tokens ------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    Ident(String),
+    Punct(char),
+    /// A string literal: its value, and its source text.
+    Str(String, String),
+    Lit(String),
+}
+
+impl Tok {
+    fn is_punct(&self, c: char) -> bool {
+        *self == Tok::Punct(c)
+    }
+
+    fn is_ident(&self, s: &str) -> bool {
+        matches!(self, Tok::Ident(i) if i == s)
+    }
+}
+
+fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
+    let s: Vec<char> = src.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+
+    while i < s.len() {
+        let c = s[i];
+
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '/' && s.get(i + 1) == Some(&'/') {
+            while i < s.len() && s[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && s.get(i + 1) == Some(&'*') {
+            // Rust block comments nest.
+            let mut depth = 0;
+            loop {
+                if i + 1 >= s.len() {
+                    return Err("unterminated block comment".into());
+                }
+                if s[i] == '/' && s[i + 1] == '*' {
+                    depth += 1;
+                    i += 2;
+                } else if s[i] == '*' && s[i + 1] == '/' {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == '"' {
+            let start = i;
+            let mut v = String::new();
+            i += 1;
+            loop {
+                match s.get(i) {
+                    None => return Err("unterminated string literal".into()),
+                    Some('"') => break,
+                    Some('\\') => {
+                        match s.get(i + 1) {
+                            Some('n') => v.push('\n'),
+                            Some('t') => v.push('\t'),
+                            Some(&e) => v.push(e),
+                            None => return Err("unterminated string literal".into()),
+                        }
+                        i += 2;
+                    }
+                    Some(&ch) => {
+                        v.push(ch);
+                        i += 1;
+                    }
+                }
+            }
+            i += 1;
+            toks.push(Tok::Str(v, s[start..i].iter().collect()));
+        } else if c == 'r' && matches!(s.get(i + 1), Some('"') | Some('#')) {
+            // Raw string r"..." / r#"..."#, or raw identifier r#ident.
+            let start = i;
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while s.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if s.get(j) != Some(&'"') {
+                let id_start = j;
+                while j < s.len() && (s[j].is_alphanumeric() || s[j] == '_') {
+                    j += 1;
+                }
+                toks.push(Tok::Ident(s[id_start..j].iter().collect()));
+                i = j;
+                continue;
+            }
+            j += 1;
+            let v_start = j;
+            loop {
+                if j >= s.len() {
+                    return Err("unterminated raw string literal".into());
+                }
+                if s[j] == '"' && (0..hashes).all(|h| s.get(j + 1 + h) == Some(&'#')) {
+                    break;
+                }
+                j += 1;
+            }
+            let v = s[v_start..j].iter().collect();
+            i = j + 1 + hashes;
+            toks.push(Tok::Str(v, s[start..i].iter().collect()));
+        } else if c == '\'' {
+            // A char literal, or a lifetime.
+            if s.get(i + 1) == Some(&'\\') {
+                let mut j = i + 2;
+                while j < s.len() && s[j] != '\'' {
+                    j += 1;
+                }
+                toks.push(Tok::Lit(s[i..=j.min(s.len() - 1)].iter().collect()));
+                i = j + 1;
+            } else if s.get(i + 2) == Some(&'\'') {
+                toks.push(Tok::Lit(s[i..i + 3].iter().collect()));
+                i += 3;
+            } else {
+                let mut j = i + 1;
+                while j < s.len() && (s[j].is_alphanumeric() || s[j] == '_') {
+                    j += 1;
+                }
+                toks.push(Tok::Lit(s[i..j].iter().collect()));
+                i = j;
+            }
+        } else if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < s.len() && (s[i].is_alphanumeric() || s[i] == '_') {
+                i += 1;
+            }
+            toks.push(Tok::Ident(s[start..i].iter().collect()));
+        } else if c.is_ascii_digit() {
+            let start = i;
+            while i < s.len() && (s[i].is_alphanumeric() || s[i] == '_') {
+                i += 1;
+            }
+            toks.push(Tok::Lit(s[start..i].iter().collect()));
+        } else {
+            toks.push(Tok::Punct(c));
+            i += 1;
+        }
+    }
+
+    Ok(toks)
+}
+
+/// The index just past the bracket group opening at @i, with nested groups of
+/// every kind skipped.
+fn skip_group(toks: &[Tok], i: usize) -> Result<usize, String> {
+    let mut depth = 0i32;
+    let mut j = i;
+    while j < toks.len() {
+        match &toks[j] {
+            Tok::Punct('(' | '[' | '{') => depth += 1,
+            Tok::Punct(')' | ']' | '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(j + 1);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    Err("unbalanced brackets".into())
+}
+
+/// Split @toks on @sep at bracket depth 0; an empty last part is dropped.
+fn split_top(toks: &[Tok], sep: char) -> Vec<&[Tok]> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            Tok::Punct('(' | '[' | '{') => depth += 1,
+            Tok::Punct(')' | ']' | '}') => depth -= 1,
+            Tok::Punct(c) if *c == sep && depth == 0 => {
+                parts.push(&toks[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < toks.len() {
+        parts.push(&toks[start..]);
+    }
+    parts
+}
+
+/// Render tokens as Rust source, `::` and generics intact.
+fn tokens_to_rust(toks: &[Tok]) -> String {
+    // A space only between two words: punctuation stays as written, so `<<`
+    // and `->` come back whole - the tokenizer splits them.
+    let word = |t: &Tok| !matches!(t, Tok::Punct(_));
+    let mut out = String::new();
+    for (n, t) in toks.iter().enumerate() {
+        if n > 0 && word(&toks[n - 1]) && word(t) {
+            out.push(' ');
+        }
+        match t {
+            Tok::Ident(s) | Tok::Lit(s) => out.push_str(s),
+            Tok::Punct(c) => out.push(*c),
+            Tok::Str(_, raw) => out.push_str(raw),
+        }
+    }
+    out
+}
+
+/// Render tokens as C source: a space only between two words, so C's
+/// multi-character operators - `->`, `<<` - come out whole.
+fn tokens_to_c(toks: &[Tok]) -> String {
+    let word = |t: &Tok| !matches!(t, Tok::Punct(_));
+    let mut out = String::new();
+    for (n, t) in toks.iter().enumerate() {
+        if n > 0 && (word(&toks[n - 1]) && word(t) ||
+                     toks[n - 1].is_punct(',') || t.is_punct('|') || toks[n - 1].is_punct('|')) {
+            out.push(' ');
+        }
+        match t {
+            Tok::Ident(s) | Tok::Lit(s) => out.push_str(s),
+            Tok::Punct(c) => out.push(*c),
+            Tok::Str(_, raw) => out.push_str(raw),
+        }
+    }
+    out
+}
+
+// ---- attributes ------------------------------------------------------------
+
+/// An attribute at @i (`#` `[`...`]`): its tokens between the brackets, and
+/// the index after it. None if there isn't one there.
+fn attr_at(toks: &[Tok], i: usize) -> Result<Option<(&[Tok], usize)>, String> {
+    if !toks.get(i).is_some_and(|t| t.is_punct('#')) ||
+       !toks.get(i + 1).is_some_and(|t| t.is_punct('[')) {
+        return Ok(None);
+    }
+    let end = skip_group(toks, i + 1)?;
+    Ok(Some((&toks[i + 2..end - 1], end)))
+}
+
+/// An attribute's arguments, if its path is @name: `repr`, `derive`, `c`.
+fn attr_args<'a>(attr: &'a [Tok], name: &str) -> Option<&'a [Tok]> {
+    match attr {
+        [Tok::Ident(n), Tok::Punct('('), rest @ ..] if n == name =>
+            rest.split_last().map(|(_, args)| args),
+        _ => None,
+    }
+}
+
+/// A family attribute's arguments (cstruct-macros' vstructs.rs):
+/// `#[counted(PATH, tail = ..)]`, `#[unsized_vstruct(tail = ..)]`,
+/// `#[grown(from = FIELD)]`.
+#[derive(Debug, Default)]
+pub struct FamilyArgs {
+    /// The one argument that isn't `key = value`: the count, a field path.
+    pub count: Option<String>,
+    /// `tail = [E]` or `tail = NAME: [E]`: the tail's name, if it's named,
+    /// and E.
+    pub tail: Option<(Option<String>, String)>,
+    /// `from = FIELD`.
+    pub from: Option<String>,
+}
+
+/// @src, a family attribute's arguments: an error for one it doesn't take -
+/// @takes, of "count", "tail" and "from" - or one not written as its kind is.
+/// The caller names the attribute and the struct.
+pub fn parse_family_args(src: &str, takes: &[&str]) -> Result<FamilyArgs, String> {
+    let toks = tokenize(src)?;
+    let mut args = FamilyArgs::default();
+    for part in split_top(&toks, ',') {
+        let (kind, set) = match part {
+            [] => continue,
+            [Tok::Ident(k), Tok::Punct('='), v @ ..] => {
+                let bad = || format!("({}) not understood", tokens_to_rust(part));
+                match k.as_str() {
+                    "tail" => {
+                        let (name, slice) = match v {
+                            [Tok::Ident(n), Tok::Punct(':'), s @ ..] if s.first().is_some_and(|t| t.is_punct('[')) =>
+                                (Some(n.clone()), s),
+                            s => (None, s),
+                        };
+                        let elem = match slice {
+                            [Tok::Punct('['), e @ .., Tok::Punct(']')] if !e.is_empty() && split_top(e, ';').len() == 1 =>
+                                tokens_to_rust(e),
+                            _ => return Err(format!("tail = [E] - a slice - not tail = {}", tokens_to_rust(v))),
+                        };
+                        ("tail", args.tail.replace((name, elem)).is_some())
+                    }
+                    "from" => match v {
+                        [Tok::Ident(f)] => ("from", args.from.replace(f.clone()).is_some()),
+                        _ => return Err(bad()),
+                    },
+                    _ => return Err(format!("no argument {k}")),
+                }
+            }
+            p => ("count", args.count.replace(tokens_to_rust(p)).is_some()),
+        };
+        if !takes.contains(&kind) {
+            return Err(format!("doesn't take ({})", tokens_to_rust(part)));
+        }
+        if set {
+            return Err(format!("{kind} given twice"));
+        }
+    }
+    Ok(args)
+}
+
+/// Parse a cfg predicate.
+fn parse_cfg(toks: &[Tok]) -> Result<Cfg, String> {
+    match toks {
+        [Tok::Ident(n)] => Ok(Cfg::Name(n.clone())),
+        [Tok::Ident(k), Tok::Punct('='), Tok::Str(v, _)] => Ok(Cfg::KeyValue(k.clone(), v.clone())),
+        [Tok::Ident(op), Tok::Punct('('), rest @ .., Tok::Punct(')')] => {
+            let args = split_top(rest, ',').into_iter().map(parse_cfg).collect::<Result<Vec<_>, _>>()?;
+            match op.as_str() {
+                "not" if args.len() == 1 => Ok(Cfg::Not(Box::new(args.into_iter().next().unwrap()))),
+                "all" => Ok(Cfg::All(args)),
+                "any" => Ok(Cfg::Any(args)),
+                _ => Err(format!("cfg({}) not understood", tokens_to_rust(toks))),
+            }
+        }
+        _ => Err(format!("cfg({}) not understood", tokens_to_rust(toks))),
+    }
+}
+
+/// Item attributes we read; others are skipped.
+#[derive(Default)]
+struct ItemAttrs {
+    cfg:       Option<Cfg>,
+    derives:   bool,
+    repr:      CRepr,
+    cfg_reprs: Vec<(Cfg, CRepr)>,
+    /// #[bitfield(uN)]: a bitfield-struct type, its storage.
+    bitfield:  Option<String>,
+    /// #[bitfield(.., ty = T)]: C's declared type of its integer members.
+    bitfield_ty: Option<String>,
+    /// #[c_typedef] or #[c_typedef(NAME)].
+    typedef:   Option<Option<String>>,
+    /// #[c_name(NAME)]: C's name for it, where Rust's differs.
+    c_name:    Option<String>,
+    /// #[c("...")] on an item: its C declaration.
+    c_decl:    Option<String>,
+    /// #[c_export] on a fn.
+    c_export:  bool,
+    /// #[must_use] on a fn.
+    must_use:  bool,
+    /// #[cold] on a fn.
+    cold:      bool,
+    /// #[c_printf(FMT, ARGS)] on a fn: its arguments.
+    c_printf:  Option<String>,
+}
+
+fn parse_repr(args: &[Tok], into: &mut CRepr) -> Result<(), String> {
+    for r in split_top(args, ',') {
+        match r {
+            [Tok::Ident(c)] if c == "C" => into.repr_c = true,
+            [Tok::Ident(p)] if p == "packed" => into.packed = Some("1".into()),
+            [Tok::Ident(p), Tok::Punct('('), n @ .., Tok::Punct(')')] if p == "packed" =>
+                into.packed = Some(tokens_to_rust(n)),
+            [Tok::Ident(al), Tok::Punct('('), n @ .., Tok::Punct(')')] if al == "align" =>
+                into.align = Some(tokens_to_rust(n)),
+            _ => return Err(format!("repr({}) not supported", tokens_to_rust(r))),
+        }
+    }
+    Ok(())
+}
+
+/// Read the attributes at @i, returning them and the index after.
+fn item_attrs(toks: &[Tok], mut i: usize) -> Result<(ItemAttrs, usize), String> {
+    let mut a = ItemAttrs::default();
+    while let Some((attr, next)) = attr_at(toks, i)? {
+        if let Some(args) = attr_args(attr, "cfg") {
+            a.cfg = Some(parse_cfg(args)?);
+        }
+        if let Some(args) = attr_args(attr, "derive") {
+            a.derives |= args.iter().any(|t| t.is_ident("CStruct"));
+        }
+        if let Some(args) = attr_args(attr, "repr") {
+            parse_repr(args, &mut a.repr)?;
+        }
+        if let Some(args) = attr_args(attr, "cfg_attr") {
+            // cfg_attr(PRED, repr(...)): a repr for one configuration.
+            let parts = split_top(args, ',');
+            if let [pred, r] = parts.as_slice() {
+                if let Some(rargs) = attr_args(r, "repr") {
+                    let mut repr = CRepr::default();
+                    parse_repr(rargs, &mut repr)?;
+                    a.cfg_reprs.push((parse_cfg(pred)?, repr));
+                }
+            }
+        }
+        if let Some(args) = attr_args(attr, "bitfield") {
+            let args = split_top(args, ',');
+            a.bitfield = args.first().map(|t| tokens_to_rust(t));
+            a.bitfield_ty = args.iter().find_map(|t| match *t {
+                [Tok::Ident(k), Tok::Punct('='), ty @ ..] if k == "ty" => Some(tokens_to_rust(ty)),
+                _ => None,
+            });
+        }
+        if matches!(attr, [Tok::Ident(n)] if n == "c_typedef") {
+            a.typedef = Some(None);
+        }
+        if matches!(attr, [Tok::Ident(n)] if n == "c_packed") {
+            a.repr.c_packed = true;
+        }
+        if matches!(attr, [Tok::Ident(n)] if n == "c_export") {
+            a.c_export = true;
+        }
+        if matches!(attr, [Tok::Ident(n), ..] if n == "must_use") {
+            a.must_use = true;
+        }
+        if matches!(attr, [Tok::Ident(n)] if n == "cold") {
+            a.cold = true;
+        }
+        if let Some(args) = attr_args(attr, "c_printf") {
+            a.c_printf = Some(tokens_to_c(args));
+        }
+        if let Some([Tok::Str(s, _)]) = attr_args(attr, "c") {
+            a.c_decl = Some(s.clone());
+        }
+        if let Some([Tok::Ident(t)]) = attr_args(attr, "c_typedef") {
+            a.typedef = Some(Some(t.clone()));
+        }
+        if let Some([Tok::Ident(n)]) = attr_args(attr, "c_name") {
+            a.c_name = Some(n.clone());
+        }
+        i = next;
+    }
+    for (_, r) in &mut a.cfg_reprs {
+        r.c_packed = a.repr.c_packed;
+    }
+    Ok((a, i))
+}
+
+/// Skip a visibility at @i: `pub`, or `pub(...)`.
+fn skip_vis(toks: &[Tok], mut i: usize) -> Result<usize, String> {
+    if toks.get(i).is_some_and(|t| t.is_ident("pub")) {
+        i += 1;
+        if toks.get(i).is_some_and(|t| t.is_punct('(')) {
+            i = skip_group(toks, i)?;
+        }
+    }
+    Ok(i)
+}
+
+fn ident_at(toks: &[Tok], i: usize) -> Option<&str> {
+    match toks.get(i) {
+        Some(Tok::Ident(s)) => Some(s),
+        _ => None,
+    }
+}
+
+// ---- structs ---------------------------------------------------------------
+
+/// The struct or union at @i, after its attributes @a, and the index after
+/// it; None if there isn't one.
+fn parse_struct(toks: &[Tok], i: usize, a: ItemAttrs) -> Result<Option<(CStructDef, usize)>, String> {
+    let mut i = skip_vis(toks, i)?;
+    let kind = match ident_at(toks, i) {
+        Some("struct") => CKind::Struct,
+        Some("union") => CKind::Union,
+        _ => return Ok(None),
+    };
+    let Some(name) = ident_at(toks, i + 1) else { return Ok(None) };
+    let name = name.to_string();
+    i += 2;
+
+    if !toks.get(i).is_some_and(|t| t.is_punct('{')) {
+        return Err(format!("{name}: a CStruct has named fields, and no generics - an unsized \
+                            vstruct's states are each its own definition: #[unsized_vstruct]"));
+    }
+    let body_end = skip_group(toks, i)? - 1;
+    i += 1;
+
+    let mut fields = Vec::new();
+    while i < body_end {
+        let mut c_decl = None;
+        let mut anon = false;
+        let mut inline = false;
+        let mut group = false;
+        let mut bitfield = false;
+        let mut bits = None;
+        let mut counted_by = None;
+        let mut cfg = None;
+        while let Some((attr, next)) = attr_at(toks, i)? {
+            if matches!(attr, [Tok::Ident(n)] if n == "c_bitfield") {
+                bitfield = true;
+            }
+            if matches!(attr, [Tok::Ident(n)] if n == "c_anon") {
+                anon = true;
+            }
+            if matches!(attr, [Tok::Ident(n)] if n == "c_inline") {
+                inline = true;
+            }
+            if matches!(attr, [Tok::Ident(n)] if n == "c_struct_group") {
+                group = true;
+            }
+            // #[bits(N, ...)]: the width, then bitfield-struct's options -
+            // from = and into = for a member's type - which C doesn't see
+            if let Some(args) = attr_args(attr, "bits") {
+                match args {
+                    [Tok::Lit(n)] | [Tok::Lit(n), Tok::Punct(','), ..] => bits = Some(n.parse::<u32>()
+                        .map_err(|_| format!("{name}: #[bits({n})] isn't a width"))?),
+                    _ => return Err(format!("{name}: #[bits(N, ...)] takes a width first")),
+                }
+            }
+            for (n, is_anon) in [("c", false), ("c_anon", true)] {
+                if let Some(args) = attr_args(attr, n) {
+                    match args {
+                        [Tok::Str(s, _)] => {
+                            c_decl = Some(s.clone());
+                            anon = is_anon;
+                        }
+                        _ => return Err(format!("{name}: #[{n}(...)] takes one string, a C declaration")),
+                    }
+                }
+            }
+            if let Some(args) = attr_args(attr, "counted_by") {
+                match args {
+                    [Tok::Ident(n)] => counted_by = Some(n.clone()),
+                    _ => return Err(format!("{name}: #[counted_by(FIELD)] takes the field that counts it")),
+                }
+            }
+            if let Some(args) = attr_args(attr, "cfg") {
+                cfg = Some(parse_cfg(args)?);
+            }
+            i = next;
+        }
+        let vis_at = i;
+        i = skip_vis(toks, i)?;
+        let vis = tokens_to_rust(&toks[vis_at..i]);
+
+        let Some(field) = ident_at(toks, i) else {
+            return Err(format!("{name}: expected a field name"));
+        };
+        let field = c_ident(field);
+        if !toks.get(i + 1).is_some_and(|t| t.is_punct(':')) {
+            return Err(format!("{name}.{field}: expected `:`"));
+        }
+        i += 2;
+
+        // The type runs to a `,` outside any brackets, or the body's end.
+        // `<`/`>` nest too - except the `>` of `->`.
+        let ty_start = i;
+        let mut depth = 0i32;
+        while i < body_end {
+            match &toks[i] {
+                Tok::Punct('(' | '[' | '{' | '<') => depth += 1,
+                Tok::Punct(')' | ']' | '}') => depth -= 1,
+                Tok::Punct('>') if !toks[i - 1].is_punct('-') => depth -= 1,
+                Tok::Punct(',') if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        let ty = tokens_to_rust(&toks[ty_start..i]);
+        if ty.is_empty() {
+            return Err(format!("{name}.{field}: missing type"));
+        }
+        i += 1; // the `,`
+
+        if let (Some(decl), false) = (&c_decl, anon) {
+            let names_field = decl
+                .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .any(|w| w == field);
+            if !names_field {
+                return Err(format!(
+                    "{name}.{field}: #[c(\"{decl}\")] must declare the field by its own name - \
+                     #[c_anon] is for a declaration that doesn't"));
+            }
+        }
+        if (inline || group) && (anon || c_decl.is_some() || (inline && group)) {
+            return Err(format!("{name}.{field}: #[c_inline] and #[c_struct_group] are the field's type, \
+                                written in its place - one of them, and not a #[c] or #[c_anon] too"));
+        }
+        fields.push(CFieldDef { name: field, ty, vis, c_decl, anon, inline, group, bitfield, bits,
+                                counted_by, cfg, c_align: None });
+    }
+
+    // A field of an alignment marker type is no field of C's, but its
+    // __aligned(): the struct's if it comes first, the next member's if not.
+    let mut c_align = None;
+    for k in 0..fields.len() {
+        let Some(expr) = align_marker(&fields[k].ty) else { continue };
+        let f = &mut fields[k];
+        if f.c_decl.is_some() || f.cfg.is_some() {
+            return Err(format!("{name}.{}: an alignment marker is C's __aligned(), not a declaration \
+                                of its own, and in every configuration", f.name));
+        }
+        f.c_decl = Some(String::new());
+        f.anon = true;
+        if k == 0 {
+            c_align = Some(expr.to_string());
+        } else if k + 1 < fields.len() {
+            fields[k + 1].c_align = Some(expr.to_string());
+        } else {
+            return Err(format!("{name}.{}: an alignment marker aligns what follows it, and nothing does",
+                               fields[k].name));
+        }
+    }
+
+    let (name, rust_name) = match a.c_name {
+        Some(c) => (c, Some(name)),
+        None    => (name, None),
+    };
+    let typedef_anon = matches!(a.typedef, Some(None));
+    let typedef = a.typedef.map(|t| t.unwrap_or_else(|| name.clone()));
+    Ok(Some((CStructDef {
+        name, rust_name, kind, cfg: a.cfg, repr: a.repr, cfg_reprs: a.cfg_reprs, fields, typedef,
+        typedef_anon, c_align,
+    }, body_end + 1)))
+}
+
+/// C's alignment, as C spells it, for a field of one of types/lib.rs's
+/// alignment markers - zero-sized, aligned as C's __aligned() is.
+fn align_marker(ty: &str) -> Option<&'static str> {
+    match ty.trim().rsplit("::").next()? {
+        "CacheAligned" => Some("SMP_CACHE_BYTES"),
+        "LongAligned"  => Some("sizeof(long)"),
+        _ => None,
+    }
+}
+
+/// A bitfield-struct type at @i, after its attributes - the struct with
+/// #[bitfield(@storage)] - and the index after it.
+fn parse_bitfield(toks: &[Tok], i: usize, cfg: Option<Cfg>, storage: String, ty: Option<String>)
+    -> Result<Option<(CBitfieldDef, usize)>, String>
+{
+    let Some((def, next)) = parse_struct(toks, i, ItemAttrs::default())? else {
+        return Ok(None);
+    };
+    let mut fields = Vec::new();
+    for f in def.fields {
+        let width = match f.bits {
+            Some(w) => w,
+            None => int_bits(&f.ty).ok_or_else(|| format!(
+                "{}.{}: a member without #[bits(N)] must be an integer", def.name, f.name))?,
+        };
+        fields.push((f.name, f.ty, width));
+    }
+    let ty = ty.unwrap_or_else(|| storage.clone());
+    Ok(Some((CBitfieldDef { name: def.name, cfg, storage, ty, fields }, next)))
+}
+
+/// The width of the unit C lays out a bitfield of type @ty in: an integer's,
+/// and bool's - _Bool's byte.
+#[allow(dead_code)]
+fn unit_bits(ty: &str) -> Option<u32> {
+    if ty.trim() == "bool" { Some(8) } else { int_bits(ty) }
+}
+
+/// The width of integer type @ty, in bits.
+fn int_bits(ty: &str) -> Option<u32> {
+    Some(match ty.trim() {
+        "u8" | "i8" => 8,
+        "u16" | "i16" => 16,
+        "u32" | "i32" => 32,
+        "u64" | "i64" => 64,
+        _ => return None,
+    })
+}
+
+// ---- c_xmacro!, c_bitmask! -------------------------------------------------
+
+/// A macro invocation's body at @i - `( ... )` or `{ ... }` - and the index
+/// after it, a trailing `;` included.
+fn macro_body(toks: &[Tok], i: usize) -> Result<(&[Tok], usize), String> {
+    if !toks.get(i).is_some_and(|t| t.is_punct('(') || t.is_punct('{')) {
+        return Err("expected a macro body".into());
+    }
+    let end = skip_group(toks, i)?;
+    let mut next = end;
+    if toks.get(next).is_some_and(|t| t.is_punct(';')) {
+        next += 1;
+    }
+    Ok((&toks[i + 1..end - 1], next))
+}
+
+/// Skip attributes - the doc comments a macro's body can start with.
+fn skip_attrs(toks: &[Tok], mut i: usize) -> Result<usize, String> {
+    while let Some((_, next)) = attr_at(toks, i)? {
+        i = next;
+    }
+    Ok(i)
+}
+
+/// c_xmacro!'s body: NAME(x) { (args), ... }
+fn parse_xmacro(body: &[Tok], cfg: Option<Cfg>) -> Result<CXMacro, String> {
+    let i = skip_attrs(body, 0)?;
+    let (Some(name), Some(callback)) = (ident_at(body, i), ident_at(body, i + 2)) else {
+        return Err("c_xmacro!: expected NAME(callback) { (entry), ... }".into());
+    };
+    if !body.get(i + 1).is_some_and(|t| t.is_punct('(')) || !body.get(i + 3).is_some_and(|t| t.is_punct(')')) {
+        return Err(format!("c_xmacro! {name}: expected NAME(callback)"));
+    }
+    let (list, _) = macro_body(body, i + 4)?;
+    let mut entries = Vec::new();
+    for e in split_top(list, ',') {
+        match e {
+            [Tok::Punct('('), inner @ .., Tok::Punct(')')] =>
+                entries.push(CXEntry::Args(tokens_to_c(inner))),
+            [Tok::Ident(sub), Tok::Punct('('), Tok::Punct(')')] =>
+                entries.push(CXEntry::Sub { list: sub.clone(), map: None }),
+            [Tok::Ident(sub), Tok::Punct('('), Tok::Ident(map), Tok::Punct('('), rest @ ..] => {
+                // SUB(MAP(params) => (template))
+                let close = rest.iter().position(|t| t.is_punct(')'))
+                    .ok_or_else(|| format!("c_xmacro! {name}: {sub}({map}(...: unterminated"))?;
+                let params = split_top(&rest[..close], ',').iter()
+                    .map(|p| match p {
+                        [Tok::Ident(p)] => Ok(p.clone()),
+                        _ => Err(format!("c_xmacro! {name}: {map}'s parameters are names")),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let template = match &rest[close + 1..] {
+                    [Tok::Punct('='), Tok::Punct('>'), Tok::Punct('('), t @ .., Tok::Punct(')'), Tok::Punct(')')] =>
+                        tokens_to_c(t),
+                    _ => return Err(format!("c_xmacro! {name}: expected {sub}({map}(params) => (args))")),
+                };
+                entries.push(CXEntry::Sub {
+                    list: sub.clone(),
+                    map: Some(CXMap { name: map.clone(), params, template }),
+                });
+            }
+            _ => return Err(format!("c_xmacro! {name}: an entry is (args), SUB(), or SUB(MAP(params) => (args))")),
+        }
+    }
+    Ok(CXMacro { cfg, name: name.to_string(), callback: callback.to_string(), entries })
+}
+
+/// c_bitmask!'s body: LE64_BITMASK(struct foo, field), strip PREFIX_ { NAME(start, end), ... }
+fn parse_bitmask(body: &[Tok], cfg: Option<Cfg>) -> Result<CBitmask, String> {
+    let i = skip_attrs(body, 0)?;
+    let Some(macro_name) = ident_at(body, i) else {
+        return Err("c_bitmask!: expected LE64_BITMASK(struct foo, field)".into());
+    };
+    if !matches!(macro_name, "LE64_BITMASK" | "LE32_BITMASK" | "LE16_BITMASK" | "BITMASK") {
+        return Err(format!("c_bitmask!: {macro_name}: not a bitmask macro"));
+    }
+    let args_end = skip_group(body, i + 1)?;
+    let args = split_top(&body[i + 2..args_end - 1], ',');
+    let [ty, field] = args.as_slice() else {
+        return Err(format!("c_bitmask! {macro_name}: expected (struct foo, field)"));
+    };
+    let (rust_type, c_type) = match ty {
+        [Tok::Ident(s), Tok::Ident(n)] if s == "struct" => (n.clone(), tokens_to_c(ty)),
+        // a family's C definition, X__head (util/vstructs.rs): its header's
+        // fields, which each state's definition derefs to
+        [Tok::Ident(s), Tok::Ident(f), Tok::Punct('<'), Tok::Ident(n), Tok::Punct('>')]
+            if s == "struct" && f == "Head" => (format!("{n}__head"), format!("struct {n}")),
+        // a family's type in a state: a #[grown] type's value in place, for
+        // its floor's fields - every view of it reaches X<Validated>
+        [Tok::Ident(s), Tok::Ident(n), Tok::Punct('<'), Tok::Ident(st), Tok::Punct('>')]
+            if s == "struct" && matches!(st.as_str(), "Whole" | "Validated" | "Unvalidated") =>
+            (format!("{n}<crate::util::vstructs::{st}>"), format!("struct {n}")),
+        _ => return Err(format!("c_bitmask! {macro_name}: expected a struct type - struct foo, \
+                                 struct Head<foo> for a family's, or struct foo<STATE> for a \
+                                 family's type in a state")),
+    };
+
+    let mut i = args_end;
+    if body.get(i).is_some_and(|t| t.is_punct(',')) {
+        i += 1;
+    }
+    let mut strip = None;
+    if body.get(i).is_some_and(|t| t.is_ident("strip")) {
+        strip = ident_at(body, i + 1).map(String::from);
+        i += 2;
+    }
+
+    let (list, _) = macro_body(body, i)?;
+    let mut entries = Vec::new();
+    for e in split_top(list, ',') {
+        match e {
+            [Tok::Ident(n), Tok::Punct('('), range @ .., Tok::Punct(')')] => {
+                let parts = split_top(range, ',');
+                let [start, end] = parts.as_slice() else {
+                    return Err(format!("c_bitmask! {n}: expected NAME(start, end)"));
+                };
+                entries.push(CBitmaskEntry {
+                    name:  n.clone(),
+                    start: tokens_to_c(start),
+                    end:   tokens_to_c(end),
+                });
+            }
+            _ => return Err(format!("c_bitmask! {rust_type}: an entry is NAME(start, end)")),
+        }
+    }
+
+    Ok(CBitmask {
+        cfg,
+        macro_name: macro_name.to_string(),
+        c_type,
+        rust_type,
+        field: tokens_to_c(field),
+        strip,
+        entries,
+    })
+}
+
+/// c_ioctl!'s body: NAME = _IOW(type, nr, ARG), ... - _IO without the ARG -
+/// with #[c("...")] before an entry for its argument's C type, where the Rust
+/// type doesn't say it.
+fn parse_ioctl(body: &[Tok], cfg: Option<Cfg>) -> Result<CIoctl, String> {
+    let mut entries = Vec::new();
+    for e in split_top(body, ',') {
+        let mut c_arg = None;
+        let mut i = 0;
+        while let Some((attr, next)) = attr_at(e, i)? {
+            if let Some([Tok::Str(s, _)]) = attr_args(attr, "c") {
+                c_arg = Some(s.clone());
+            }
+            i = next;
+        }
+        let [Tok::Ident(name), Tok::Punct('='), Tok::Ident(dir), Tok::Punct('('), args @ .., Tok::Punct(')')] = &e[i..] else {
+            return Err("c_ioctl!: an entry is NAME = _IOW(type, nr, ARG)".into());
+        };
+        let (ty, nr, arg) = match (dir.as_str(), split_top(args, ',').as_slice()) {
+            ("_IO", [ty, nr]) => (tokens_to_c(ty), tokens_to_c(nr), None),
+            ("_IOR" | "_IOW" | "_IOWR", [ty, nr, arg]) => (tokens_to_c(ty), tokens_to_c(nr), Some(tokens_to_rust(arg))),
+            ("_IO", _) => return Err(format!("c_ioctl! {name}: expected _IO(type, nr)")),
+            ("_IOR" | "_IOW" | "_IOWR", _) => return Err(format!("c_ioctl! {name}: expected {dir}(type, nr, ARG)")),
+            _ => return Err(format!("c_ioctl! {name}: {dir} isn't _IO, _IOR, _IOW or _IOWR")),
+        };
+        if arg.is_none() && c_arg.is_some() {
+            return Err(format!("c_ioctl! {name}: #[c(...)] is the argument's C type, and _IO has none"));
+        }
+        entries.push(CIoctlEntry { name: name.clone(), dir: dir.clone(), ty, nr, arg, c_arg });
+    }
+    if entries.is_empty() {
+        return Err("c_ioctl!: expected NAME = _IOW(type, nr, ARG), ...".into());
+    }
+    Ok(CIoctl { cfg, entries })
+}
+
+/// c_enum!'s body: #[open|closed|flags] pub enum NAME: REPR { A = expr, B, ... }
+/// - NAME `_` for an anonymous enum.
+fn parse_enum(body: &[Tok], cfg: Option<Cfg>) -> Result<CEnumDef, String> {
+    let mut kind = None;
+    let mut i = 0;
+    while let Some((attr, next)) = attr_at(body, i)? {
+        for (n, k) in [("open", CEnumKind::Open), ("closed", CEnumKind::Closed), ("flags", CEnumKind::Flags)] {
+            if matches!(attr, [Tok::Ident(a)] if a == n) {
+                kind = Some(k);
+            }
+        }
+        i = next;
+    }
+    i = skip_vis(body, i)?;
+    if !body.get(i).is_some_and(|t| t.is_ident("enum")) {
+        return Err("c_enum!: expected #[open|closed|flags] pub enum NAME: REPR { ... }".into());
+    }
+    let name = match ident_at(body, i + 1) {
+        Some("_") => None,
+        Some(n) => Some(n.to_string()),
+        None => return Err("c_enum!: expected a name, or _".into()),
+    };
+    let what = name.clone().unwrap_or_else(|| "(anonymous)".into());
+    let kind = kind.ok_or_else(|| format!("c_enum! {what}: #[open], #[closed] or #[flags]"))?;
+    if !body.get(i + 2).is_some_and(|t| t.is_punct(':')) {
+        return Err(format!("c_enum! {what}: expected `: REPR`"));
+    }
+    let repr = ident_at(body, i + 3)
+        .filter(|r| int_bits(r).is_some())
+        .ok_or_else(|| format!("c_enum! {what}: REPR is an integer type"))?
+        .to_string();
+    let (list, _) = macro_body(body, i + 4)?;
+
+    let mut variants = Vec::new();
+    let mut from = Vec::new();
+    for v in split_top(list, ',') {
+        if let Some(f) = parse_from_list(v)? {
+            from.push((variants.len(), f));
+            continue;
+        }
+        let j = skip_attrs(v, 0)?;
+        let Some(vname) = ident_at(v, j) else {
+            return Err(format!("c_enum! {what}: expected a variant name"));
+        };
+        let value = match &v[j + 1..] {
+            [] => None,
+            [Tok::Punct('='), expr @ ..] if !expr.is_empty() => Some(tokens_to_rust(expr)),
+            _ => return Err(format!("c_enum! {what}::{vname}: expected `= value`, or nothing")),
+        };
+        variants.push((vname.to_string(), value));
+    }
+    Ok(CEnumDef { cfg, kind, name, repr, variants, from })
+}
+
+/// c_typedef!'s body: [#[c("C declarator")]] pub type NAME = TYPE;
+fn parse_typedef(body: &[Tok], cfg: Option<Cfg>) -> Result<CTypedef, String> {
+    let mut c_decl = None;
+    let mut i = 0;
+    while let Some((attr, next)) = attr_at(body, i)? {
+        if let Some([Tok::Str(s, _)]) = attr_args(attr, "c") {
+            c_decl = Some(s.clone());
+        }
+        i = next;
+    }
+    let i = skip_vis(body, i)?;
+    match &body[i..] {
+        [Tok::Ident(t), Tok::Ident(name), Tok::Punct('='), ty @ ..] if t == "type" && !ty.is_empty() => {
+            let ty = ty.strip_suffix(&[Tok::Punct(';')]).unwrap_or(ty);
+            Ok(CTypedef { cfg, name: name.clone(), ty: tokens_to_rust(ty), c_decl })
+        }
+        _ => Err("c_typedef!: expected pub type NAME = TYPE;".into()),
+    }
+}
+
+/// c_same!'s body: struct|union NAME == TYPE [{ field, ... }]
+fn parse_same(body: &[Tok]) -> Result<CSame, String> {
+    let i = skip_attrs(body, 0)?;
+    let (Some(kw), Some(name)) = (ident_at(body, i), ident_at(body, i + 1)) else {
+        return Err("c_same!: expected struct NAME == TYPE".into());
+    };
+    if !matches!(kw, "struct" | "union") ||
+        !body.get(i + 2).is_some_and(|t| t.is_punct('=')) ||
+        !body.get(i + 3).is_some_and(|t| t.is_punct('=')) {
+        return Err("c_same!: expected struct NAME == TYPE".into());
+    }
+    let rest = &body[i + 4..];
+    let (ty, fields) = match rest.iter().position(|t| t.is_punct('{')) {
+        Some(b) => {
+            let (list, _) = macro_body(rest, b)?;
+            let fields = split_top(list, ',').into_iter()
+                .map(|f| match f {
+                    [Tok::Ident(n)] => Ok(n.clone()),
+                    _ => Err(format!("c_same! {name}: a field list is names")),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (&rest[..b], fields)
+        }
+        None => (rest, Vec::new()),
+    };
+    if ty.is_empty() {
+        return Err(format!("c_same! {name}: expected a type"));
+    }
+    Ok(CSame { c_type: format!("{kw} {name}"), rust_ty: tokens_to_rust(ty), fields })
+}
+
+/// One of c_const!'s constants: `#[c_int]? pub const NAME: TYPE = EXPR`. The #define
+/// has TYPE's C type; #[c_int], int's: for a constant C had as a plain
+/// number, so its type is the one C was written against, whatever type
+/// Rust wants it in.
+fn parse_const(body: &[Tok], cfg: Option<Cfg>) -> Result<CConst, String> {
+    let mut i = 0;
+    let mut c_int = false;
+    while let Some((attr, next)) = attr_at(body, i)? {
+        c_int |= matches!(attr, [Tok::Ident(n)] if n == "c_int");
+        i = next;
+    }
+    let i = skip_vis(body, i)?;
+    let err = || "c_const!: expected pub const NAME: TYPE = EXPR;".to_string();
+    let [Tok::Ident(c), Tok::Ident(name), Tok::Punct(':'), rest @ ..] = &body[i..] else {
+        return Err(err());
+    };
+    let eq = rest.iter().position(|t| t.is_punct('=')).ok_or_else(err)?;
+    let (ty, expr) = (&rest[..eq], &rest[eq + 1..]);
+    let expr = expr.strip_suffix(&[Tok::Punct(';')]).unwrap_or(expr);
+    if c != "const" || ty.is_empty() || expr.is_empty() {
+        return Err(err());
+    }
+    let c_type = match c_int {
+        true => "int".to_string(),
+        false => canon_base(ty).ok_or_else(|| format!("c_const! {name}: {} has no C type", tokens_to_rust(ty)))?,
+    };
+    Ok(CConst { cfg, name: name.clone(), ty: tokens_to_rust(ty), c_type, value: tokens_to_rust(expr) })
+}
+
+/// c_extern!'s body: `pub fn NAME(p: T, ...) -> R;` and `pub static [mut]
+/// NAME: T;`, each with a #[cfg] if it has one.
+fn parse_extern(body: &[Tok], cfg: Option<Cfg>) -> Result<CExtern, String> {
+    let mut ex = CExtern { cfg, fns: Vec::new(), statics: Vec::new(), export: false };
+    let mut i = 0;
+    while i < body.len() {
+        let (a, j) = item_attrs(body, i)?;
+        let j = skip_vis(body, j)?;
+        // the item's ';' - not an array type's
+        let mut semi = j;
+        let mut depth = 0;
+        while semi < body.len() && !(depth == 0 && body[semi].is_punct(';')) {
+            match &body[semi] {
+                Tok::Punct('(' | '[' | '{') => depth += 1,
+                Tok::Punct(')' | ']' | '}') => depth -= 1,
+                _ => {}
+            }
+            semi += 1;
+        }
+        if semi == body.len() {
+            return Err("c_extern!: an item without a ';'".into());
+        }
+        let item = &body[j..semi];
+        match item {
+            [Tok::Ident(f), Tok::Ident(name), Tok::Punct('('), ..] if f == "fn" => {
+                let close = skip_group(item, 2)?;
+                let mut params = Vec::new();
+                let mut variadic = false;
+                for p in split_top(&item[3..close - 1], ',') {
+                    match p {
+                        [] => {}
+                        [Tok::Punct('.'), Tok::Punct('.'), Tok::Punct('.')] => variadic = true,
+                        [Tok::Ident(n), Tok::Punct(':'), ty @ ..] if !ty.is_empty() =>
+                            params.push((n.clone(), tokens_to_rust(ty))),
+                        _ => return Err(format!("c_extern!: fn {name}: parameter {} not understood",
+                                                tokens_to_rust(p))),
+                    }
+                }
+                let ret = match &item[close..] {
+                    [] => None,
+                    [Tok::Punct('-'), Tok::Punct('>'), ty @ ..] if !ty.is_empty() => Some(tokens_to_rust(ty)),
+                    rest => return Err(format!("c_extern!: fn {name}: {} after the parameters",
+                                               tokens_to_rust(rest))),
+                };
+                ex.fns.push(CFnDecl { cfg: a.cfg, name: name.clone(), params, variadic, ret,
+                                      must_use: a.must_use, cold: a.cold, printf: a.c_printf });
+            }
+            [Tok::Ident(s), rest @ ..] if s == "static" => {
+                let (mutable, rest) = match rest {
+                    [Tok::Ident(m), rest @ ..] if m == "mut" => (true, rest),
+                    _ => (false, rest),
+                };
+                match rest {
+                    [Tok::Ident(name), Tok::Punct(':'), ty @ ..] if !ty.is_empty() =>
+                        ex.statics.push(CStaticDecl { cfg: a.cfg, name: name.clone(), ty: tokens_to_rust(ty),
+                                                      mutable, c_decl: a.c_decl }),
+                    _ => return Err("c_extern!: expected static NAME: TYPE;".into()),
+                }
+            }
+            _ => return Err(format!("c_extern!: {} isn't a fn or a static", tokens_to_rust(item))),
+        }
+        i = semi + 1;
+    }
+    Ok(ex)
+}
+
+/// Rust's types for C's that a #[c_export] fn may take, as unqualified() has
+/// them, and C's, as c_extern! does: #[repr(transparent)], or c_same! - one
+/// layout either way. References are c_export_type()'s.
+const C_EXPORT_TYPES: &[(&str, &str)] = &[
+    ("Printbuf",   "c::printbuf"),
+    ("BkeySC<'_>", "c::bkey_s_c"),
+];
+
+/// @toks with each path's qualifiers dropped: `&crate::util::ffi::Opaque<c::bch_fs>`
+/// is `&Opaque<bch_fs>`.
+fn unqualified(toks: &[Tok]) -> Vec<Tok> {
+    let colons = |k: usize| toks.get(k).is_some_and(|t| t.is_punct(':')) &&
+                            toks.get(k + 1).is_some_and(|t| t.is_punct(':'));
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < toks.len() {
+        if matches!(toks[k], Tok::Ident(_)) && colons(k + 1) {
+            k += 3;
+        } else {
+            out.push(toks[k].clone());
+            k += 1;
+        }
+    }
+    out
+}
+
+/// @ty's argument, if it's @name<T>, however qualified.
+fn generic_arg<'a>(ty: &'a [Tok], name: &str) -> Option<&'a [Tok]> {
+    let open = ty.iter().position(|t| t.is_punct('<'))?;
+    (matches!(unqualified(&ty[..open]).as_slice(), [Tok::Ident(n)] if n == name) &&
+     ty.last()?.is_punct('>'))
+        .then(|| &ty[open + 1..ty.len() - 1])
+}
+
+/// The C type, as c_extern! has it, of a #[c_export] fn's parameter or return
+/// type @ty - and whether it isn't @ty, the value converting by transmute. A
+/// reference is C's pointer: &T const T *, &mut T T *, and Option<&T> one
+/// that may be NULL; Opaque<T> and MaybeUninit<T> are T, and an Opaque's
+/// pointer isn't const, as C changes what's behind it. C_EXPORT_TYPES' are
+/// as it has them. Any other type is C's own: a path to it written c::NAME,
+/// as `crate::c::foo` from a macro_rules! isn't.
+fn c_export_type(ty: &[Tok]) -> (String, bool) {
+    if let Some(r) = generic_arg(ty, "Option").filter(|r| r.first().is_some_and(|t| t.is_punct('&'))) {
+        return c_export_type(r);
+    }
+    if let [amp, rest @ ..] = ty {
+        if amp.is_punct('&') {
+            let rest = match rest {
+                [Tok::Lit(l), rest @ ..] if l.starts_with('\'') => rest,
+                rest => rest,
+            };
+            let (mut mutable, mut pointee) = match rest {
+                [m, rest @ ..] if m.is_ident("mut") => (true, rest),
+                rest => (false, rest),
+            };
+            if let Some(t) = generic_arg(pointee, "Opaque") {
+                (mutable, pointee) = (true, t);
+            } else if let Some(t) = generic_arg(pointee, "MaybeUninit") {
+                pointee = t;
+            }
+            let q = if mutable { "mut" } else { "const" };
+            return (format!("*{q} {}", c_export_type(pointee).0), true);
+        }
+    }
+    let bare = unqualified(ty);
+    if let Some((_, c)) = C_EXPORT_TYPES.iter().find(|(r, _)| tokenize(r).is_ok_and(|r| r == bare)) {
+        return (c.to_string(), true);
+    }
+    let mut t = ty.to_vec();
+    if let Some(ns) = t.iter().rposition(|x| matches!(x, Tok::Ident(n) if is_c_ns(n))) {
+        // the path's qualifiers before c::, each `IDENT ::`
+        let mut start = ns;
+        while start >= 3 && t[start - 1].is_punct(':') && t[start - 2].is_punct(':') &&
+              matches!(t[start - 3], Tok::Ident(_)) {
+            start -= 3;
+        }
+        t.splice(start..=ns, [Tok::Ident("c".into())]);
+    }
+    (tokens_to_rust(&t), false)
+}
+
+/// A #[c_export] fn: its prototype, as c_extern!'s, with each type C's
+/// (c_export_type()); and for the definition with C's signature that calls
+/// it, each of its types that isn't C's - its parameters', its return's.
+/// An extern "C" fn is C's symbol itself, and has no such definition.
+pub struct CExport {
+    pub ex:       CExtern,
+    pub extern_c: bool,
+    pub params:   Vec<Option<String>>,
+    pub ret:      Option<String>,
+}
+
+/// A #[c_export] fn, at @i, past its attributes: `[pub] [unsafe] [extern
+/// "C"] fn NAME(p: T, ...) [-> R] { ... }`; and the index after it.
+fn parse_export(toks: &[Tok], i: usize, a: ItemAttrs)
+    -> Result<(CExport, usize), String>
+{
+    let mut j = skip_vis(toks, i)?;
+    if toks.get(j).is_some_and(|t| t.is_ident("unsafe")) {
+        j += 1;
+    }
+    let extern_c = matches!(&toks[j.min(toks.len())..], [e, Tok::Str(abi, _), ..]
+                            if e.is_ident("extern") && abi == "C");
+    if extern_c {
+        j += 2;
+    }
+    let name = match &toks[j.min(toks.len())..] {
+        [f, Tok::Ident(name), p, ..] if f.is_ident("fn") && p.is_punct('(') => name.clone(),
+        _ => return Err("#[c_export]: expected [pub] [unsafe] [extern \"C\"] fn NAME(..), \
+                         not generic".into()),
+    };
+    let close = skip_group(toks, j + 2)?;
+    let mut params = Vec::new();
+    let mut rust_params = Vec::new();
+    for p in split_top(&toks[j + 3..close - 1], ',') {
+        let p = match p {
+            [m, rest @ ..] if m.is_ident("mut") => rest,
+            p => p,
+        };
+        match p {
+            [Tok::Ident(n), Tok::Punct(':'), ty @ ..] if !ty.is_empty() => {
+                let (c, converts) = c_export_type(ty);
+                params.push((n.clone(), c));
+                rust_params.push(converts.then(|| tokens_to_rust(ty)));
+            }
+            _ => return Err(format!("#[c_export] fn {name}: parameter {} not understood",
+                                    tokens_to_rust(p))),
+        }
+    }
+    let body = (close..toks.len()).find(|&k| toks[k].is_punct('{'))
+        .ok_or_else(|| format!("#[c_export] fn {name}: no body"))?;
+    let (ret, rust_ret) = match &toks[close..body] {
+        [] => (None, None),
+        [Tok::Punct('-'), Tok::Punct('>'), ty @ ..] if !ty.is_empty() => {
+            let (c, converts) = c_export_type(ty);
+            (Some(c), converts.then(|| tokens_to_rust(ty)))
+        }
+        rest => return Err(format!("#[c_export] fn {name}: {} after the parameters",
+                                   tokens_to_rust(rest))),
+    };
+    let f = CFnDecl { cfg: a.cfg, name, params, variadic: false, ret, must_use: a.must_use,
+                      cold: a.cold, printf: a.c_printf };
+    let ex = CExtern { cfg: None, fns: vec![f], statics: Vec::new(), export: true };
+    Ok((CExport { ex, extern_c, params: rust_params, ret: rust_ret }, skip_group(toks, body)?))
+}
+
+/// @item onto @items, where a #[c_export] fn after another joins its block: a
+/// run of them is one block of prototypes, as a c_extern!'s is.
+fn push_item(items: &mut Vec<CItem>, mut item: CItem) {
+    if let (CItem::Extern(ex), Some(CItem::Extern(prev))) = (&mut item, items.last_mut()) {
+        if ex.export && prev.export {
+            prev.fns.append(&mut ex.fns);
+            return;
+        }
+    }
+    items.push(item);
+}
+
+/// #[c_export]'s text, as its macro records it - checked that C can have
+/// the prototype.
+#[allow(dead_code)]
+pub fn parse_c_export(text: &str) -> Result<CExport, String> {
+    let toks = tokenize(text)?;
+    let (a, j) = item_attrs(&toks, 0)?;
+    let (e, _) = parse_export(&toks, j, a)?;
+    emit_extern(&e.ex, &|_| None)?;
+    Ok(e)
+}
+
+/// tagged_union!'s body: `[vis] struct NAME { tag NAME: TYPE [= TAG_ENUM], arms
+/// from LIST(params) => template | arm NAME: TYPE = VALUE, ..., pad: TYPE,
+/// size: pad, [packed] }`, or `[vis] union NAME in STORAGE { ..., size: header|arm }`.
+fn parse_tagged_union(body: &[Tok], cfg: Option<Cfg>) -> Result<CTaggedUnion, String> {
+    // `#[...]*` are for the arm types defined here - nestify propagates them -
+    // not the storage: skipped
+    let mut i = 0;
+    while let Some((_, next)) = attr_at(body, i)? {
+        i = if body.get(next).is_some_and(|t| t.is_punct('*')) { next + 1 } else { next };
+    }
+    let i = skip_vis(body, i)?;
+    const EXPECTED: &str = "tagged_union!: expected struct|union NAME [in STORAGE] { ... }";
+    let (union, name, rest) = match &body[i..] {
+        [Tok::Ident(s), Tok::Ident(name), rest @ ..] if s == "struct" || s == "union" =>
+            (s == "union", name.clone(), rest),
+        _ => return Err(EXPECTED.into()),
+    };
+    let open = rest.iter().position(|t| t.is_punct('{')).ok_or(EXPECTED)?;
+    let storage = match &rest[..open] {
+        [] => None,
+        [Tok::Ident(kw), path @ ..] if kw == "in" && !path.is_empty() => Some(tokens_to_rust(path)),
+        _ => return Err(EXPECTED.into()),
+    };
+    let inner = match &rest[open..] {
+        [Tok::Punct('{'), inner @ .., Tok::Punct('}')] => inner,
+        _ => return Err(EXPECTED.into()),
+    };
+    let mut size = None;
+    let mut tu = CTaggedUnion { cfg, name, union, storage, tag_field: String::new(),
+                                tag_ty: String::new(), tag_enum: String::new(), from: None,
+                                arms: Vec::new(), pad: None, packed: false,
+                                size: CTaggedSize::Pad, defs: Vec::new() };
+    for item in split_top(inner, ',') {
+        let eq = item.iter().rposition(|t| t.is_punct('='));
+        match item {
+            [] => {}
+            _ if tagged_def_at(item).is_some() => {
+                let j = tagged_def_at(item).unwrap();
+                tu.defs.push(CTaggedDef { name: ident_at(item, j + 1).unwrap().to_string() });
+            }
+            [Tok::Ident(kw), Tok::Ident(field), Tok::Punct(':'), rest @ ..] if kw == "tag" => {
+                let eq = rest.iter().position(|t| t.is_punct('=')).unwrap_or(rest.len());
+                tu.tag_field = field.clone();
+                tu.tag_ty = tokens_to_rust(&rest[..eq]);
+                tu.tag_enum = tokens_to_rust(rest.get(eq + 1..).unwrap_or_default());
+                if tu.tag_ty.is_empty() || (eq < rest.len() && tu.tag_enum.is_empty()) {
+                    return Err("tagged_union!: tag NAME: TYPE [= TAG_ENUM]".into());
+                }
+            }
+            [Tok::Ident(kw), Tok::Ident(from), rest @ ..] if kw == "arms" && from == "from" => {
+                tu.from = Some(parse_from_list(rest)?
+                    .ok_or("tagged_union!: arms from LIST(params) => name: Type = value")?);
+            }
+            [Tok::Ident(kw), Tok::Ident(arm), Tok::Punct(':'), ..] if kw == "arm" => {
+                let eq = eq.ok_or("tagged_union!: arm NAME: TYPE = VALUE")?;
+                tu.arms.push(CTaggedArm { name: arm.clone(), ty: tokens_to_rust(&item[3..eq]),
+                                          value: tokens_to_rust(&item[eq + 1..]) });
+            }
+            [Tok::Ident(kw), Tok::Punct(':'), ty @ ..] if kw == "pad" && !ty.is_empty() =>
+                tu.pad = Some(tokens_to_rust(ty)),
+            [Tok::Ident(kw), Tok::Punct(':'), Tok::Ident(of)] if kw == "size" => {
+                size = Some(match of.as_str() {
+                    "pad"    => CTaggedSize::Pad,
+                    "header" => CTaggedSize::Header,
+                    "arm"    => CTaggedSize::Arm,
+                    _ => return Err(format!("tagged_union!: size: {of} - its size is a function \
+                                             of nothing, its pad's, `size: pad`; of its \
+                                             header's count, `size: header`; or of its tag, \
+                                             its arm's, `size: arm`")),
+                });
+            }
+            [Tok::Ident(kw)] if kw == "packed" => tu.packed = true,
+            _ => return Err(format!("tagged_union!: {} not understood", tokens_to_rust(item))),
+        }
+    }
+    if tu.tag_field.is_empty() {
+        return Err("tagged_union!: no tag".into());
+    }
+    tu.size = size.ok_or_else(|| format!("tagged_union! {}: no size - what it's a function of, \
+                                          `size: pad`, `size: header` or `size: arm`", tu.name))?;
+    // a constant size is a struct's, its own storage, which holds its arms; a
+    // header's count or the arm's own size, a union's over another's storage,
+    // the head its arms start with
+    let ok = match tu.size {
+        CTaggedSize::Pad                       => !tu.union && tu.storage.is_none() && tu.pad.is_some(),
+        CTaggedSize::Header | CTaggedSize::Arm => tu.union && tu.storage.is_some() && tu.pad.is_none(),
+    };
+    if !ok {
+        return Err(format!("tagged_union! {}: `struct NAME {{ .., pad: TYPE, size: pad }}` - its \
+                            own storage, which holds its arms, the pad's size - or `union NAME \
+                            in STORAGE {{ .., size: header }}` - over another's storage, whose \
+                            arms run past its header as far as its count says - or `union NAME \
+                            in HEAD {{ .., size: arm }}` - the head every arm starts with, each \
+                            as long as its arm", tu.name));
+    }
+    if tu.storage.is_some() {
+        if let Some(d) = tu.defs.first() {
+            return Err(format!("tagged_union! {}: {} is defined here, but the storage is \
+                                another's - `in STORAGE` - and so are its arms' types",
+                               tu.name, d.name));
+        }
+    }
+    Ok(tu)
+}
+
+/// `LIST(params) => template` at @item - the rest of a tagged_union!'s `arms
+/// from`, or a c_enum! variant - if it is one.
+fn parse_from_list(item: &[Tok]) -> Result<Option<CFromList>, String> {
+    let [Tok::Ident(list), Tok::Punct('('), ..] = item else {
+        return Ok(None);
+    };
+    let close = skip_group(item, 1)?;
+    let template = match &item[close..] {
+        [Tok::Punct('='), Tok::Punct('>'), t @ ..] if !t.is_empty() => tokens_to_rust(t),
+        _ => return Ok(None),
+    };
+    let params = split_top(&item[2..close - 1], ',').into_iter().map(tokens_to_rust).collect();
+    Ok(Some(CFromList { list: list.clone(), params, template }))
+}
+
+/// What @f's template makes of one entry of its list, @entry its source.
+fn from_list_entry(f: &CFromList, entry: &str) -> Result<Vec<Tok>, String> {
+    let list = &f.list;
+    let template = tokenize(&f.template)?;
+    let etoks = tokenize(entry)?;
+    let args = split_top(&etoks, ',');
+    let mut bound: Vec<(&str, &[Tok])> = Vec::new();
+    for (n, p) in f.params.iter().enumerate() {
+        if p == ".." {
+            break;
+        }
+        let arg = args.get(n).ok_or_else(|| format!("{list}: entry ({entry}) has no {p}"))?;
+        bound.push((p, arg));
+    }
+    // substitute, then paste
+    let mut subst: Vec<Tok> = Vec::new();
+    for t in &template {
+        match t {
+            Tok::Ident(s) => match bound.iter().find(|(p, _)| p == s) {
+                Some((_, arg)) => subst.extend(arg.iter().cloned()),
+                None => subst.push(t.clone()),
+            },
+            _ => subst.push(t.clone()),
+        }
+    }
+    let mut out: Vec<Tok> = Vec::new();
+    let mut k = 0;
+    while k < subst.len() {
+        if subst[k].is_punct('#') && subst.get(k + 1).is_some_and(|t| t.is_punct('#')) {
+            let (Some(Tok::Ident(a) | Tok::Lit(a)), Some(Tok::Ident(b) | Tok::Lit(b))) =
+                (out.pop(), subst.get(k + 2).cloned()) else {
+                return Err(format!("{list}: ## between non-identifiers in the template"));
+            };
+            out.push(Tok::Ident(a + &b));
+            k += 3;
+            continue;
+        }
+        out.push(subst[k].clone());
+        k += 1;
+    }
+    Ok(out)
+}
+
+/// tagged_union!'s arms from its list's entries - each the source of one
+/// entry's arguments.
+#[allow(dead_code)]
+pub fn tagged_union_arms(tu: &CTaggedUnion, entries: &[String]) -> Result<Vec<CTaggedArm>, String> {
+    let f = tu.from.as_ref().ok_or("tagged_union!: no arms from a list")?;
+    let mut arms = Vec::new();
+    for entry in entries {
+        let out = from_list_entry(f, entry)?;
+        let colon = out.iter().position(|t| t.is_punct(':'));
+        let eq = out.iter().rposition(|t| t.is_punct('='));
+        match (&out[..], colon, eq) {
+            ([Tok::Ident(name), ..], Some(1), Some(eq)) if eq > 2 => arms.push(CTaggedArm {
+                name:  name.clone(),
+                ty:    tokens_to_rust(&out[2..eq]),
+                value: tokens_to_rust(&out[eq + 1..]),
+            }),
+            _ => return Err(format!("{}: the template gives {} - not name: Type = value",
+                                    f.list, tokens_to_rust(&out))),
+        }
+    }
+    Ok(arms)
+}
+
+/// c_enum! @e's variants from its first list, @entries each the source of one
+/// entry's arguments, in their place: each `NAME [= value]`, a value cast to
+/// the enum's integer type, as a list's can be any integer type.
+#[allow(dead_code)]
+pub fn expand_enum_list(e: &mut CEnumDef, entries: &[String]) -> Result<(), String> {
+    if e.from.is_empty() {
+        return Ok(());
+    }
+    let (at, f) = e.from.remove(0);
+    let mut variants = Vec::new();
+    for entry in entries {
+        let toks = from_list_entry(&f, entry)?;
+        variants.push(match &toks[..] {
+            [Tok::Ident(name)] => (name.clone(), None),
+            [Tok::Ident(name), Tok::Punct('='), v @ ..] if !v.is_empty() =>
+                (name.clone(), Some(format!("(({}) as {})", tokens_to_rust(v), e.repr))),
+            _ => return Err(format!("{}: the template gives {} - not NAME [= value]",
+                                    f.list, tokens_to_rust(&toks))),
+        });
+    }
+    let n = variants.len();
+    e.variants.splice(at..at, variants);
+    for (later, _) in &mut e.from {
+        *later += n;
+    }
+    Ok(())
+}
+
+/// c_enum! @e as source: its variants, and the lists not yet expanded in their
+/// place - with all expanded, the record's form.
+#[allow(dead_code)]
+pub fn enum_text(e: &CEnumDef) -> String {
+    let mut t = format!("#[{}] pub enum {}: {} {{ ", e.kind.attr(),
+                        e.name.as_deref().unwrap_or("_"), e.repr);
+    let lists = |t: &mut String, i: usize| for (at, f) in &e.from {
+        if *at == i {
+            // `##` spaced: Rust 2021 lexes `a##b` as a reserved prefix
+            t.push_str(&format!("{}({}) => {}, ", f.list, f.params.join(", "),
+                                f.template.replace("##", " ## ")));
+        }
+    };
+    for (i, (v, value)) in e.variants.iter().enumerate() {
+        lists(&mut t, i);
+        match value {
+            Some(x) => t.push_str(&format!("{v} = {x}, ")),
+            None => t.push_str(&format!("{v}, ")),
+        }
+    }
+    lists(&mut t, e.variants.len());
+    t + "}"
+}
+
+/// The record's form of @tu, with @arms: each written out.
+#[allow(dead_code)]
+pub fn tagged_union_record_text(tu: &CTaggedUnion, arms: &[CTaggedArm]) -> String {
+    let tag_enum = if tu.tag_enum.is_empty() { String::new() } else { format!(" = {}", tu.tag_enum) };
+    let mut t = format!("tagged_union! {{ {} {{ tag {}: {}{tag_enum}, ",
+                        tu.c_type(), tu.tag_field, tu.tag_ty);
+    for a in arms {
+        t.push_str(&format!("arm {}: {} = {}, ", a.name, a.ty, a.value));
+    }
+    if let Some(p) = &tu.pad {
+        t.push_str(&format!("pad: {p}, "));
+    }
+    t.push_str(&format!("size: {}, ", tu.size.keyword()));
+    if tu.packed {
+        t.push_str("packed, ");
+    }
+    t + "} }"
+}
+
+impl CTaggedUnion {
+    /// What C calls it: `struct NAME` or `union NAME`.
+    pub fn c_type(&self) -> String {
+        format!("{} {}", if self.union { "union" } else { "struct" }, self.name)
+    }
+}
+
+/// tagged_union!'s C - a struct's: the storage over another's has its own -
+/// the tag, then an anonymous union of the arms, inside an anonymous union
+/// with the pad, if there is one. `packed`: the struct and the arms' union
+/// are __packed.
+fn emit_tagged_union(tu: &CTaggedUnion, kind: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let c = |ty: &str, decl: &str| {
+        // a payload is a type the file defines, by its bare name, or c::NAME
+        let bare = ty.trim().trim_start_matches("c::").trim_start_matches("cs::").trim();
+        match kind(bare) {
+            Some(k) if !bare.contains(|ch: char| !(ch.is_alphanumeric() || ch == '_')) =>
+                Some(format!("{k} {decl}")),
+            _ => proto_c(ty, decl, kind),
+        }
+        .ok_or_else(|| format!("tagged_union! {}: {ty} has no C rendering", tu.name))
+    };
+    let packed = if tu.packed { " __packed" } else { "" };
+    let mut arms = String::new();
+    for a in &tu.arms {
+        arms.push_str(&format!("\t\t{};\n", c(&a.ty, &c_ident(&a.name))?));
+    }
+    let tag = c(&tu.tag_ty, &c_ident(&tu.tag_field))?;
+    let tagged = format!("\t{tag};\n\tunion {{\n{arms}\t}}{packed};\n");
+    match &tu.pad {
+        Some(p) => {
+            let indented: String = tagged.lines().map(|l| format!("\t\t{l}\n")).collect();
+            let body = format!("\tunion {{\n\t\tstruct {{\n{indented}\t\t}}{packed};\n\t\t{};\n\t}};\n",
+                               c(p, "_pad")?);
+            under_cfg(&tu.cfg, format!("struct {} {{\n{body}}};\n", tu.name))
+        }
+        None => under_cfg(&tu.cfg, format!("struct {} {{\n{tagged}}}{packed};\n", tu.name)),
+    }
+}
+
+/// The C declaration of @decl as Rust type @ty, for a prototype: canon_c()'s,
+/// a zero-length array being an extern's unsized one.
+pub fn proto_c(ty: &str, decl: &str, kind: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    canon_c(ty, decl, true, kind)
+}
+
+/// The C declaration of @decl as Rust type @ty - or None if @ty has no C
+/// rendering. A pointer keeps its const - `*const T` is `const T *` - a
+/// function pointer is one, c::NAME is what @kind says C calls it (`struct
+/// foo`, `enum foo`, a typedef's own name), and a zero-length array is a
+/// flexible array: x[] at the end (@last), x[0] elsewhere.
+pub fn canon_c(ty: &str, decl: &str, last: bool, kind: &dyn Fn(&str) -> Option<String>)
+    -> Option<String>
+{
+    let toks = tokenize(ty).ok()?;
+    proto_toks(&toks, decl.to_string(), false, last, kind)
+}
+
+fn proto_toks(toks: &[Tok], decl: String, konst: bool, last: bool,
+              kind: &dyn Fn(&str) -> Option<String>)
+    -> Option<String>
+{
+    // Head<T>, by any path: what C has of unsized T - C's T itself
+    if let Some(t) = head_arg(toks) {
+        return proto_toks(t, decl, konst, last, kind);
+    }
+    let q = if konst { "const " } else { "" };
+    // BkeyI<Head<bch_foo>>, by any path: a key whose value is a family's,
+    // whole - C's typed key, struct bkey_i_foo
+    if let Some(name) = bkey_i_arg(toks, kind) {
+        return Some(format!("{q}struct bkey_i_{name} {decl}").trim_end().to_string());
+    }
+    match toks {
+        // Option<unsafe extern "C" fn(ARGS) -> RET>: a function pointer.
+        [Tok::Ident(o), Tok::Punct('<'), inner @ .., Tok::Punct('>')] if o == "Option" => {
+            let f = inner.iter().position(|t| t.is_ident("fn"))?;
+            if !inner.get(f + 1)?.is_punct('(') {
+                return None;
+            }
+            let close = skip_group(inner, f + 1).ok()?;
+            let args = split_top(&inner[f + 2..close - 1], ',').into_iter()
+                .filter(|p| !p.is_empty())
+                .map(|p| match p {
+                    [Tok::Punct('.'), Tok::Punct('.'), Tok::Punct('.')] => Some("...".to_string()),
+                    // a named parameter: C's, named - the `:` not half of a
+                    // path's `::`, as in an unnamed c::foo
+                    [Tok::Ident(n), Tok::Punct(':'), ty @ ..] if ty.first().is_some_and(|t| !t.is_punct(':')) => {
+                        let n = if n == "_" { String::new() } else { c_ident(n) };
+                        proto_toks(ty, n, false, false, kind)
+                    }
+                    ty => proto_toks(ty, String::new(), false, false, kind),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let args = if args.is_empty() { "void".to_string() } else { args.join(", ") };
+            let inner_decl = format!("(*{q}{decl})({args})");
+            match &inner[close..] {
+                [] => Some(format!("void {inner_decl}")),
+                [Tok::Punct('-'), Tok::Punct('>'), ret @ ..] =>
+                    proto_toks(ret, inner_decl, false, false, kind),
+                _ => None,
+            }
+        }
+        [Tok::Punct('['), inner @ .., Tok::Punct(']')] => {
+            let semi = inner.iter().rposition(|t| t.is_punct(';'))?;
+            let n = c_dim(&inner[semi + 1..])?;
+            let n = if n == "0" && last { String::new() } else { n };
+            let decl = if decl.starts_with('*') { format!("({decl})") } else { decl };
+            proto_toks(&inner[..semi], format!("{decl}[{n}]"), konst, false, kind)
+        }
+        [Tok::Punct('*'), Tok::Ident(m), inner @ ..] if m == "mut" || m == "const" =>
+            proto_toks(inner, format!("*{q}{decl}"), m == "const", false, kind),
+        // never returns: __noreturn is an attribute, not the type
+        [Tok::Punct('!')] => Some(format!("void {decl}")),
+        [Tok::Ident(ns), Tok::Punct(':'), Tok::Punct(':'), Tok::Ident(name)] if is_c_ns(ns) => {
+            let base = kind(name).unwrap_or_else(|| canon_base(toks).unwrap());
+            Some(format!("{q}{base} {decl}").trim_end().to_string())
+        }
+        _ => canon_base(toks).map(|b| format!("{q}{b} {decl}").trim_end().to_string()),
+    }
+}
+
+/// T, if @toks is Head<T> by any path: a family's C definition, which C has
+/// as the struct T itself (util/vstructs.rs).
+fn head_arg(toks: &[Tok]) -> Option<&[Tok]> {
+    let f = toks.iter().position(|t| t.is_ident("Head"))?;
+    let path_ok = toks[..f].iter().all(|t| matches!(t, Tok::Ident(_) | Tok::Punct(':')));
+    match &toks[f + 1..] {
+        [Tok::Punct('<'), inner @ .., Tok::Punct('>')] if path_ok => Some(inner),
+        _ => None,
+    }
+}
+
+/// foo, if @toks is BkeyI<V> by any path, V a key value type - or
+/// BkeyI<Head<V>>, an unsized one's: C's struct bkey_i_foo, V's C name being
+/// struct bch_foo, by @kind - V named as Rust names it, or as C does.
+fn bkey_i_arg(toks: &[Tok], kind: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let b = toks.iter().position(|t| t.is_ident("BkeyI"))?;
+    let path_ok = toks[..b].iter().all(|t| matches!(t, Tok::Ident(_) | Tok::Punct(':')));
+    let [Tok::Punct('<'), inner @ .., Tok::Punct('>')] = &toks[b + 1..] else { return None };
+    let inner = head_arg(inner).unwrap_or(inner);
+    let val_path_ok = inner.iter().all(|t| matches!(t, Tok::Ident(_) | Tok::Punct(':')));
+    match inner {
+        [.., Tok::Ident(v)] if path_ok && val_path_ok => kind(v)
+            .unwrap_or_else(|| format!("struct {v}"))
+            .strip_prefix("struct bch_").map(str::to_string),
+        _ => None,
+    }
+}
+
+/// c_extern!'s C: a prototype for each fn, an extern declaration for each
+/// static.
+fn emit_extern(ex: &CExtern, kind: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let c = |ty: &str, decl: &str, what: &str| proto_c(ty, decl, kind)
+        .ok_or_else(|| format!("{what}: {ty} has no C rendering"));
+    let mut t = String::new();
+    for f in &ex.fns {
+        let mut params = f.params.iter()
+            .map(|(_, ty)| c(ty, "", &format!("fn {}", f.name)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if f.variadic {
+            params.push("...".into());
+        }
+        let params = if params.is_empty() { "void".to_string() } else { params.join(", ") };
+        let must_check = if f.must_use { "__must_check " } else { "" };
+        let decl = format!("{must_check}{}({params})", f.name);
+        let proto = match f.ret.as_deref().map(str::trim) {
+            None => format!("void {decl}"),
+            Some("!") => format!("void __noreturn {decl}"),
+            Some(r) => c(r, &decl, &format!("fn {}", f.name))?,
+        };
+        let printf = f.printf.as_ref().map(|p| format!("__printf({p}) ")).unwrap_or_default();
+        let cold = if f.cold { "__cold " } else { "" };
+        let proto = format!("{printf}{cold}{proto}");
+        t.push_str(&under_cfg(&f.cfg, format!("{proto};\n"))?);
+    }
+    for s in &ex.statics {
+        // a static that isn't mut is C's const: what it holds, an array's
+        // elements - for a pointer, the pointer
+        let decl = match &s.c_decl {
+            Some(d) => d.clone(),
+            None => proto_toks(&tokenize(&s.ty)?, s.name.clone(), !s.mutable, true, kind)
+                .ok_or_else(|| format!("static {}: {} has no C rendering", s.name, s.ty))?,
+        };
+        t.push_str(&under_cfg(&s.cfg, format!("extern {decl};\n"))?);
+    }
+    under_cfg(&ex.cfg, t)
+}
+
+// ---- emitting C ------------------------------------------------------------
+//
+// One emitter for every path that writes C: the same items give the same C.
+
+/// The paths C's namespace goes by: c - and cs, in modules whose c is still
+/// bindgen's (btree/types.rs and the like, which have code of their own).
+fn is_c_ns(s: &str) -> bool {
+    s == "c" || s == "cs"
+}
+
+/// The C base type Rust type @toks renders as - the canonical rendering, by
+/// which a field needs no #[c]: integers by their plain names, endian
+/// integers - Le16..Le64, zerocopy's le::/be:: - as __leN/__beN, c::foo as
+/// struct foo - unless foo ends in _t, a typedef.
+fn canon_base(toks: &[Tok]) -> Option<String> {
+    let path: Vec<&str> = toks.iter().filter_map(|t| match t {
+        Tok::Ident(s) => Some(s.as_str()),
+        Tok::Punct(':') => None,
+        _ => Some("?"),
+    }).collect();
+    let s = match path.as_slice() {
+        ["u8"] => "u8", ["u16"] => "u16", ["u32"] => "u32", ["u64"] => "u64",
+        ["i8"] => "s8", ["i16"] => "s16", ["i32"] => "s32", ["i64"] => "s64",
+        ["bool"] => "bool", ["usize"] => "size_t", ["isize"] => "ssize_t",
+        [.., "c_void"] => "void", [.., "c_char"] => "char",
+        [.., "c_short"] => "short", [.., "c_ushort"] => "unsigned short",
+        [.., "c_int"] => "int", [.., "c_uint"] => "unsigned",
+        [.., "c_long"] => "long", [.., "c_ulong"] => "unsigned long",
+        [.., "c_longlong"] => "long long", [.., "c_ulonglong"] => "unsigned long long",
+        [.., "Le16"] => "__le16", [.., "Le32"] => "__le32", [.., "Le64"] => "__le64",
+        [e, u] if (*e == "le" || *e == "be") && u.starts_with('U') => {
+            return Some(format!("__{e}{}", &u[1..]));
+        }
+        [ns, name] if is_c_ns(ns) => {
+            return Some(if name.ends_with("_t") { name.to_string() } else { format!("struct {name}") });
+        }
+        _ => return None,
+    };
+    Some(s.to_string())
+}
+
+/// A field's Rust type, as #[derive(TypeInfo)] describes it.
+#[allow(dead_code)] // the macros', not rust_types_gen's
+pub enum FieldType {
+    /// `[elem; n]`, both as Rust source
+    Array { elem: String, n: String },
+    /// A pointer, reference, function or generic: nothing to describe
+    Opaque,
+    /// Anything else: the C base type it renders as, if it has one - an
+    /// integer's name, `struct foo` - and the last segment of its path.
+    Named { c: Option<String>, name: String },
+}
+
+/// What @ty is, for #[derive(TypeInfo)]: an integer's width, endianness and
+/// signedness are read from canon_base(), the C the generator renders it as,
+/// so a field's TypeInfo and its C declaration can't disagree.
+#[allow(dead_code)] // the macros', not rust_types_gen's
+pub fn field_type(ty: &str) -> Result<FieldType, String> {
+    let toks = tokenize(ty)?;
+    Ok(match toks.as_slice() {
+        [Tok::Punct('*' | '&'), ..] => FieldType::Opaque,
+        [Tok::Punct('['), inner @ .., Tok::Punct(']')] => match split_top(inner, ';').as_slice() {
+            [elem, n] => FieldType::Array { elem: tokens_to_rust(elem), n: tokens_to_rust(n) },
+            _ => FieldType::Opaque,
+        },
+        _ if toks.iter().any(|t| t.is_punct('<') || t.is_ident("fn")) => FieldType::Opaque,
+        _ => FieldType::Named {
+            c:    canon_base(&toks),
+            name: toks.iter().rev()
+                .find_map(|t| match t { Tok::Ident(s) => Some(s.clone()), _ => None })
+                .unwrap_or_default(),
+        },
+    })
+}
+
+/// @text, under #if @cfg if there is one.
+fn under_cfg(cfg: &Option<Cfg>, text: String) -> Result<String, String> {
+    Ok(match cfg {
+        Some(c) => format!("#if {}\n{text}#endif\n", c.to_c()?),
+        None => text,
+    })
+}
+
+/// A bitfield member's C name: bitfield-struct takes a leading '_' for
+/// padding, so C's _foo is foo_raw in Rust.
+fn bitfield_c_name(name: &str) -> String {
+    match name.strip_suffix("_raw") {
+        Some(stem) => format!("_{stem}"),
+        None => c_ident(name),
+    }
+}
+
+/// A bitfield-struct member that's padding: Rust's, where C leaves bits
+/// unused.
+fn is_bitfield_pad(name: &str) -> bool {
+    name.starts_with("__pad")
+}
+
+/// The members of bitfield type @bf, as C declares them: least significant
+/// first on little-endian bitfields, the reverse on big-endian - so each is at
+/// the same bits of the same native-endian word either way. A member of an
+/// enum type is C's `enum foo name:N`.
+fn emit_bitfield(bf: &CBitfieldDef, kind: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let decl = |(name, ty, width): &(String, String, u32)| -> Result<String, String> {
+        let ty = bf.c_type(ty);
+        let d = canon_c(ty, &bitfield_c_name(name), false, kind)
+            .ok_or_else(|| format!("{}.{name}: {ty} has no C type", bf.name))?;
+        Ok(if Some(*width) == int_bits(ty) {
+            format!("\t{d};\n")
+        } else {
+            format!("\t{d}:{width};\n")
+        })
+    };
+    // Padding - __pad, __padN, where C skips to a member's next unit or past
+    // the run's end - C does by itself, from the start of the word; from its
+    // end, on big-endian, it's an unnamed member.
+    let mut le = String::new();
+    for f in bf.fields.iter().filter(|f| !is_bitfield_pad(&f.0)) {
+        le.push_str(&decl(f)?);
+    }
+    let mut be = String::new();
+    for f in bf.fields.iter().rev() {
+        if is_bitfield_pad(&f.0) {
+            let base = canon_base(&tokenize(&f.1)?)
+                .ok_or_else(|| format!("{}.{}: {} has no C type", bf.name, f.0, f.1))?;
+            be.push_str(&format!("\t{base} :{};\n", f.2));
+        } else {
+            be.push_str(&decl(f)?);
+        }
+    }
+    Ok(format!("#if defined(__LITTLE_ENDIAN_BITFIELD)\n{le}\
+                #elif defined(__BIG_ENDIAN_BITFIELD)\n{be}\
+                #else\n#error edit for your odd byteorder.\n#endif\n"))
+}
+
+/// Whether C writes @f's type in its place: a bare #[c_anon], #[c_inline],
+/// or #[c_struct_group].
+fn in_place(f: &CFieldDef) -> bool {
+    f.inline || f.group || (f.anon && f.c_decl.is_none())
+}
+
+/// Rust type @ty as an element type and C's array dimensions - `[[T; 2]; N]`
+/// is T and [N][2] - or @ty itself and none. None if a dimension has no C
+/// rendering.
+fn array_of(ty: &str) -> Option<(String, String)> {
+    let toks = tokenize(ty).ok()?;
+    let mut elem: &[Tok] = &toks;
+    let mut dims = String::new();
+    while let [Tok::Punct('['), inner @ .., Tok::Punct(']')] = elem {
+        let semi = inner.iter().rposition(|t| t.is_punct(';'))?;
+        dims.push_str(&format!("[{}]", c_dim(&inner[semi + 1..])?));
+        elem = &inner[..semi];
+    }
+    Some((tokens_to_rust(elem), dims))
+}
+
+/// An array dimension as C: a number, or a constant C has by name - a usize
+/// one, or another `as usize`.
+fn c_dim(toks: &[Tok]) -> Option<String> {
+    match toks {
+        [Tok::Lit(n)] => Some(n.trim_end_matches("usize").to_string()),
+        [Tok::Ident(c), Tok::Punct(':'), Tok::Punct(':'), Tok::Ident(name), rest @ ..] if is_c_ns(c) =>
+            match rest {
+                [] => Some(name.clone()),
+                [Tok::Ident(as_), Tok::Ident(us)] if as_ == "as" && us == "usize" => Some(name.clone()),
+                _ => None,
+            },
+        _ => None,
+    }
+}
+
+/// The type field @f declares in its place, if it does: a struct or union of
+/// @items - for #[c_inline], the element type of an array of one.
+#[allow(dead_code)]
+pub fn in_place_def<'a>(f: &CFieldDef, items: &'a [CItem]) -> Option<&'a CStructDef> {
+    if !in_place(f) {
+        return None;
+    }
+    let (elem, dims) = array_of(&f.ty)?;
+    if !dims.is_empty() && !f.inline {
+        return None;
+    }
+    items.iter().find_map(|i| match i {
+        CItem::Struct(d) if d.name == elem.trim() => Some(d),
+        _ => None,
+    })
+}
+
+/// The types of @items that fields declare in their place: C has no
+/// definition of its own for them.
+#[allow(dead_code)]
+pub fn in_place_types(items: &[CItem]) -> Vec<&str> {
+    items.iter()
+        .filter_map(|i| match i {
+            CItem::Struct(d) => Some(d),
+            _ => None,
+        })
+        .flat_map(|d| d.fields.iter())
+        .filter_map(|f| in_place_def(f, items))
+        .map(|d| d.name.as_str())
+        .collect()
+}
+
+/// A zero-length array in a union: C can't have a flexible array member
+/// there, but the kernel's __DECLARE_FLEX_ARRAY wraps one in an anonymous
+/// struct, which can.
+fn union_flex_array(ty: &str, name: &str) -> Option<String> {
+    let toks = tokenize(ty).ok()?;
+    let [Tok::Punct('['), inner @ .., Tok::Punct(']')] = toks.as_slice() else {
+        return None;
+    };
+    let semi = inner.iter().rposition(|t| t.is_punct(';'))?;
+    if !matches!(&inner[semi + 1..], [Tok::Lit(n)] if n == "0") {
+        return None;
+    }
+    Some(format!("__DECLARE_FLEX_ARRAY({}, {name})", canon_base(&inner[..semi])?))
+}
+
+/// The attributes after @def's closing brace - per configuration, if its
+/// repr is, unless C says it once for all of them.
+fn c_attrs(def: &CStructDef) -> Result<String, String> {
+    Ok(if let Some(a) = &def.c_align {
+        format!(" __aligned({a})")
+    } else if def.cfg_reprs.is_empty() {
+        def.repr.to_c()
+    } else {
+        let mut a = String::from("\n");
+        for (k, (cfg, repr)) in def.cfg_reprs.iter().enumerate() {
+            let kw = if k == 0 { "#if" } else { "#elif" };
+            a.push_str(&format!("{kw} {}\n{}\n", cfg.to_c()?, repr.to_c()));
+        }
+        a.push_str("#endif\n");
+        a
+    })
+}
+
+/// A struct's C definition. @opaque gives the C declaration of a Rust-only
+/// field - one with no #[c] and no canonical rendering.
+fn emit_struct(def: &CStructDef, items: &[CItem],
+               opaque: &dyn Fn(&CStructDef, &CFieldDef) -> Result<String, String>,
+               kind: &dyn Fn(&str) -> Option<String>)
+    -> Result<String, String>
+{
+    if !def.repr_c() {
+        return Err(format!("{} must be #[repr(C)]: C shares it", def.name));
+    }
+    let body = emit_members(def, items, opaque, kind)?;
+    let attrs = c_attrs(def)?;
+    let kw = def.kind.keyword();
+    under_cfg(&def.cfg, match &def.typedef {
+        Some(t) if def.typedef_anon => format!("typedef {kw} {{\n{body}}}{attrs} {t};\n"),
+        Some(t) => format!("typedef {kw} {} {{\n{body}}}{attrs} {t};\n", def.name),
+        None => format!("{kw} {} {{\n{body}}}{attrs};\n", def.name),
+    })
+}
+
+/// @def's members, a tab in - an anonymous member's a tab further.
+fn emit_members(def: &CStructDef, items: &[CItem],
+                opaque: &dyn Fn(&CStructDef, &CFieldDef) -> Result<String, String>,
+                kind: &dyn Fn(&str) -> Option<String>)
+    -> Result<String, String>
+{
+    // Consecutive fields under the same cfg share one #if.
+    let mut body = String::new();
+    let mut open: Option<String> = None;
+    // whether C has a member before this one: a flexible array, x[], needs
+    // one - a struct of only x[] is an error to gcc before 15 - so with none
+    // it's x[0], as bch_val's __nothing was written
+    let mut named = false;
+    for (n, f) in def.fields.iter().enumerate() {
+        let last = n + 1 == def.fields.len() && named;
+        let text = if f.bitfield {
+            let bf = items.iter().find_map(|i| match i {
+                CItem::Bitfield(b) if b.name == f.ty.trim() => Some(b),
+                _ => None,
+            }).ok_or_else(|| format!("{}.{}: #[c_bitfield], but {} isn't a #[bitfield] type here",
+                                     def.name, f.name, f.ty))?;
+            emit_bitfield(bf, kind)?
+        } else if in_place(f) {
+            let attr = match (f.inline, f.group) {
+                (true, _) => "c_inline",
+                (_, true) => "c_struct_group",
+                _ => "c_anon",
+            };
+            let inner = in_place_def(f, items).ok_or_else(|| format!(
+                "{}.{}: #[{attr}], but {} isn't a struct or union here", def.name, f.name, f.ty))?;
+            if !inner.repr_c() || inner.typedef.is_some() {
+                return Err(format!("{}.{}: #[{attr}]'s type {} must be #[repr(C)], and not a typedef",
+                                   def.name, f.name, inner.name));
+            }
+            let members: String = emit_members(inner, items, opaque, kind)?
+                .lines()
+                .map(|l| if l.starts_with('#') { format!("{l}\n") } else { format!("\t{l}\n") })
+                .collect();
+            if f.group {
+                // the kernel's: a union of the members, and the same as a
+                // struct of that name
+                let plain = CRepr { repr_c: true, ..CRepr::default() };
+                if inner.kind != CKind::Struct || inner.repr != plain
+                    || inner.c_align.is_some() || !inner.cfg_reprs.is_empty() {
+                    return Err(format!("{}.{}: #[c_struct_group]'s type {} must be a plain #[repr(C)] struct: \
+                                        struct_group() takes no attributes", def.name, f.name, inner.name));
+                }
+                format!("\tstruct_group({},\n{members}\t);\n", f.name)
+            } else {
+                let name = match array_of(&f.ty) {
+                    Some((_, dims)) if f.inline => format!(" {}{dims}", f.name),
+                    _ => String::new(),
+                };
+                format!("\t{} {{\n{members}\t}}{}{name};\n", inner.kind.keyword(), c_attrs(inner)?)
+            }
+        } else if f.c_decl.as_deref() == Some("") {
+            // #[c_anon("")]: Rust's alone, and nothing in C - a zero-sized
+            // alignment marker, say.
+            String::new()
+        } else if let Some(decl) = &f.c_decl {
+            // An x-macro expansion, as written, ends with its #undef: the
+            // members are its, and a ; would be on the directive's line.
+            let directive = decl.lines().last().is_some_and(|l| l.trim_start().starts_with('#'));
+            format!("\t{decl}{}\n", if directive { "" } else { ";" })
+        } else if let Some(decl) = union_flex_array(&f.ty, &f.name).filter(|_| def.kind == CKind::Union) {
+            format!("\t{decl};\n")
+        } else if let Some(decl) = container_c(&f.ty, &f.name, kind)
+            .map_err(|e| format!("{}.{e}", def.name))? {
+            format!("\t{decl};\n")
+        } else if let Some(decl) = canon_c(&f.ty, &f.name, last, kind) {
+            format!("\t{decl};\n")
+        } else {
+            format!("\t{};\n", opaque(def, f)?)
+        };
+        let text = match (&f.c_align, text.strip_suffix(";\n")) {
+            (None, _) => text,
+            (Some(a), Some(decl)) => format!("{decl} __aligned({a});\n"),
+            (Some(_), None) => return Err(format!("{}.{}: after an alignment marker, but C declares it \
+                                                   so __aligned() can't follow", def.name, f.name)),
+        };
+        named |= !text.is_empty();
+        let cond = f.cfg.as_ref().map(Cfg::to_c).transpose()?;
+        if cond != open {
+            if open.is_some() {
+                body.push_str("#endif\n");
+            }
+            if let Some(c) = &cond {
+                body.push_str(&format!("#if {c}\n"));
+            }
+            open = cond;
+        }
+        body.push_str(&text);
+    }
+    if open.is_some() {
+        body.push_str("#endif\n");
+    }
+    Ok(body)
+}
+
+/// @ty's type arguments, Rust source, if it's @name<...> - one of
+/// types/lib.rs's containers of C's, by any path.
+fn container_args(ty: &str, name: &str) -> Result<Option<Vec<String>>, String> {
+    let toks = tokenize(ty)?;
+    let Some(i) = toks.iter().rposition(|t| t.is_ident(name)) else {
+        return Ok(None);
+    };
+    let [Tok::Punct('<'), args @ .., Tok::Punct('>')] = &toks[i + 1..] else {
+        return Ok(None);
+    };
+    Ok(Some(split_top(args, ',').into_iter().map(tokens_to_rust).collect()))
+}
+
+/// A DArray<T> or DArray<T, N> - types/lib.rs's, C's DARRAY() - as @ty, Rust
+/// source: T, and N if it's there.
+fn darray_args(ty: &str) -> Result<Option<(String, Option<String>)>, String> {
+    Ok(match container_args(ty, "DArray")?.as_deref() {
+        Some([elem]) => Some((elem.clone(), None)),
+        Some([elem, nr]) => Some((elem.clone(), Some(nr.clone()))),
+        _ => None,
+    })
+}
+
+/// @decl of container type @ty - a DArray or a GenRadix - as C declares it,
+/// by the container's macro: DARRAY(T), DARRAY_PREALLOCATED(T, N),
+/// GENRADIX(T). None if @ty is no container.
+fn container_c(ty: &str, decl: &str, kind: &dyn Fn(&str) -> Option<String>)
+    -> Result<Option<String>, String>
+{
+    let elem_c = |elem: &str| canon_c(elem, "", false, kind)
+        .map(|e| e.trim().to_string())
+        .ok_or_else(|| format!("{decl}: {ty}'s element type {elem} has no C rendering"));
+    if let Some((elem, nr)) = darray_args(ty)? {
+        let elem = elem_c(&elem)?;
+        return Ok(Some(match nr {
+            None => format!("DARRAY({elem}) {decl}"),
+            Some(n) => format!("DARRAY_PREALLOCATED({elem}, {}) {decl}", darray_nr_c(&n)
+                .ok_or_else(|| format!("{decl}: {ty}'s length {n} has no C rendering"))?),
+        }));
+    }
+    if let Some([elem]) = container_args(ty, "GenRadix")?.as_deref() {
+        return Ok(Some(format!("GENRADIX({}) {decl}", elem_c(elem)?)));
+    }
+    Ok(None)
+}
+
+/// DArray<T, N>'s N as C: a const generic, so a constant's in braces.
+fn darray_nr_c(n: &str) -> Option<String> {
+    let toks = tokenize(n).ok()?;
+    match toks.as_slice() {
+        [Tok::Punct('{'), inner @ .., Tok::Punct('}')] => c_dim(inner),
+        toks => c_dim(toks),
+    }
+}
+
+/// A declaration of each struct, union and enum @c names inside parentheses -
+/// in a prototype: a c_extern!'s, a callback field's, a function typedef's. One
+/// a prototype names before it's declared would be the prototype's own, which
+/// conflicts with the real one. An enum too: incomplete until its definition,
+/// as GNU C allows. Macros are left out - they declare nothing until they're
+/// used - and so are comments.
+fn forward_decls(c: &str) -> String {
+    let mut decls = std::collections::BTreeSet::new();
+    let mut depth = 0usize;
+    let mut in_comment = false;
+    for line in c.lines() {
+        if !in_comment && line.trim_start().starts_with('#') {
+            continue;
+        }
+        let b = line.as_bytes();
+        let ident = |i: usize| b.get(i).is_some_and(|&c| c == b'_' || c.is_ascii_alphanumeric());
+        let mut i = 0;
+        while i < b.len() {
+            if in_comment {
+                if b[i..].starts_with(b"*/") {
+                    in_comment = false;
+                    i += 1;
+                }
+            } else if b[i..].starts_with(b"/*") {
+                in_comment = true;
+                i += 1;
+            } else if b[i..].starts_with(b"//") {
+                break;
+            } else if b[i] == b'(' {
+                depth += 1;
+            } else if b[i] == b')' {
+                depth = depth.saturating_sub(1);
+            } else if ident(i) {
+                let start = i;
+                while ident(i) { i += 1; }
+                let word = &line[start..i];
+                if depth > 0 && matches!(word, "struct" | "union" | "enum") {
+                    let rest = line[i..].trim_start();
+                    let n: String = rest.chars().take_while(|&c| c == '_' || c.is_ascii_alphanumeric()).collect();
+                    if !n.is_empty() {
+                        decls.insert(format!("{word} {n};\n"));
+                    }
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+    decls.into_iter().collect()
+}
+
+/// The C for @items, in order, after the declarations their prototypes need
+/// (forward_decls()). @opaque as for emit_struct().
+#[allow(dead_code)]
+pub fn emit_items(items: &[CItem],
+                  opaque: &dyn Fn(&CStructDef, &CFieldDef) -> Result<String, String>,
+                  kind: &dyn Fn(&str) -> Option<String>)
+    -> Result<String, String>
+{
+    let in_place = in_place_types(items);
+    let mut out = String::new();
+    for item in items {
+        let text = match item {
+            CItem::Extern(ex) => emit_extern(ex, kind)?,
+            CItem::TaggedUnion(tu) => emit_tagged_union(tu, kind)?,
+            // Declared where its #[c_anon] or #[c_inline] field is.
+            CItem::Struct(def) if in_place.contains(&def.name.as_str()) => continue,
+            CItem::Struct(def) => emit_struct(def, items, opaque, kind)
+                .map_err(|e| format!("struct {}: {e}", def.name))?,
+            // Declared in the C of the struct that has one.
+            CItem::Bitfield(_) => continue,
+            CItem::Verbatim(v) => under_cfg(&v.cfg, format!("{}\n", v.text))?,
+            CItem::XMacro(x) => {
+                // The mappings for the lists spliced in, first: C expands
+                // them where the list is used.
+                let mut t = String::new();
+                for e in &x.entries {
+                    if let CXEntry::Sub { map: Some(m), .. } = e {
+                        t.push_str(&format!("#define {}({})\t\\\n\t{}({})\n",
+                                            m.name, m.params.join(", "), x.callback, m.template));
+                    }
+                }
+                t.push_str(&format!("#define {}()", x.name));
+                for e in &x.entries {
+                    match e {
+                        CXEntry::Args(a) => t.push_str(&format!("\t\\\n\t{}({a})", x.callback)),
+                        CXEntry::Sub { list, .. } => t.push_str(&format!("\t\\\n\t{list}()")),
+                    }
+                }
+                under_cfg(&x.cfg, t + "\n")?
+            }
+            CItem::Bitmask(b) => {
+                // the struct as Rust names it - if not as C does, C's, which
+                // @kind has from its record
+                let c_type = match b.c_type.strip_prefix("struct ").and_then(|n| Some((n, kind(n)?))) {
+                    Some((n, c)) if ![format!("struct {n}"), format!("union {n}"), n.to_string()].contains(&c) => c,
+                    _ => b.c_type.clone(),
+                };
+                let mut t = String::new();
+                for e in &b.entries {
+                    t.push_str(&format!("{}({}, {}, {}, {}, {});\n",
+                                        b.macro_name, e.name, c_type, b.field, e.start, e.end));
+                }
+                under_cfg(&b.cfg, t)?
+            }
+            CItem::Ioctl(io) => {
+                let mut t = String::new();
+                for e in &io.entries {
+                    let arg = match (&e.arg, &e.c_arg) {
+                        (None, _) => String::new(),
+                        (Some(_), Some(c)) => format!(", {c}"),
+                        (Some(a), None) => {
+                            let c = canon_c(a, "", false, kind)
+                                .ok_or_else(|| format!("{}: {a} has no C rendering - it needs a #[c(\"...\")]", e.name))?;
+                            format!(", {}", c.trim())
+                        }
+                    };
+                    t.push_str(&format!("#define {}\t{}({}, {}{arg})\n", e.name, e.dir, e.ty, e.nr));
+                }
+                under_cfg(&io.cfg, t)?
+            }
+            CItem::Enum(e) => {
+                let mut t = format!("enum {}{} {{\n", e.kind.marker(),
+                                    e.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default());
+                for (v, value) in &e.variants {
+                    match value {
+                        Some(x) => t.push_str(&format!("\t{v} = {x},\n")),
+                        None => t.push_str(&format!("\t{v},\n")),
+                    }
+                }
+                under_cfg(&e.cfg, t + "};\n")?
+            }
+            CItem::Const(c) => under_cfg(&c.cfg, format!("#define {}\t{}\n", c.name, c.c_value()?))?,
+            CItem::Typedef(t) => match (&t.c_decl, darray_args(&t.ty)?) {
+                // util/darray.h's: the typedef and its cleanup class
+                (None, Some((elem, nr))) => {
+                    let elem = canon_c(&elem, "", false, kind)
+                        .ok_or_else(|| format!("typedef {}: {elem} has no C rendering", t.name))?;
+                    under_cfg(&t.cfg, match nr {
+                        None => format!("DEFINE_DARRAY_NAMED({}, {});\n", t.name, elem.trim()),
+                        Some(n) => {
+                            let n = darray_nr_c(&n).ok_or_else(|| format!(
+                                "typedef {}: {}'s length {n} has no C rendering", t.name, t.ty))?;
+                            format!("typedef DARRAY_PREALLOCATED({}, {n}) {};\nDEFINE_DARRAY_CLASS({})\n",
+                                    elem.trim(), t.name, t.name)
+                        }
+                    })?
+                }
+                _ => {
+                    let decl = match &t.c_decl {
+                        Some(d) => d.clone(),
+                        None => match container_c(&t.ty, &t.name, kind).map_err(|e| format!("typedef {e}"))? {
+                            Some(d) => d,
+                            None => canon_c(&t.ty, &t.name, false, kind)
+                                .ok_or_else(|| format!("typedef {}: {} has no C rendering - it needs a #[c(\"...\")]",
+                                                       t.name, t.ty))?,
+                        },
+                    };
+                    under_cfg(&t.cfg, format!("typedef {decl};\n"))?
+                }
+            },
+            // C's own definition: the generator asserts it's the Rust type's.
+            CItem::Same(_) => continue,
+        };
+        out.push('\n');
+        out.push_str(&text);
+    }
+    let decls = forward_decls(&out);
+    Ok(if decls.is_empty() { out } else { format!("\n{decls}{out}") })
+}
+
+// ---- entry points ----------------------------------------------------------
+
+/// Parse a derive's input: exactly one struct or union.
+#[allow(dead_code)]
+pub fn parse_cstruct(src: &str) -> Result<CStructDef, String> {
+    let toks = tokenize(src)?;
+    let (a, i) = item_attrs(&toks, 0)?;
+    parse_struct(&toks, i, a)?
+        .map(|(def, _)| def)
+        .ok_or_else(|| "#[derive(CStruct)] is for structs and unions with named fields".to_string())
+}
+
+/// Every C-shared item in a source file, in order.
+#[allow(dead_code)]
+pub fn parse_items(src: &str) -> Result<Vec<CItem>, String> {
+    let toks = tokenize(src)?;
+    let mut out = Vec::new();
+
+    let mut i = 0;
+    while i < toks.len() {
+        // An item: its attributes, then what it is. Anything else - an impl,
+        // a fn, a use - is stepped over a token at a time; its attributes are
+        // read and dropped with it.
+        let (a, j) = item_attrs(&toks, i)?;
+
+        match (ident_at(&toks, j), toks.get(j + 1)) {
+            (Some("c_verbatim"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                let text = match body {
+                    [Tok::Str(s, _)] => s.trim_matches('\n').to_string(),
+                    _ => return Err("c_verbatim!: takes one string".into()),
+                };
+                out.push(CItem::Verbatim(CVerbatim { cfg: a.cfg, text }));
+                i = next;
+                continue;
+            }
+            (Some("c_xmacro"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                out.push(CItem::XMacro(parse_xmacro(body, a.cfg)?));
+                i = next;
+                continue;
+            }
+            (Some("c_bitmask"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                out.push(CItem::Bitmask(parse_bitmask(body, a.cfg)?));
+                i = next;
+                continue;
+            }
+            (Some("c_ioctl"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                out.push(CItem::Ioctl(parse_ioctl(body, a.cfg)?));
+                i = next;
+                continue;
+            }
+            (Some("c_enum"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                out.push(CItem::Enum(parse_enum(body, a.cfg)?));
+                i = next;
+                continue;
+            }
+            (Some("c_const"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                for c in split_top(body, ';') {
+                    out.push(CItem::Const(parse_const(c, a.cfg.clone())?));
+                }
+                i = next;
+                continue;
+            }
+            (Some("c_typedef"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                out.push(CItem::Typedef(parse_typedef(body, a.cfg)?));
+                i = next;
+                continue;
+            }
+            (Some("tagged_union"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                out.push(CItem::TaggedUnion(parse_tagged_union(body, a.cfg)?));
+                i = next;
+                continue;
+            }
+            (Some("c_extern"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                out.push(CItem::Extern(parse_extern(body, a.cfg)?));
+                i = next;
+                continue;
+            }
+            (Some("c_same"), Some(t)) if t.is_punct('!') => {
+                let (body, next) = macro_body(&toks, j + 2)?;
+                out.push(CItem::Same(parse_same(body)?));
+                i = next;
+                continue;
+            }
+            _ => {}
+        }
+
+        if a.c_export {
+            let (e, next) = parse_export(&toks, j, a)?;
+            push_item(&mut out, CItem::Extern(e.ex));
+            i = next;
+            continue;
+        }
+        if let Some(storage) = a.bitfield.clone() {
+            if let Some((def, next)) = parse_bitfield(&toks, j, a.cfg.clone(), storage, a.bitfield_ty.clone())? {
+                out.push(CItem::Bitfield(def));
+                i = next;
+                continue;
+            }
+        }
+        if a.derives {
+            if let Some((def, next)) = parse_struct(&toks, j, a)? {
+                out.push(CItem::Struct(def));
+                i = next;
+                continue;
+            }
+        }
+        i = j.max(i + 1);
+    }
+    Ok(out)
+}

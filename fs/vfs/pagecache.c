@@ -372,8 +372,6 @@ int bch2_mark_pagecache_reserved(struct bch_inode_info *inode,
 
 			BUG_ON(end <= folio_start);
 
-			*start = min(end, folio_end);
-
 			struct bch_folio *s = bch2_folio(folio);
 			if (s) {
 				unsigned folio_offset = max(*start, folio_start) - folio_start;
@@ -387,6 +385,7 @@ int bch2_mark_pagecache_reserved(struct bch_inode_info *inode,
 				}
 			}
 
+			*start = min(end, folio_end);
 			folio_unlock(folio);
 		}
 		folio_batch_release(&fbatch);
@@ -536,7 +535,7 @@ static ssize_t __bch2_folio_reservation_get(struct bch_fs *c,
 					      res->disk.nr_replicas,
 					      partial ? BCH_DISK_RESERVATION_PARTIAL : 0));
 
-		unsigned got = disk_res.r.sectors / disk_res.r.nr_replicas;
+		unsigned got = div_u64(disk_res.r.sectors, disk_res.r.nr_replicas);
 		if (unlikely(got < last - first)) {
 			/*
 			 * Make sure to get a reservation that's aligned to the

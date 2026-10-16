@@ -21,7 +21,7 @@ impl PartialOrd for c::bbpos {
 
 impl Ord for c::bbpos {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.btree as u32).cmp(&(other.btree as u32))
+        self.btree.0.cmp(&{ other.btree.0 })
             .then(self.pos.cmp(&other.pos))
     }
 }
@@ -31,7 +31,7 @@ impl FromStr for c::bbpos {
     type Err = BchError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let err = || BchError::from_errcode(bch_errcode::BCH_ERR_EINVAL_parse_bbpos);
+        let err = || BchError::from(bch_errcode::BCH_ERR_EINVAL_parse_bbpos);
 
         let (btree_s, pos_s) = s.split_once(':').ok_or_else(err)?;
 
