@@ -18,6 +18,7 @@
 #include "data/compress.h"
 #include "data/keylist.h"
 #include "data/extents.h"
+#include "data/ec/create.h"
 #include "data/ec/init.h"
 #include "data/ec/io.h"
 #include "data/ec/trigger.h"
@@ -103,13 +104,29 @@ static void move_write(struct data_update *u)
 	struct bch_read_bio *rbio = &u->rbio;
 
 	if (ctxt->stats) {
-		if (rbio->ret) {
-			atomic64_add(u->rbio.bvec_iter.bi_size >> 9,
+		/*
+		 * A poisoned extent is data we've already lost, even when it
+		 * reads back clean: a move gives it a new checksum over the bad
+		 * data. Not for the journal scrub, where uncorrected means a
+		 * rewind, and a rewind can't bring this back.
+		 */
+		bool poisoned = u->opts.type == BCH_DATA_UPDATE_scrub &&
+			(bch2_bkey_extent_flags(bkey_i_to_s_c(u->k.k)) &
+			 BIT_ULL(BCH_EXTENT_FLAG_poisoned));
+
+		/*
+		 * Not rbio->bvec_iter: that's only set when the read went
+		 * straight into this rbio, not through a bounce or a clone
+		 */
+		if (bch2_data_update_read_err_benign(rbio->ret)) {
+			/* nothing was read, and nothing was lost */
+		} else if (rbio->ret || poisoned) {
+			atomic64_add(u->k.k->k.size,
 				     &ctxt->stats->sectors_error_uncorrected);
 			set_bit(rbio->pick.ptr.dev,
 				ctxt->stats->devs_error_uncorrected.d);
 		} else if (rbio->saw_error)
-			atomic64_add(u->rbio.bvec_iter.bi_size >> 9,
+			atomic64_add(u->k.k->k.size,
 				     &ctxt->stats->sectors_error_corrected);
 	}
 
@@ -655,16 +672,16 @@ static int stripe_block_at_bp(struct bch_dev *ca, struct bkey_s_c_stripe s,
 }
 
 /*
- * A bad stripe block: point the stripe's pointer to it at
- * BCH_SB_MEMBER_INVALID, as removing its device would. The stripe is then
- * degraded, and reconcile rebuilds it. Refused if the stripe couldn't be
- * rebuilt without it, or is open - being rewritten already.
+ * A bad stripe block: repair the stripe, as reconcile would a degraded one. Not
+ * by invalidating the block - its extents outside the bad granule are intact,
+ * and may be needed if the stripe can't be reconstructed.
  */
-static int scrub_invalidate_stripe_block(struct btree_trans *trans,
-					 struct ec_stripe_buf *buf, unsigned block,
-					 bool *gone, bool *invalidated,
-					 struct printbuf *err)
+static int scrub_repair_stripe(struct moving_context *ctxt,
+			       struct ec_stripe_buf *buf, unsigned block,
+			       bool *gone)
 {
+	struct btree_trans *trans = ctxt->trans;
+
 	CLASS(btree_iter, iter)(trans, BTREE_ID_stripes, buf->key.k.p, BTREE_ITER_intent);
 	struct bkey_s_c k = bkey_try(bch2_btree_iter_peek_slot(&iter));
 
@@ -677,13 +694,15 @@ static int scrub_invalidate_stripe_block(struct btree_trans *trans,
 		return 0;
 	}
 
-	bool had_open = false;
-	u64 recorded = 0;
-	try(bch2_invalidate_stripe_to_dev(trans, &iter, k, buf->key.v.ptrs[block].dev,
-					  BCH_FORCE_IF_DATA_DEGRADED, err,
-					  &had_open, &recorded));
-	*invalidated = !had_open;
-	return 0;
+	/* repair drops our locks: it needs a copy */
+	struct bkey_buf sk __cleanup(bch2_bkey_buf_exit);
+	bch2_bkey_buf_init(&sk);
+	bch2_bkey_buf_reassemble(&sk, k);
+
+	int ret = bch2_stripe_repair_damaged(ctxt, &iter, bkey_i_to_s_c_stripe(sk.k), block);
+
+	/* narrowing: evacuating, and reconcile finishes it */
+	return ret == -BCH_ERR_stripe_needs_block_evacuate ? 0 : ret;
 }
 
 static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
@@ -712,6 +731,9 @@ static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
 	bch2_trans_unlock(trans);
 
 	s64 bad = bch2_ec_scrub_block(c, buf, block);
+
+	try(bch2_trans_relock(trans));
+
 	if (bad <= 0) {
 		/*
 		 * Couldn't read it: an IO error is counted by the device, and a
@@ -720,16 +742,14 @@ static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
 		return bad == -BCH_ERR_ENOMEM_stripe_buf ? bad : 0;
 	}
 
-	bool gone = false, invalidated = false;
-	CLASS(printbuf, err)();
-	int ret = commit_do(trans, NULL, NULL, BCH_TRANS_COMMIT_no_enospc,
-			    scrub_invalidate_stripe_block(trans, buf, block, &gone,
-							  &invalidated, &err));
-	if (gone)
-		return 0;
+	/* a restart goes back to the backpointer walk, which retries the block: */
+	bool gone = false;
+	int ret = scrub_repair_stripe(ctxt, buf, block, &gone);
+	if (gone || bch2_err_matches(ret, BCH_ERR_transaction_restart))
+		return ret;
 
 	if (ctxt->stats)
-		atomic64_add(bad, invalidated
+		atomic64_add(bad, !ret
 			     ? &ctxt->stats->sectors_error_corrected
 			     : &ctxt->stats->sectors_error_uncorrected);
 
@@ -743,17 +763,13 @@ static int scrub_stripe_block(struct moving_context *ctxt, struct bch_dev *ca,
 	bch2_bkey_val_to_text(&msg.m, c, bkey_i_to_s_c(&buf->key.k_i));
 	prt_newline(&msg.m);
 
-	if (invalidated)
-		prt_str(&msg.m, "block invalidated, reconcile will rebuild the stripe");
-	else if (ret)
-		prt_printf(&msg.m, "error invalidating block: %s", bch2_err_str(ret));
+	if (ret)
+		prt_printf(&msg.m, "error repairing stripe: %s", bch2_err_str(ret));
 	else
-		prt_str(&msg.m, "not repaired: stripe is open");
+		prt_str(&msg.m, "repairing stripe");
 	prt_newline(&msg.m);
-	if (err.pos)
-		prt_str(&msg.m, err.buf);
 
-	return bch2_err_matches(ret, BCH_ERR_remove_would_lose_data) ? 0 : ret;
+	return ret;
 }
 
 static int __bch2_move_data_phys(struct moving_context *ctxt,
@@ -1291,24 +1307,42 @@ int bch2_scrub_journal(struct bch_fs *c, u64 *rewind_seq)
 	CLASS(darray_u64, flushes)();
 	int ret = 0;
 
-	u64 last_entry_time = 0;
 	*rewind_seq = 0;
 
 	struct journal_replay **_i;
 	struct genradix_iter radix_iter;
+
+	/*
+	 * The window is measured back from the newest flush entry, so we need
+	 * that before we can decide what falls inside it - genradix_for_each()
+	 * runs oldest-first, and the scrub loop below requires @flushes in
+	 * ascending seq order, so take two passes rather than reversing.
+	 */
+	u64 newest_time = 0;
 	genradix_for_each(&c->journal_entries, radix_iter, _i) {
 		struct journal_replay *i = *_i;
 
-		if (!journal_replay_ignore(i) &&
-		    !JSET_NO_FLUSH(&i->j)) {
-			u64 t = jset_datetime(&i->j);
-			if (!last_entry_time)
-				last_entry_time = t;
-			else if (time_before64(t + c->opts.scrub_journal_max_rewind_secs, last_entry_time))
-				break;
+		if (!journal_replay_ignore(i) && !JSET_NO_FLUSH(&i->j))
+			newest_time = max(newest_time, (u64) jset_datetime(&i->j));
+	}
 
-			try(darray_push(&flushes, le64_to_cpu(i->j.seq)));
-		}
+	genradix_for_each(&c->journal_entries, radix_iter, _i) {
+		struct journal_replay *i = *_i;
+
+		if (journal_replay_ignore(i) || JSET_NO_FLUSH(&i->j))
+			continue;
+
+		/*
+		 * Entries with no datetime entry (t == 0) are always included:
+		 * we can't tell how old they are, and excluding them would
+		 * silently shrink the scrub window.
+		 */
+		u64 t = jset_datetime(&i->j);
+		if (t && newest_time &&
+		    time_before64(t + c->opts.scrub_journal_max_rewind_secs, newest_time))
+			continue;
+
+		try(darray_push(&flushes, le64_to_cpu(i->j.seq)));
 	}
 
 	if (!flushes.nr) {

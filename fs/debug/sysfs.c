@@ -241,7 +241,7 @@ read_attribute(moving_ctxts);
 
 read_attribute(recent_counters);
 
-#if defined(CONFIG_BCACHEFS_TESTS) && defined(CONFIG_BCACHEFS_RUST)
+#ifdef CONFIG_BCACHEFS_TESTS
 write_attribute(perf_test);
 #endif
 
@@ -480,6 +480,14 @@ STORE(bch2_fs)
 	if (attr == &sysfs_trigger_reconcile_pending_wakeup)
 		bch2_reconcile_pending_wakeup(c);
 
+	/* Only arms the knob, so no write ref - and it can fail: */
+	if (attr == &sysfs_logged_op_fail_next) {
+		unsigned type;
+
+		try(bch2_logged_op_fail_next_parse(buf, &type));
+		WRITE_ONCE(c->logged_op_fail_next, type);
+	}
+
 	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_sysfs))
 		return -EROFS;
 
@@ -502,13 +510,6 @@ STORE(bch2_fs)
 	if (attr == &sysfs_trigger_gc)
 		bch2_gc_gens(c);
 
-	if (attr == &sysfs_logged_op_fail_next) {
-		unsigned type;
-
-		try(bch2_logged_op_fail_next_parse(buf, &type));
-		WRITE_ONCE(c->logged_op_fail_next, type);
-	}
-
 	if (attr == &sysfs_trigger_delete_dead_snapshots) {
 		/* debug force: bypass auto_snapshot_deletion; serialize via run_lock */
 		scoped_guard(mutex, &c->recovery.run_lock)
@@ -522,7 +523,7 @@ STORE(bch2_fs)
 		bch2_fs_emergency_read_only(c, &msg.m);
 	}
 
-#if defined(CONFIG_BCACHEFS_TESTS) && defined(CONFIG_BCACHEFS_RUST)
+#ifdef CONFIG_BCACHEFS_TESTS
 	if (attr == &sysfs_perf_test) {
 		char *tmp __free(kfree) = kstrdup(buf, GFP_KERNEL), *p = tmp;
 		char *test		= strsep(&p, " \t\n");
@@ -559,7 +560,7 @@ struct attribute *bch2_fs_files[] = {
 	&sysfs_compression_stats,
 	&sysfs_errors,
 
-#if defined(CONFIG_BCACHEFS_TESTS) && defined(CONFIG_BCACHEFS_RUST)
+#ifdef CONFIG_BCACHEFS_TESTS
 	&sysfs_perf_test,
 #endif
 	NULL

@@ -35,6 +35,7 @@
 #include "vfs/buffered.h"
 #include "vfs/direct.h"
 #include "vfs/pagecache.h"
+#include "vfs/rust_gen.h"
 
 #include <linux/aio.h>
 #include <linux/backing-dev.h>
@@ -217,11 +218,13 @@ int bch2_fs_quota_transfer(struct bch_fs *c,
 
 	guard(mutex)(&inode->ei_quota_lock);
 
-	int ret = bch2_quota_transfer(c, qtypes, new_qid,
-				  inode->ei_qid,
-				  inode->v.i_blocks +
-				  inode->ei_quota_reserved,
-				  mode);
+	/* Quotas don't count snapshot inodes: only the qid changes. */
+	int ret = test_bit(EI_INODE_SNAPSHOT, &inode->ei_flags) ? 0 :
+		bch2_quota_transfer(c, qtypes, new_qid,
+				    inode->ei_qid,
+				    inode->v.i_blocks +
+				    inode->ei_quota_reserved,
+				    mode);
 	if (!ret)
 		for (unsigned i = 0; i < QTYP_NR; i++)
 			if (qtypes & (1 << i))
@@ -776,6 +779,14 @@ __bch2_create(struct mnt_idmap *idmap,
 retry:
 	bch2_trans_begin(trans);
 
+	/*
+	 * Quotas count only master subvolume inodes; a new subvolume's root is
+	 * in a new snapshot tree, and is its master unless it's a snapshot:
+	 */
+	bool quota = flags & BCH_CREATE_SUBVOL
+		? !(flags & BCH_CREATE_SNAPSHOT)
+		: !test_bit(EI_INODE_SNAPSHOT, &dir->ei_flags);
+
 	ret   = bch2_create_trans(trans,
 				  inode_inum(dir), &dir_u, &inode_u, &subvol,
 				  !(flags & BCH_CREATE_TMPFILE)
@@ -784,8 +795,8 @@ retry:
 				  from_kgid(i_user_ns(&dir->v), kgid),
 				  mode, rdev,
 				  default_acl, acl, snapshot_src, flags) ?:
-		bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, 1,
-				KEY_TYPE_QUOTA_PREALLOC);
+		(quota ? bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, 1,
+					 KEY_TYPE_QUOTA_PREALLOC) : 0);
 	if (unlikely(ret))
 		goto err_before_quota;
 
@@ -806,8 +817,9 @@ retry:
 					 inum, &inode_u, flags) ?:
 		bch2_trans_commit(trans, NULL, NULL, 0);
 	if (unlikely(ret)) {
-		bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, -1,
-				KEY_TYPE_QUOTA_WARN);
+		if (quota)
+			bch2_quota_acct(c, bch_qid(&inode_u), Q_INO, -1,
+					KEY_TYPE_QUOTA_WARN);
 err_before_quota:
 		if (bch2_err_matches(ret, BCH_ERR_transaction_restart))
 			goto retry;
@@ -851,6 +863,25 @@ err_before_quota:
 
 /* methods */
 
+static void bch2_vfs_check_dirents_work(struct work_struct *work)
+{
+	struct bch_fs *c = container_of(work, struct bch_fs, vfs.check_dirents_work);
+	CLASS(bch_log_msg, msg)(c);
+
+	bch_err_fn(c, bch2_run_explicit_recovery_pass(c, &msg.m,
+							 BCH_RECOVERY_PASS_check_dirents, 0));
+	enumerated_ref_put(&c->writes, BCH_WRITE_REF_vfs_check_dirents);
+}
+
+static void bch2_vfs_schedule_check_dirents(struct bch_fs *c)
+{
+	if (!enumerated_ref_tryget(&c->writes, BCH_WRITE_REF_vfs_check_dirents))
+		return;
+
+	if (!queue_work(c->write_ref_wq, &c->vfs.check_dirents_work))
+		enumerated_ref_put(&c->writes, BCH_WRITE_REF_vfs_check_dirents);
+}
+
 static int dirent_to_missing_inode(struct btree_trans *trans,
 				   struct bkey_s_c_dirent d,
 				   subvol_inum dir,
@@ -863,8 +894,6 @@ static int dirent_to_missing_inode(struct btree_trans *trans,
 
 	prt_printf(&msg.m, "dirent to missing inode: (%s)\n", bch2_err_str(ret));
 	bch2_bkey_val_to_text(&msg.m, c, d.s_c);
-	prt_str(&msg.m, "\n in: ");
-	try(bch2_inum_to_path(trans, dir, &msg.m));
 	prt_printf(&msg.m, "\ndir subvol %llu inum subvol %llu snapshot %u\n",
 		   dir.subvol, inum.subvol, snapshot);
 
@@ -872,12 +901,14 @@ static int dirent_to_missing_inode(struct btree_trans *trans,
 	 * Not a reason to take the whole filesystem read only: log it,
 	 * schedule check_dirents, and the lookup returns ENOENT.
 	 *
-	 * Scheduling the pass takes sb_lock and may write the superblock;
-	 * we're on the error return path, nothing here needs btree locks:
+	 * This lookup runs under the VFS parent's i_rwsem. Do not make that
+	 * caller wait for recovery-pass registration to take sb_lock and write
+	 * the superblock. The queued worker holds a write ref, so it can finish
+	 * recording the offline repair without extending d_alloc_parallel().
 	 */
 	bch2_trans_unlock(trans);
-	return bch2_run_explicit_recovery_pass(c, &msg.m,
-					       BCH_RECOVERY_PASS_check_dirents, 0);
+	bch2_vfs_schedule_check_dirents(c);
+	return 0;
 }
 
 static struct bch_inode_info *bch2_lookup_trans(struct btree_trans *trans,
@@ -887,15 +918,9 @@ static struct bch_inode_info *bch2_lookup_trans(struct btree_trans *trans,
 	struct bch_fs *c = trans->c;
 	subvol_inum inum = {};
 
-	struct qstr lookup_name;
-	int ret = bch2_maybe_casefold(trans, dir_hash_info, name, &lookup_name);
-	if (ret)
-		return ERR_PTR(ret);
-
 	CLASS(btree_iter_uninit, dirent_iter)(trans);
-	struct bkey_s_c k = bch2_hash_lookup(trans, &dirent_iter, bch2_dirent_hash_desc,
-					     dir_hash_info, dir, &lookup_name, 0);
-	ret = bkey_err(k);
+	struct bkey_s_c k = bch2_dirent_lookup_key(trans, &dirent_iter, dir, dir_hash_info, name);
+	int ret = bkey_err(k);
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -1325,8 +1350,9 @@ retry:
 					from_kgid(i_user_ns(&src_dir->v), current_fsgid()),
 					S_IFCHR|WHITEOUT_MODE, 0,
 					NULL, NULL, (subvol_inum) { 0 }, 0) ?:
-		      bch2_quota_acct(c, bch_qid(whiteout_inode_u), Q_INO, 1,
-				      KEY_TYPE_QUOTA_PREALLOC);
+		      (!test_bit(EI_INODE_SNAPSHOT, &src_dir->ei_flags)
+		       ? bch2_quota_acct(c, bch_qid(whiteout_inode_u), Q_INO, 1,
+					 KEY_TYPE_QUOTA_PREALLOC) : 0);
 		if (unlikely(ret))
 			goto err_tx_restart;
 	}
@@ -1426,7 +1452,7 @@ static int bch2_setattr_nonsize_trans(struct btree_trans *trans,
 				      struct bch_inode_info *inode,
 				      struct iattr *attr)
 {
-	struct posix_acl *acl __free(kfree) = NULL;
+	struct posix_acl *acl __free(posix_acl) = NULL;
 
 	CLASS(btree_iter_uninit, inode_iter)(trans);
 	struct bch_inode_unpacked inode_u;
@@ -1443,10 +1469,8 @@ static int bch2_setattr_nonsize_trans(struct btree_trans *trans,
 
 	bch2_inode_update_after_write(trans, inode, &inode_u, attr->ia_valid);
 
-	if (acl) {
+	if (acl)
 		set_cached_acl(&inode->v, ACL_TYPE_ACCESS, acl);
-		acl = NULL;
-	}
 
 	return 0;
 }
@@ -2546,10 +2570,12 @@ static void bch2_evict_inode(struct inode *vinode)
 	BUG_ON(!is_bad_inode(&inode->v) && inode->ei_quota_reserved);
 
 	if (delete) {
-		bch2_quota_acct(c, inode->ei_qid, Q_SPC, -((s64) inode->v.i_blocks),
-				KEY_TYPE_QUOTA_WARN);
-		bch2_quota_acct(c, inode->ei_qid, Q_INO, -1,
-				KEY_TYPE_QUOTA_WARN);
+		if (!test_bit(EI_INODE_SNAPSHOT, &inode->ei_flags)) {
+			bch2_quota_acct(c, inode->ei_qid, Q_SPC, -((s64) inode->v.i_blocks),
+					KEY_TYPE_QUOTA_WARN);
+			bch2_quota_acct(c, inode->ei_qid, Q_INO, -1,
+					KEY_TYPE_QUOTA_WARN);
+		}
 		bch2_inode_rm(c, inode_inum(inode));
 
 		/*
@@ -3440,6 +3466,7 @@ void bch2_fs_vfs_exit(struct bch_fs *c)
 int bch2_fs_vfs_init(struct bch_fs *c)
 {
 	fdm_init(&c->fdm_table);
+	INIT_WORK(&c->vfs.check_dirents_work, bch2_vfs_check_dirents_work);
 	try(fast_list_init(&c->vfs.inodes));
 
 	try(rhashtable_init(&c->vfs.inodes_table, &bch2_vfs_inodes_params));
@@ -3514,6 +3541,142 @@ int __init bch2_vfs_init(void)
 err:
 	bch2_vfs_exit();
 	return ret;
+}
+
+/* For Rust - see vfs/rust_types.rs: */
+
+struct bch_inode_info *rust_to_bch_ei(struct inode *vinode)
+{
+	return to_bch_ei(vinode);
+}
+
+struct inode *rust_ei_vinode(struct bch_inode_info *inode)
+{
+	return &inode->v;
+}
+
+struct bch_fs *rust_ei_fs(struct bch_inode_info *inode)
+{
+	return inode->v.i_sb->s_fs_info;
+}
+
+struct bch_inode_unpacked *rust_ei_inode(struct bch_inode_info *inode)
+{
+	return &inode->ei_inode;
+}
+
+subvol_inum rust_ei_inum(struct bch_inode_info *inode)
+{
+	return inode_inum(inode);
+}
+
+void rust_ei_update_lock(struct bch_inode_info *inode)
+{
+	mutex_lock(&inode->ei_update_lock);
+}
+
+void rust_ei_update_unlock(struct bch_inode_info *inode)
+{
+	mutex_unlock(&inode->ei_update_lock);
+}
+
+int rust_ei_set_projid(struct bch_fs *c, struct bch_inode_info *inode, u32 projid)
+{
+	return bch2_set_projid(c, inode, projid);
+}
+
+struct bch_inode_info *rust_dentry_ei(struct dentry *dentry)
+{
+	return to_bch_ei(dentry->d_inode);
+}
+
+/*
+ * Inode option @id of @dentry's parent directory, in @v - false at the root,
+ * which has none.
+ */
+bool rust_dentry_parent_inode_opt(struct dentry *dentry, unsigned id, u64 *v)
+{
+	guard(spinlock)(&dentry->d_lock);
+	if (IS_ROOT(dentry))
+		return false;
+
+	*v = bch2_inode_opt_get(&to_bch_ei(d_inode(dentry->d_parent))->ei_inode, id);
+	return true;
+}
+
+void rust_dir_casefold_changed(struct dentry *dentry)
+{
+	bch2_dir_casefold_changed(dentry);
+}
+
+int rust_xattr_handler_flags(const struct xattr_handler *handler)
+{
+	return handler->flags;
+}
+
+unsigned rust_posix_acl_count(const struct posix_acl *acl)
+{
+	return acl->a_count;
+}
+
+/* Entry @i of @acl; @id is the uid or gid, for ACL_USER and ACL_GROUP: */
+void rust_posix_acl_entry(const struct posix_acl *acl, unsigned i,
+			  u16 *tag, u16 *perm, u32 *id)
+{
+	const struct posix_acl_entry *e = &acl->a_entries[i];
+
+	*tag	= e->e_tag;
+	*perm	= e->e_perm;
+
+	switch (e->e_tag) {
+	case ACL_USER:
+		*id = from_kuid(&init_user_ns, e->e_uid);
+		break;
+	case ACL_GROUP:
+		*id = from_kgid(&init_user_ns, e->e_gid);
+		break;
+	default:
+		*id = 0;
+	}
+}
+
+void rust_posix_acl_set_entry(struct posix_acl *acl, unsigned i,
+			      u16 tag, u16 perm, u32 id)
+{
+	struct posix_acl_entry *e = &acl->a_entries[i];
+
+	e->e_tag	= tag;
+	e->e_perm	= perm;
+
+	switch (tag) {
+	case ACL_USER:
+		e->e_uid = make_kuid(&init_user_ns, id);
+		break;
+	case ACL_GROUP:
+		e->e_gid = make_kgid(&init_user_ns, id);
+		break;
+	}
+}
+
+struct posix_acl *rust_posix_acl_dup(struct posix_acl *acl)
+{
+	return posix_acl_dup(acl);
+}
+
+void rust_posix_acl_release(struct posix_acl *acl)
+{
+	posix_acl_release(acl);
+}
+
+void rust_set_cached_acl(struct inode *inode, int type, struct posix_acl *acl)
+{
+	set_cached_acl(inode, type, acl);
+}
+
+int rust_posix_acl_update_mode(struct mnt_idmap *idmap, struct inode *inode,
+			       umode_t *mode, struct posix_acl **acl)
+{
+	return posix_acl_update_mode(idmap, inode, mode, acl);
 }
 
 #endif /* NO_BCACHEFS_FS */

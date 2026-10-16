@@ -1,5 +1,4 @@
 use std::ffi::CString;
-use std::fmt::Write;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
@@ -11,6 +10,7 @@ use bcachefs_kernel::c;
 use bcachefs_kernel::fs::Fs;
 use bcachefs_kernel::metadata_version;
 use bcachefs_kernel::opt_set;
+use bcachefs_kernel::util::vstructs::Head;
 use clap::Parser;
 
 use crate::wrappers::handle::BcachefsHandle;
@@ -114,21 +114,15 @@ fn should_use_kernel_fsck(devs: &[String]) -> bool {
         Err(_) => return false,
     };
 
-    let sb_version = fs.sb().version as u64;
+    let sb_version = fs.sb().version.get() as u64;
 
     let ret = (current < kernel_version && kernel_version <= sb_version) ||
               (sb_version <= kernel_version && kernel_version < current);
 
     if ret {
-        let mut buf = Printbuf::new();
-        let _ = write!(buf, "fsck binary is version ");
-        buf.version(current as u32);
-        let _ = write!(buf, " but filesystem is ");
-        buf.version(sb_version as u32);
-        let _ = write!(buf, " and kernel is ");
-        buf.version(kernel_version as u32);
-        let _ = write!(buf, ", using kernel fsck");
-        println!("{}", buf);
+        let v = |v| c::bcachefs_metadata_version(v as u32);
+        println!("fsck binary is version {} but filesystem is {} and kernel is {}, using kernel fsck",
+                 v(current), v(sb_version), v(kernel_version));
     }
 
     ret
@@ -297,12 +291,12 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
             }
         }
 
-        let mut buf = IoctlBuf::<c::bch_ioctl_fsck_offline>::new::<u64>(dev_ptrs.len());
+        let mut buf = IoctlBuf::<Head<c::bch_ioctl_fsck_offline>>::new(dev_ptrs.len());
         let c_opts = CString::new(opts_str.as_str())?;
         let hdr = buf.hdr_mut();
         hdr.opts = c_opts.as_ptr() as u64;
         hdr.nr_devs = dev_ptrs.len() as u64;
-        unsafe { hdr.devs.as_mut_slice(dev_ptrs.len()).copy_from_slice(&dev_ptrs) };
+        buf.get_mut()?.devs.copy_from_slice(&dev_ptrs);
 
         let fsck_fd = match std::fs::OpenOptions::new()
             .read(true).write(true)

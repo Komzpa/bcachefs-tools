@@ -1429,7 +1429,9 @@ static int do_reconcile_scan(struct moving_context *ctxt,
 					    r->scan_start.pos, r->scan_end.pos));
 	}
 
-	try(bch2_clear_reconcile_needs_scan(trans, cookie_pos, cookie));
+	/* do_reconcile() clears the pending cookie after the pending phases. */
+	if (s.type != RECONCILE_SCAN_pending)
+		try(bch2_clear_reconcile_needs_scan(trans, cookie_pos, cookie));
 
 	*sectors_scanned += atomic64_read(&r->scan_stats.sectors_seen);
 	/*
@@ -1644,10 +1646,14 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
 		nr_started++;
 	}
 
-	/* The threads freeze in place, so our wait for them must be freezable too: */
+	/*
+	 * The threads freeze in place, so our wait for them must be freezable
+	 * too. TASK_IDLE: we sleep here for the whole pass, which on a large
+	 * rotational device can be hours - that's not a hung task:
+	 */
 	for (unsigned i = 0; i < nr_started; i++)
 		wait_for_completion_state(&thrs.data[i].done,
-					  TASK_UNINTERRUPTIBLE|TASK_FREEZABLE);
+					  TASK_IDLE|TASK_FREEZABLE);
 	return ret;
 }
 
@@ -1785,9 +1791,15 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		if (bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc)) {
 			bch2_trans_unlock_long(trans);
 			bch2_copygc_wakeup(c);
-			wait_event(c->copygc.running_wq,
-				   c->copygc.run_count != *p->copygc_run_count ||
-				   kthread_should_stop());
+			/*
+			 * Freezable: copygc freezes in place, so a plain
+			 * wait_event() here would stall the freezer. Idle: a
+			 * copygc run can take longer than the hung task timeout:
+			 */
+			wait_event_state(c->copygc.running_wq,
+					 c->copygc.run_count != *p->copygc_run_count ||
+					 kthread_should_stop(),
+					 (TASK_IDLE|TASK_FREEZABLE));
 			*p->copygc_run_count = c->copygc.run_count;
 			ret = 0;
 			continue;
@@ -1961,7 +1973,9 @@ static int do_reconcile(struct moving_context *ctxt)
 			break;
 	}
 out:
-	if (!ret && !bkey_deleted(&pending_cookie.k))
+	if (!ret &&
+	    r->phase == ARRAY_SIZE(reconcile_phases) &&
+	    !bkey_deleted(&pending_cookie.k))
 		try(bch2_clear_reconcile_needs_scan(trans,
 				pending_cookie.k.p, pending_cookie.v.cookie));
 

@@ -5,7 +5,6 @@ use std::path::Path;
 
 use bch_bindgen::c::{
     bch_ioctl_dev_usage, bch_ioctl_dev_usage_v2,
-    bch_ioctl_dev_usage_bch_ioctl_dev_usage_type,
     bch_ioctl_disk, bch_ioctl_disk_v2,
     bch_ioctl_disk_set_state, bch_ioctl_disk_set_state_v2,
     bch_ioctl_disk_resize, bch_ioctl_disk_resize_v2,
@@ -18,6 +17,7 @@ use bch_bindgen::accounting::data_type;
 use crate::wrappers::ioctl::*;
 use crate::wrappers::sysfs;
 use bch_bindgen::c::bch_sb;
+use bcachefs_kernel::util::vstructs::Head;
 use bcachefs_kernel::errcode::BchError;
 use bcachefs_kernel::path_to_cstr;
 use errno::Errno;
@@ -58,7 +58,7 @@ struct FsSysfsPath {
 }
 
 const _: () = assert!(
-    mem::size_of::<FsSysfsPath>() == bch_bindgen::c::BCH_SIZEOF_FS_SYSFS_PATH as usize,
+    mem::size_of::<FsSysfsPath>() == bch_bindgen::c::BCH_SIZEOF_FS_SYSFS_PATH,
     "FsSysfsPath must match struct fs_sysfs_path - FS_IOC_GETFSSYSFSPATH encodes its size",
 );
 
@@ -459,27 +459,17 @@ impl BcachefsHandle {
     /// Read the filesystem superblock via BCH_IOCTL_READ_SUPER.
     ///
     /// Returns a heap-allocated buffer containing the raw superblock.
-    /// The kernel may return ERANGE if the buffer is too small, so we
-    /// start with a reasonable size and retry once if needed.
     pub(crate) fn read_super(&self) -> Result<Vec<u8>, Errno> {
-        let mut size: usize = 4096;
-
-        loop {
+        grow_on_erange(4096, 1 << 20, |size| {
             let mut buf = vec![0u8; size];
-
             let arg = bch_ioctl_read_super {
                 size: size as u64,
                 sb:   buf.as_mut_ptr() as u64,
                 ..Default::default()
             };
-
-            match ioctl_w::<BCH_IOCTL_READ_SUPER>(self.ioctl_fd(), &arg) {
-                Ok(_) => return Ok(buf),
-                Err(e) if e.raw_os_error() == Some(libc::ERANGE) && size < 1 << 20 =>
-                    size *= 4,
-                Err(e) => return Err(io_errno(e)),
-            }
-        }
+            ioctl_w::<BCH_IOCTL_READ_SUPER>(self.ioctl_fd(), &arg)?;
+            Ok(buf)
+        }).map_err(io_errno)
     }
 
     /// BCH_IOCTL_QUERY_BTREE_KEYS: fetch one buffer's worth of formatted
@@ -487,26 +477,27 @@ impl BcachefsHandle {
     /// advances `arg.start` past the last key returned; loop until
     /// `arg.done` is set. Returns ERANGE if `arg.buf_size` can't hold even
     /// a single key.
-    pub(crate) fn query_btree_keys(&self, arg: &mut bch_ioctl_query_btree_keys) -> Result<(), Errno> {
-        ioctl_rw::<BCH_IOCTL_QUERY_BTREE_KEYS>(self.ioctl_fd(), arg)
-            .map(|_| ()).map_err(io_errno)
+    pub(crate) fn query_btree_keys(&self, arg: &mut bch_ioctl_query_btree_keys) -> std::io::Result<()> {
+        ioctl_rw::<BCH_IOCTL_QUERY_BTREE_KEYS>(self.ioctl_fd(), arg).map(|_| ())
     }
 
     /// Read the on-disk metadata version from the filesystem superblock.
     pub(crate) fn sb_version(&self) -> Result<u16, Errno> {
         let buf = self.read_super()?;
-        if buf.len() < mem::size_of::<bch_sb>() {
+        if buf.len() < mem::size_of::<Head<bch_sb>>() {
             return Err(Errno(libc::EIO));
         }
-        let sb = unsafe { &*(buf.as_ptr() as *const bch_sb) };
-        Ok(sb.version)
+        // SAFETY: the header's bytes, as checked, and any bytes are one - read
+        // unaligned: the buffer is bytes
+        let sb = unsafe { buf.as_ptr().cast::<Head<bch_sb>>().read_unaligned() };
+        Ok(sb.version.get())
     }
 
     /// Query device usage (v2 with flex array, v1 fallback).
     pub(crate) fn dev_usage(&self, dev_idx: u32) -> Result<DevUsage, Errno> {
         let nr_data_types = data_type::nr.0 as usize;
 
-        let mut buf = IoctlBuf::<bch_ioctl_dev_usage_v2>::new::<bch_ioctl_dev_usage_bch_ioctl_dev_usage_type>(nr_data_types);
+        let mut buf = IoctlBuf::<Head<bch_ioctl_dev_usage_v2>>::new(nr_data_types);
         let hdr = buf.hdr_mut();
         hdr.dev = dev_idx as u64;
         hdr.flags = BCH_BY_INDEX;
@@ -518,13 +509,12 @@ impl BcachefsHandle {
 
         if ret.is_ok() {
             let hdr = buf.hdr();
-            let nr = (hdr.nr_data_types as usize).min(nr_data_types);
 
             return Ok(DevUsage {
                 state: hdr.state,
                 bucket_size: hdr.bucket_size,
                 nr_buckets: hdr.nr_buckets,
-                data_types: unsafe { hdr.d.as_slice(nr) }.iter()
+                data_types: buf.get().map_err(|_| Errno(libc::EIO))?.d.iter()
                     .map(|d| DevUsageType { buckets: d.buckets, sectors: d.sectors, fragmented: d.fragmented })
                     .collect(),
             });
