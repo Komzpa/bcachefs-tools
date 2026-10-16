@@ -51,24 +51,11 @@
 
 #include <linux/types.h>
 
-#define SIPHASH_BLOCK_LENGTH	 8
+#include "util/siphash_gen.h"
+
 #define SIPHASH_KEY_LENGTH	16
 #define SIPHASH_DIGEST_LENGTH	 8
 
-typedef struct _SIPHASH_CTX {
-	u64		v[4];
-	u8		buf[SIPHASH_BLOCK_LENGTH];
-	u32		bytes;
-} SIPHASH_CTX;
-
-typedef struct {
-	__le64		k0;
-	__le64		k1;
-} SIPHASH_KEY;
-
-void	SipHash_Init(SIPHASH_CTX *, const SIPHASH_KEY *);
-void	SipHash_Update(SIPHASH_CTX *, int, int, const void *, size_t);
-u64	SipHash_End(SIPHASH_CTX *, int, int);
 void	SipHash_Final(void *, SIPHASH_CTX *, int, int);
 u64	SipHash(const SIPHASH_KEY *, int, int, const void *, size_t);
 

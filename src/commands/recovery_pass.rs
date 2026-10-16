@@ -1,4 +1,3 @@
-use std::fmt::Write;
 
 use anyhow::Result;
 use bcachefs_kernel::c;
@@ -54,17 +53,17 @@ fn cmd_recovery_pass(cli: RecoveryPassCli) -> Result<()> {
         let _sb_lock = crate::wrappers::sb_lock(fs.raw);
 
         let ext_u64s = (std::mem::size_of::<c::bch_sb_field_ext>() / std::mem::size_of::<u64>()) as u32;
-        let ext: &mut c::bch_sb_field_ext = bcachefs_kernel::sb::io::sb_field_get_minsize(
+        let ext = bcachefs_kernel::sb::io::sb_field_get_minsize::<c::bch_sb_field_ext>(
             &mut (*fs.raw).disk_sb,
             ext_u64s,
         ).ok_or_else(|| anyhow::anyhow!("Error getting sb_field_ext"))?;
 
-        let mut scheduled = u64::from_le(ext.recovery_passes_required[0]);
+        let mut scheduled = ext.recovery_passes_required[0].get();
 
         if passes_to_set != 0 || passes_to_unset != 0 {
-            ext.recovery_passes_required[0] &= !passes_to_unset.to_le();
-            ext.recovery_passes_required[0] |= passes_to_set.to_le();
-            scheduled = u64::from_le(ext.recovery_passes_required[0]);
+            let r = &mut ext.recovery_passes_required[0];
+            r.set((r.get() & !passes_to_unset) | passes_to_set);
+            scheduled = ext.recovery_passes_required[0].get();
             fs.write_super_ret()
                 .map_err(|e| anyhow::anyhow!("error writing superblock: {e}"))?;
         }
@@ -72,7 +71,7 @@ fn cmd_recovery_pass(cli: RecoveryPassCli) -> Result<()> {
         drop(_sb_lock);
 
         let mut buf = Printbuf::new();
-        let _ = write!(buf, "Scheduled recovery passes: ");
+        write!(buf, "Scheduled recovery passes: ");
 
         if scheduled != 0 {
             buf.prt_bitflags(
@@ -80,7 +79,7 @@ fn cmd_recovery_pass(cli: RecoveryPassCli) -> Result<()> {
                 c::bch2_recovery_passes_from_stable(scheduled),
             );
         } else {
-            let _ = write!(buf, "(none)");
+            write!(buf, "(none)");
         }
 
         println!("{}", buf);

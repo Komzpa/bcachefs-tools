@@ -10,10 +10,11 @@
 #include "fs/journal/seq_blacklist.h"
 #include "fs/sb/io.h"
 #include "fs/sb/members.h"
-#include "fs/alloc/buckets_types.h"
+#include "alloc/buckets_gen.h"
 #include "fs/data/checksum.h"
 #include "fs/data/read.h"
 #include "fs/data/write.h"
+#include "fs/btree/journal_overlay.h"
 #include "fs/btree/read.h"
 #include "fs/init/error.h"
 #include "fs/init/fs.h"
@@ -91,12 +92,18 @@ struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c)
 	struct journal_replay **_p;
 	size_t count = 0;
 
+	/* the last journal_keys put frees the entries: hold one while they're out */
+	if (!atomic_inc_not_zero(&c->journal_keys.ref))
+		return ret;
+
 	genradix_for_each(&c->journal_entries, iter, _p)
 		if (*_p)
 			count++;
 
-	if (!count)
+	if (!count) {
+		bch2_journal_keys_put(c);
 		return ret;
+	}
 
 	ret.entries = malloc(count * sizeof(*ret.entries));
 	if (!ret.entries)
@@ -107,6 +114,16 @@ struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c)
 			ret.entries[ret.nr++] = *_p;
 
 	return ret;
+}
+
+void rust_journal_entries_put(struct bch_fs *c, struct rust_journal_entries *e)
+{
+	if (e->entries) {
+		free(e->entries);
+		e->entries = NULL;
+		e->nr = 0;
+		bch2_journal_keys_put(c);
+	}
 }
 
 
@@ -152,7 +169,7 @@ int rust_write_submit(struct bch_fs *c,
 	op->subvol	= subvol;
 	op->pos		= SPOS(inum, offset >> 9, U32_MAX);
 	op->new_i_size	= new_i_size;
-	op->flags	|= BCH_WRITE_sync|BCH_WRITE_only_specified_devs;
+	op->flags	|= BCH_WRITE_sync;
 
 	int ret = bch2_disk_reservation_add(c, &op->res, len >> 9,
 					    replicas, 0);

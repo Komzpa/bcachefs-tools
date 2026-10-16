@@ -47,9 +47,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Result};
 use bcachefs_kernel::c;
 use bcachefs_kernel::btree::bkey::BkeySC;
-use bcachefs_kernel::btree::iter::{BtreeIterFlags, BtreeNodeIter, BtreeTrans};
-use bcachefs_kernel::data::extents::bkey_ptrs;
+use bcachefs_kernel::btree::iter::{BtreeIterFlags, BtreeNodeIter};
 use bcachefs_kernel::opt_set;
+use bcachefs_kernel::util::vstructs::{cast_plain, Head, SelfSized};
 use clap::Parser;
 
 struct KillNode {
@@ -155,46 +155,33 @@ struct BsetLoc {
 /// empty still has to be corruptible: on a freshly formatted filesystem every
 /// btree leaf is one of those, which is exactly what the spin repro formats.
 fn first_bset(node: &[u8]) -> BsetLoc {
-    let at = size_of::<c::btree_node>() - size_of::<c::bset>();
-    let u64s_at = at + std::mem::offset_of!(c::bset, u64s);
+    let n = cast_plain::<Head<c::btree_node>>(node).expect("node buffer: aligned, at least a block");
 
     BsetLoc {
-        at,
+        at:     std::mem::offset_of!(Head<c::btree_node>, keys),
         sector: 0,
-        u64s: u16::from_le_bytes([node[u64s_at], node[u64s_at + 1]]) as usize,
+        u64s:   n.keys.u64s(),
     }
 }
 
-fn first_bset_with_keys(node: &[u8], written_sectors: usize, block_size: usize)
-    -> Option<BsetLoc>
-{
-    let u64s_in_bset = std::mem::offset_of!(c::bset, u64s);
-
+fn first_bset_with_keys(node: &[u8], written_sectors: usize, block_bits: u32) -> Option<BsetLoc> {
     let mut off = 0;
 
     while off < written_sectors * 512 {
-        // offset of the bset within its container, and the container's size -
-        // which is offsetof(_data), i.e. where this bset's keys begin
-        let (bset_at, header) = if off == 0 {
-            (size_of::<c::btree_node>() - size_of::<c::bset>(), size_of::<c::btree_node>())
+        // where the bset is, its u64s, and its container's sectors
+        let (bset_at, u64s, sectors) = if off == 0 {
+            let n = cast_plain::<Head<c::btree_node>>(&node[off..])?;
+            (std::mem::offset_of!(Head<c::btree_node>, keys), n.keys.u64s(), n.sectors(block_bits))
         } else {
-            (off + size_of::<c::btree_node_entry>() - size_of::<c::bset>(),
-             size_of::<c::btree_node_entry>())
+            let n = cast_plain::<Head<c::btree_node_entry>>(&node[off..])?;
+            (off + std::mem::offset_of!(Head<c::btree_node_entry>, keys), n.keys.u64s(), n.sectors(block_bits))
         };
-
-        let u64s_at = bset_at + u64s_in_bset;
-        if u64s_at + 2 > node.len() {
-            break;
-        }
-
-        let u64s = u16::from_le_bytes([node[u64s_at], node[u64s_at + 1]]) as usize;
 
         if u64s != 0 {
             return Some(BsetLoc { at: bset_at, sector: off / 512, u64s });
         }
 
         /* empty bset: skip past it and try the next */
-        let sectors = (header + u64s * 8).div_ceil(block_size) * block_size / 512;
         if sectors == 0 {
             break;
         }
@@ -225,7 +212,7 @@ fn cmd_kill_btree_node(cli: KillBtreeNodeCli) -> Result<()> {
     // O_DIRECT requires aligned buffers; bd_fd is opened with O_DIRECT
     let zeroes = crate::util::AlignedBuf::new(block_size);
 
-    let trans = BtreeTrans::new(&fs);
+    let trans = bcachefs_kernel::btree_trans!(&fs);
 
     for kill in &mut kill_nodes {
         let mut found = false;
@@ -252,9 +239,9 @@ fn cmd_kill_btree_node(cli: KillBtreeNodeCli) -> Result<()> {
             }
 
             found = true;
-            let k = BkeySC::from(&b.key);
+            let k = BkeySC::from(b.key_i());
 
-            for ptr in bkey_ptrs(&b.key) {
+            for ptr in k.ptrs(&fs) {
                 let dev = ptr.dev() as u32;
                 if dev_idx >= 0 && dev as i32 != dev_idx {
                     continue;
@@ -269,7 +256,7 @@ fn cmd_kill_btree_node(cli: KillBtreeNodeCli) -> Result<()> {
 
                 let fd = unsafe { (*ca.disk_sb.bdev).bd_fd };
                 let file = crate::wrappers::super_io::borrowed_file(fd);
-                let offset = (ptr.offset() as u64) << 9;
+                let offset = ptr.offset() << 9;
 
                 let damage = || -> Result<()> {
                     match cli.error {
@@ -282,7 +269,7 @@ fn cmd_kill_btree_node(cli: KillBtreeNodeCli) -> Result<()> {
 
                             std::os::unix::fs::FileExt::read_exact_at(&*file, &mut buf, offset)?;
 
-                            let bset = first_bset_with_keys(&buf, written, block_size)
+                            let bset = first_bset_with_keys(&buf, written, fs.block_bits() as u32)
                                 .or_else(|| (cli.error == ErrorType::Csum)
                                             .then(|| first_bset(&buf)))
                                 .ok_or_else(|| anyhow!(
@@ -290,13 +277,13 @@ fn cmd_kill_btree_node(cli: KillBtreeNodeCli) -> Result<()> {
                                      --error keys has nothing to corrupt"))?;
 
                             let (victim, what) = if cli.error == ErrorType::Csum {
-                                (bset.at + std::mem::offset_of!(c::bset, journal_seq),
+                                (bset.at + std::mem::offset_of!(Head<c::bset>, journal_seq),
                                  "bset header")
                             } else {
                                 /* midway into the keys: inside the checksummed
                                  * region, and corrupts a key rather than a
                                  * header field the keys don't depend on */
-                                (bset.at + size_of::<c::bset>() + bset.u64s * 8 / 2,
+                                (bset.at + size_of::<Head<c::bset>>() + bset.u64s * 8 / 2,
                                  "key data")
                             };
 

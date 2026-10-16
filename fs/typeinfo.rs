@@ -3,13 +3,12 @@
 //! Runtime type information for the C on-disk structures.
 //!
 //! Static per-type field tables — name, offset, width, endianness — for the
-//! bindgen-generated structs, produced by `#[derive(TypeInfo)]`
-//! (fs/typeinfo-macros/) which bindgen injects on every `bch_*`-family type
-//! (see the `--with-derive-custom-*` flags in codegen.rs). Offsets come from
-//! `offset_of!`, so the compiler guarantees them against the real layout;
-//! endianness is recovered from the C typedef *name* (`__le32` resolves to
-//! `u32`, so the information only exists at the syntax level — the reason
-//! this is a derive macro and not a generic reflection library).
+//! on-disk structs, produced by `#[derive(TypeInfo)]`
+//! (fs/cstruct-macros/src/typeinfo.rs) on their Rust definitions. Offsets come
+//! from `offset_of!`, so the compiler guarantees them against the real layout;
+//! width, endianness and signedness are read from the C type a field renders
+//! as (`Le32` is `__le32`) - the syntax, which is why this is a derive macro
+//! and not a generic reflection library.
 //!
 //! Primary consumer: the btree REPL (`bcachefs kvdb`), which reads and writes
 //! btree keys by field name — both for field debugging and for corruption
@@ -29,9 +28,9 @@
 //!   reflection.
 //!
 //! `BITMASK`/`LE*_BITMASK` bit ranges are described too, but through a
-//! separate table (`BITMASK_FIELDS`): the macro invocations are freestanding,
-//! not part of the struct definition, so codegen.rs scans the headers for
-//! them rather than the derive. Bits resolve by bare name when it doesn't
+//! separate table (`BITMASKS`): c_bitmask! is freestanding, not part of the
+//! struct definition, so each one makes a table of its own, listed there,
+//! rather than the derive. Bits resolve by bare name when it doesn't
 //! collide with a field (`no_keys`) or qualified as `<field>.<bit>`
 //! (`flags.subvol` — the `subvol` *field* wins the bare name).
 
@@ -91,7 +90,7 @@ pub trait TypeInfo {
 }
 
 /// A named bit range within an integer field, from a `BITMASK`/`LE*_BITMASK`
-/// declaration. The instances live in the generated `BITMASK_FIELDS` table.
+/// declaration. Each c_bitmask! has a table of them, which BITMASKS lists.
 pub struct BitmaskField {
     pub struct_name: &'static str,
     /// Field path within the struct, as written in the declaration —
@@ -127,7 +126,7 @@ impl BitmaskField {
 pub fn bitmask_fields(
     struct_name: &str,
 ) -> impl Iterator<Item = &'static BitmaskField> + '_ {
-    BITMASK_FIELDS.iter().filter(move |b| b.struct_name == struct_name)
+    BITMASKS.iter().flat_map(|t| t.iter()).filter(move |b| b.struct_name == struct_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +279,7 @@ pub fn resolve<'p>(
 pub fn resolve_with_bits<'p>(
     info: &'static StructInfo,
     path: &'p str,
-) -> Result<(FieldRef, Option<&'static BitmaskField>), ResolveError<'p>> {
+) -> Result<FieldTarget, ResolveError<'p>> {
     let err = match resolve(info, path) {
         Ok(r) => return Ok((r, None)),
         Err(e) => e,
@@ -419,6 +418,18 @@ pub fn write_bits(
     }
     let old = read_scalar(buf, r)?;
     write_scalar(buf, r, old & !(bm.mask() << bm.lo) | (v << bm.lo))
+}
+
+/// What resolve_with_bits() resolves to: a field, or a declared bit range
+/// within one (`no_keys`, `flags.subvol`).
+pub type FieldTarget = (FieldRef, Option<&'static BitmaskField>);
+
+/// Write a resolved field or bit range.
+pub fn write(buf: &mut [u8], (r, bm): &FieldTarget, v: u64) -> Result<(), AccessError> {
+    match bm {
+        Some(bm) => write_bits(buf, r, bm, v),
+        None => write_scalar(buf, r, v),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,9 +576,72 @@ pub fn struct_to_text(
     fields_to_text(out, info, buf, 0, 0)
 }
 
-// Generated from BCH_BKEY_TYPES(): BKEY_TYPE_INFO table mapping each key type
-// to its val struct's StructInfo, plus lookup helpers.
-include!(concat!(env!("OUT_DIR"), "/typeinfo_gen.rs"));
+/// A bkey type together with its val struct's type info.
+pub struct BkeyTypeInfo {
+    pub name: &'static str,
+    pub type_: u32,
+    pub info: &'static StructInfo,
+}
+
+// From BCH_BKEY_TYPES(): each key type and its val struct's StructInfo.
+macro_rules! bkey_type_info {
+    ($(($name:ident, $nr:literal $(, $($rest:tt)*)?)),* $(,)?) => { ::paste::paste! {
+        pub static BKEY_TYPE_INFO: &[BkeyTypeInfo] = &[$(
+            BkeyTypeInfo { name: stringify!($name), type_: $nr,
+                           info: <crate::c::[<$name:camel>] as TypeInfo>::INFO },
+        )*];
+    } };
+}
+crate::c::BCH_BKEY_TYPES!(bkey_type_info);
+
+pub fn bkey_val_info(type_: u32) -> Option<&'static StructInfo> {
+    BKEY_TYPE_INFO.iter().find(|t| t.type_ == type_).map(|t| t.info)
+}
+
+pub fn bkey_type_info_by_name(name: &str) -> Option<&'static BkeyTypeInfo> {
+    BKEY_TYPE_INFO.iter().find(|t| t.name == name)
+}
+
+// Every c_bitmask!'s table, which each asserts is here.
+macro_rules! bitmasks {
+    ($($table:ident),* $(,)?) => {
+        static BITMASKS: &[&[BitmaskField]] = &[$(crate::c::$table),*];
+        const BITMASKS_LISTED: &[&str] = &[$(stringify!($table)),*];
+    };
+}
+bitmasks! {
+    AllocV3_flags_BITMASKS, AllocV4_flags_BITMASKS, Backpointer_flags_BITMASKS,
+    BtreePtrV2_flags_BITMASKS, bch_disk_group_flags_0_BITMASKS,
+    Inode_bi_flags_BITMASKS, bch_inode_unpacked_bi_flags_BITMASKS,
+    InodeV2_bi_flags_BITMASKS, InodeV3_bi_flags_BITMASKS,
+    bch_member_bucket_size_BITMASKS, bch_member_flags_BITMASKS, ReflinkP_idx_flags_BITMASKS,
+    bch_sb_block_size_BITMASKS, bch_sb_field_crypt_flags_BITMASKS,
+    bch_sb_field_crypt_kdf_flags_BITMASKS, bch_sb_field_error_entry_v_BITMASKS,
+    bch_sb_field_ext_flags0_BITMASKS, bch_sb_flags_0_BITMASKS, bch_sb_flags_1_BITMASKS,
+    bch_sb_flags_2_BITMASKS, bch_sb_flags_3_BITMASKS, bch_sb_flags_4_BITMASKS,
+    bch_sb_flags_5_BITMASKS, bch_sb_flags_6_BITMASKS, Snapshot_flags_BITMASKS,
+    Subvolume_flags_BITMASKS, bset_flags_BITMASKS, btree_node_flags_BITMASKS,
+    jset_flags_BITMASKS, recovery_pass_entry_flags_BITMASKS,
+}
+
+/// Whether BITMASKS lists @name: c_bitmask!'s check that its table is here.
+pub const fn bitmasks_listed(name: &str) -> bool {
+    let mut i = 0;
+    while i < BITMASKS_LISTED.len() {
+        let (a, b) = (BITMASKS_LISTED[i].as_bytes(), name.as_bytes());
+        if a.len() == b.len() {
+            let mut j = 0;
+            while j < a.len() && a[j] == b[j] {
+                j += 1;
+            }
+            if j == a.len() {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
 
 #[cfg(test)]
 mod tests {
@@ -575,14 +649,14 @@ mod tests {
     use crate::c;
 
     fn snapshot_info() -> &'static StructInfo {
-        <c::bch_snapshot as TypeInfo>::INFO
+        <c::Snapshot as TypeInfo>::INFO
     }
 
     #[test]
     fn snapshot_table() {
         let info = snapshot_info();
         assert_eq!(info.name, "bch_snapshot");
-        assert_eq!(info.size, core::mem::size_of::<c::bch_snapshot>());
+        assert_eq!(info.size, core::mem::size_of::<c::Snapshot>());
     }
 
     #[test]
@@ -617,10 +691,26 @@ mod tests {
         ));
     }
 
+    /// A trailing `[T; 0]` is C's flexible array member, indexable past
+    /// zero; anywhere else it's a zero-length array.
+    #[test]
+    fn flex_array_tail() {
+        let info = <crate::util::vstructs::Head<c::bch_ioctl_fsck_offline> as TypeInfo>::INFO;
+        let devs = info.fields.iter().find(|f| f.name == "devs").unwrap();
+        assert!(matches!(devs.kind, FieldKind::VarTail { stride: 8, .. }));
+
+        let r = resolve(info, "devs[1]").unwrap();
+        assert_eq!(r.offset, 32);
+        assert!(matches!(
+            r.kind,
+            FieldKind::Int { bytes: 8, endian: Endian::Native, signed: false }
+        ));
+    }
+
     #[test]
     fn scalar_roundtrip() {
         let info = snapshot_info();
-        let mut buf = [0u8; core::mem::size_of::<c::bch_snapshot>()];
+        let mut buf = [0u8; core::mem::size_of::<c::Snapshot>()];
 
         let r = resolve(info, "parent").unwrap();
         write_scalar(&mut buf, &r, 249).unwrap();
@@ -643,7 +733,7 @@ mod tests {
     #[test]
     fn to_text() {
         let info = snapshot_info();
-        let mut buf = [0u8; core::mem::size_of::<c::bch_snapshot>()];
+        let mut buf = [0u8; core::mem::size_of::<c::Snapshot>()];
         let r = resolve(info, "parent").unwrap();
         write_scalar(&mut buf, &r, 249).unwrap();
 
@@ -676,7 +766,7 @@ mod tests {
     #[test]
     fn bits_roundtrip() {
         let info = snapshot_info();
-        let mut buf = [0u8; core::mem::size_of::<c::bch_snapshot>()];
+        let mut buf = [0u8; core::mem::size_of::<c::Snapshot>()];
 
         let (r, bm) = resolve_with_bits(info, "no_keys_obsolete").unwrap();
         let bm = bm.unwrap();
@@ -697,7 +787,7 @@ mod tests {
     #[test]
     fn bits_decode_display() {
         let info = snapshot_info();
-        let mut buf = [0u8; core::mem::size_of::<c::bch_snapshot>()];
+        let mut buf = [0u8; core::mem::size_of::<c::Snapshot>()];
         buf[0] = 2 | 8; // SUBVOL_OBSOLETE | NO_KEYS_OBSOLETE
 
         let mut s = String::new();
@@ -707,13 +797,13 @@ mod tests {
 
     #[test]
     fn typed_accessors() {
-        let mut s = c::bch_snapshot::default();
+        let mut s: c::Snapshot = Default::default();
         s.set_no_keys_obsolete(true);
         assert!(s.no_keys_obsolete());
-        assert_eq!(u32::from_le(s.flags), 8);
+        assert_eq!(s.flags.get(), 8);
         s.set_no_keys_obsolete(false);
         assert!(!s.no_keys_obsolete());
-        assert_eq!(u32::from_le(s.flags), 0);
+        assert_eq!(s.flags.get(), 0);
     }
 
     #[test]

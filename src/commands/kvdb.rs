@@ -27,8 +27,9 @@
 //! makes that command raw again. Writes always target the exact key.
 //! Full semantics: doc/kvdb.md.
 //!
-//! Fixed-layout vals are fully editable; varint-packed (inode) and
-//! entry-stream (extent) vals only up to their fixed header. Updates run the
+//! Fields are set by the key type's set() (btree/bkey_methods.rs):
+//! fixed-layout vals and inodes (through bch_inode_unpacked) are fully
+//! editable, entry-stream (extent) vals only up to their fixed header. Updates run the
 //! normal triggers and key validation — per-key-invalid keys are (correctly)
 //! rejected; whether we want a validation-bypass mode for injecting those is
 //! an open question.
@@ -39,16 +40,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Result};
-use bcachefs_kernel::btree::bkey::{BkeyS, BkeySC, POS_MIN, SPOS_MAX};
+use bcachefs_kernel::btree::bkey::{BkeySC, POS_MIN, SPOS_MAX};
+use bcachefs_kernel::btree::bkey_methods;
 use bcachefs_kernel::btree::iter::{
-    commit_do, lockrestart_do, BtreeIter, BtreeIterFlags, BtreeTrans, CommitFlags, CommitOpts,
-    TransError, UpdateTriggerFlags,
+    commit_do, lockrestart_do, BtreeIter, BtreeIterFlags, CommitFlags,
+    TransBkey, UpdateTriggerFlags,
 };
 use bcachefs_kernel::c;
 use bcachefs_kernel::errcode::{bch_errcode, BchError};
 use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::inode;
 use bcachefs_kernel::opt_set;
-use bcachefs_kernel::typeinfo;
+use bcachefs_kernel::typeinfo::{self, FieldTarget, StructInfo, TypeInfo};
+use bcachefs_kernel::util::vstructs::Head;
 use bch_bindgen::c::bch_degraded_actions;
 use clap::Parser;
 
@@ -108,12 +112,13 @@ in memory: listings then show a root inode that does not exist on disk.
 
 Commands:
 
-    get       [-k] <btree> <pos>                   exact lookup (slot iteration)
+    get    [-k|-r] <btree> <pos>                   exact lookup (slot iteration)
     peek      [-k] <btree> <pos>                   first key >= pos
     peek_prev [-k] <btree> <pos>                   last key <= pos
     list      [-k] <btree> [start] [end]           keys in range
-    update    <btree> <pos> <field=val>...         modify fields of a key
-    set  [-s] <btree> <pos> <type> [field=val]...  insert a whole new key
+    update [-r] <btree> <pos> <field=val>...       modify fields of a key
+    set  [-s][-r] <btree> <pos> <type> [field=val]... insert a whole new key
+    copy [-r] <btree> <pos> <new_pos>              duplicate a key elsewhere
     sb get [-d <dev>] <field>                      read a superblock field
     sb set [-d <dev>] <field=val>                  write one
     snapshot  [<id>|none]                          session snapshot context
@@ -131,6 +136,16 @@ value names: state=will_delete. Values are decimal, 0x hex, or negative
 decimal. `set <btree> <pos> deleted` removes the exact key; with -s it
 deletes within pos's snapshot instead (inserting whiteouts, like a runtime
 delete).
+
+`copy <btree> <pos> <new_pos>` duplicates a key exactly as it is - for
+values set can't build, extents above all - at another position, which may
+be in another inode or another snapshot. The insert is raw: triggers run,
+but an extent copy overwrites nothing, so it can overlap the extents there;
+the destination slot must be empty. An extent's new_pos is its new end.
+
+`-r` on update, set and copy runs no triggers at all: nothing else is
+updated to match - not other btrees, not the accounting - for injecting a
+key the rest of the filesystem doesn't know about.
 
 The snapshot context. Snapshot visibility is the subtle dimension of every
 bcachefs lookup: a key at snapshot S is visible at S and its descendants
@@ -174,9 +189,16 @@ One editing trap: snapshot IDs allocate descending from U32_MAX and the
 in-memory snapshot table is id-indexed; inserting a snapshot key with an
 unrealistically low id asks the table to span billions of entries and fails
 with ENOMEM_mark_snapshot. Use realistic, near-U32_MAX ids when fabricating
-snapshots. Varint-packed values (inodes) and entry-stream values (extents)
-are editable only up to their fixed header; fixed-layout values are fully
-editable.
+snapshots.
+
+Fixed-layout values are fully editable. Inodes are too, by their unpacked
+field names (bi_dir, bi_nlink, ...): an edit unpacks, sets and repacks, so
+it rewrites the inode as inode_v3, and can only produce what the packer
+does. `update -r` writes the value as stored instead, by its own struct's
+fields (an inode's bi_flags, bi_journal_seq, ...), and runs no triggers:
+for states the packer or a trigger would correct, such as has_inode_opts
+or a bi_journal_seq in the future. Entry-stream values (extents) are
+editable only up to their fixed header.
 ";
 
 /// Btree read/write REPL (debug)
@@ -258,61 +280,14 @@ fn parse_pos(s: &str) -> Result<c::bpos> {
 }
 
 fn parse_int(s: &str) -> Result<u64> {
-    if let Some(h) = s.strip_prefix("0x") {
-        Ok(u64::from_str_radix(h, 16)?)
-    } else if s.starts_with('-') {
-        Ok(s.parse::<i64>()? as u64)
-    } else {
-        Ok(s.parse::<u64>()?)
-    }
+    bkey_methods::parse_int(s).ok_or_else(|| anyhow!("expected an integer, got '{s}'"))
 }
 
-/// An assignment value: numbers resolve immediately, anything else is an
-/// enum value name, resolved once the field (and so the key type) is known.
-enum FieldVal {
-    Int(u64),
-    Name(String),
-}
-
-fn parse_assign(s: &str) -> Result<(&str, FieldVal)> {
-    let (path, val) = s
-        .split_once('=')
-        .ok_or_else(|| anyhow!("expected field=value, got '{s}'"))?;
-    Ok((path, match parse_int(val) {
-        Ok(v) => FieldVal::Int(v),
-        Err(_) => FieldVal::Name(val.to_string()),
-    }))
-}
-
-/// The one piece of schema kvdb owns: which fields hold enum codewords. The
-/// name<->value tables come from the x-macro imports (fs/codegen.rs); this
-/// goes away when the format has a real schema:
-fn field_enum(type_: u8, path: &str) -> Option<&'static [(&'static str, u64)]> {
-    use bcachefs_kernel::snapshot_states::*;
-
-    match (type_ as u32, path) {
-        (t, "state") if t == c::bch_bkey_type::KEY_TYPE_snapshot.0 =>
-            Some(SNAPSHOT_STATE_VALUES),
-        (t, "state") if t == c::bch_bkey_type::KEY_TYPE_subvolume.0 =>
-            Some(SUBVOLUME_STATE_VALUES),
-        _ => None,
-    }
-}
-
-fn field_val(type_: u8, path: &str, v: &FieldVal) -> Result<u64> {
-    match v {
-        FieldVal::Int(v) => Ok(*v),
-        FieldVal::Name(n) => {
-            let vals = field_enum(type_, path)
-                .ok_or_else(|| anyhow!("{path}: expected integer, got '{n}'"))?;
-            vals.iter()
-                .find(|(name, _)| name == n)
-                .map(|(_, v)| *v)
-                .ok_or_else(|| anyhow!("{path}: unknown value '{n}' (valid: {})",
-                                       vals.iter().map(|(n, _)| *n)
-                                           .collect::<Vec<_>>().join(", ")))
-        }
-    }
+/// `field=value`, both as text: the value is parsed by the field's key type
+/// (TransBkey::set()).
+fn parse_assign(s: &str) -> Result<(&str, &str)> {
+    s.split_once('=')
+        .ok_or_else(|| anyhow!("expected field=value, got '{s}'"))
 }
 
 /// The bcachefs to_text methods are the faithful rendering of the on-disk
@@ -320,7 +295,7 @@ fn field_val(type_: u8, path: &str, v: &FieldVal) -> Result<u64> {
 /// addressing fields on the write side (update/set), not for display.
 fn render_key(fs: &Fs, k: &BkeySC<'_>, key_only: bool) -> String {
     if key_only {
-        format!("{}\n", k.to_text_key())
+        format!("{}\n", k.k)
     } else {
         format!("{}\n", k.to_text(fs))
     }
@@ -332,11 +307,32 @@ fn render_key(fs: &Fs, k: &BkeySC<'_>, key_only: bool) -> String {
 /// human-oriented to_text display. Whole arrays print space-separated.
 /// A field beyond the end of a short (older-format) value reads as zero,
 /// mirroring update's grow-zero-filled write semantics.
-fn render_key_fields(k: &BkeySC<'_>, paths: &[&str]) -> Result<String> {
+///
+/// Inodes are read through the decoded form, bch_inode_unpacked, as update
+/// writes them: the varint-packed fields have no fixed position.
+fn render_key_fields(fs: &Fs, k: &BkeySC<'_>, paths: &[&str]) -> Result<String> {
+    if inode::bkey_is_inode(k.k) {
+        let u = inode::unpack(fs, *k);
+        let bytes = unsafe {
+            core::slice::from_raw_parts(&u as *const _ as *const u8,
+                                        size_of::<c::bch_inode_unpacked>())
+        };
+        return render_fields(bytes, <c::bch_inode_unpacked as TypeInfo>::INFO, paths);
+    }
+
+    render_raw_fields(k, paths)
+}
+
+/// Fields of the value as stored, by its own struct: get -r, for update -r.
+fn render_raw_fields(k: &BkeySC<'_>, paths: &[&str]) -> Result<String> {
+    let info = typeinfo::bkey_val_info(k.k.type_ as u32)
+        .ok_or_else(|| anyhow!("unknown key type {}", k.k.type_))?;
+    render_fields(k.val_bytes(), info, paths)
+}
+
+fn render_fields(val: &[u8], info: &'static StructInfo, paths: &[&str]) -> Result<String> {
     use std::fmt::Write as _;
     use typeinfo::{AccessError, FieldKind, FieldRef};
-
-    let val = k.val_bytes();
 
     let read_int = |path: &str, r: &FieldRef| -> Result<String> {
         let v = match typeinfo::read_scalar(val, r) {
@@ -353,7 +349,7 @@ fn render_key_fields(k: &BkeySC<'_>, paths: &[&str]) -> Result<String> {
 
     let mut out = String::new();
     for path in paths {
-        let (r, bm) = resolve_field(k.k.type_, path)?;
+        let (r, bm) = typeinfo::resolve_with_bits(info, path).map_err(|e| anyhow!("{e}"))?;
         let line = match bm {
             Some(bm) => match typeinfo::read_bits(val, &r, bm) {
                 Ok(v) => v.to_string(),
@@ -393,26 +389,26 @@ fn render_key_fields(k: &BkeySC<'_>, paths: &[&str]) -> Result<String> {
     Ok(out)
 }
 
-/// A resolved assignment target: a field, or a declared bit range within one
-/// (`no_keys`, `flags.subvol`).
-type FieldTarget = (typeinfo::FieldRef, Option<&'static typeinfo::BitmaskField>);
+/// Room for whatever set() grows a value to: the largest key there is.
+const BKEY_VAL_U64S_MAX: usize = u8::MAX as usize - BKEY_U64S;
 
-/// Resolve a field-or-bit path against a key type's val struct.
-fn resolve_field(type_: u8, path: &str) -> Result<FieldTarget> {
-    let info = typeinfo::bkey_val_info(type_ as u32)
-        .ok_or_else(|| anyhow!("unknown key type {type_}"))?;
-    typeinfo::resolve_with_bits(info, path).map_err(|e| anyhow!("{e}"))
-}
-
-fn write_field(
-    val: &mut [u8],
-    (r, bm): &FieldTarget,
-    v: u64,
-) -> std::result::Result<(), typeinfo::AccessError> {
-    match bm {
-        Some(bm) => typeinfo::write_bits(val, r, bm, v),
-        None => typeinfo::write_scalar(val, r, v),
+/// Apply @assigns to @k, reporting the first failure through @user_err. @raw:
+/// to the value as stored - see TransBkey::set_raw().
+fn set_fields(
+    fs:       &Fs,
+    k:        &mut TransBkey<'_, '_>,
+    assigns:  &[(&str, &str)],
+    raw:      bool,
+    user_err: &mut Option<anyhow::Error>,
+) -> Result<(), BchError> {
+    for (field, val) in assigns {
+        let ret = if raw { k.set_raw(field, val) } else { k.set(fs, field, val) };
+        if let Err(e) = ret {
+            *user_err = Some(anyhow!("{e}"));
+            return Err(no_key_err());
+        }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +423,7 @@ const RAW_EXACT: BtreeIterFlags = BtreeIterFlags::SLOTS.union(BtreeIterFlags::AL
 /// snapshotted - on anything else it would corrupt positions (snapshots
 /// btree keys live at snapshot 0) and filtering is meaningless.
 fn btree_uses_snapshots(btree: c::btree_id) -> bool {
-    bcachefs_kernel::BTREE_HAS_SNAPSHOTS_MASK & (1u64 << btree as u64) != 0
+    bcachefs_kernel::BTREE_HAS_SNAPSHOTS_MASK & (1u64 << btree.0 as u64) != 0
 }
 
 /// With a snapshot context active, reads drop ALL_SNAPSHOTS - the iterator
@@ -448,23 +444,26 @@ fn iter_flags(base: BtreeIterFlags, filtered: bool) -> BtreeIterFlags {
 /// faithful display), the key alone (-k), or selected value fields as bare
 /// values (trailing field paths). A deleted slot is "no key" for a field
 /// read - scripts reading fields need the miss to fail, not to read zeros -
-/// while the display modes do show deleted slots and whiteouts.
+/// while the display modes do show deleted slots and whiteouts. RawFields
+/// (-r): the value as stored, by its own struct - what update -r writes.
 #[derive(Clone, Copy)]
 enum Render<'a> {
     Full,
     KeyOnly,
     Fields(&'a [&'a str]),
+    RawFields(&'a [&'a str]),
 }
 
 fn render_read(fs: &Fs, k: &BkeySC<'_>, how: Render<'_>) -> Result<String> {
     match how {
         Render::Full => Ok(render_key(fs, k, false)),
         Render::KeyOnly => Ok(render_key(fs, k, true)),
-        Render::Fields(_) if k.is_deleted() => {
+        Render::Fields(_) | Render::RawFields(_) if k.is_deleted() => {
             let (inode, offset, snapshot) = (k.k.p.inode, k.k.p.offset, k.k.p.snapshot);
             Err(anyhow!("no key at {inode}:{offset}:{snapshot}"))
         }
-        Render::Fields(paths) => render_key_fields(k, paths),
+        Render::Fields(paths) => render_key_fields(fs, k, paths),
+        Render::RawFields(paths) => render_raw_fields(k, paths),
     }
 }
 
@@ -480,30 +479,29 @@ enum ReadOp {
 
 fn cmd_read(fs: &Fs, op: ReadOp, btree: c::btree_id, pos: c::bpos, filtered: bool,
             how: Render<'_>) -> Result<String> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut user_err: Option<anyhow::Error> = None;
     let out = lockrestart_do(&trans, |t| {
         let base = match op {
             ReadOp::Get => RAW_EXACT,
             _ => BtreeIterFlags::ALL_SNAPSHOTS,
         };
-        let mut iter = BtreeIter::new(t.trans(), btree, pos, iter_flags(base, filtered));
+        let mut iter = BtreeIter::new(t, btree, pos, iter_flags(base, filtered));
         let out = match op {
-            ReadOp::Get => iter.peek_max_flags(SPOS_MAX, BtreeIterFlags::SLOTS),
-            ReadOp::Peek => iter.peek(),
-            ReadOp::PeekPrev => iter.peek_prev(),
-        }
-        .and_then(|k| match k {
+            ReadOp::Get => iter.peek_max_flags(t, SPOS_MAX, BtreeIterFlags::SLOTS),
+            ReadOp::Peek => iter.peek(t),
+            ReadOp::PeekPrev => iter.peek_prev(t),
+        }?;
+        match out {
             Some(k) => render_read(fs, &k, how).map_err(|e| {
                 // Render errors (bad field path, no key for a field read)
                 // are the user's, not the transaction's: stash and abort
                 // the retry loop with a stand-in errcode.
                 user_err = Some(e);
-                BchError::from_errcode(bch_errcode::BCH_ERR_ENOENT_bkey_type_mismatch)
+                BchError::from(bch_errcode::BCH_ERR_ENOENT_bkey_type_mismatch)
             }),
             None => Ok("(no key)\n".to_string()),
-        });
-        t.result_value(out)
+        }
     });
     match user_err {
         Some(e) => Err(e),
@@ -573,7 +571,7 @@ fn take_interrupt() -> bool {
 
 fn cmd_list(fs: &Fs, btree: c::btree_id, start: c::bpos, end: c::bpos,
             filtered: bool, key_only: bool) -> Result<String> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut out = String::new();
     let mut iter = BtreeIter::new(
         &trans,
@@ -581,17 +579,17 @@ fn cmd_list(fs: &Fs, btree: c::btree_id, start: c::bpos, end: c::bpos,
         start,
         iter_flags(BtreeIterFlags::ALL_SNAPSHOTS | BtreeIterFlags::PREFETCH, filtered),
     );
-    iter.for_each_max(&trans, end, |k| {
+    iter.for_each_max(&trans, end, |_, _, k| {
         if take_interrupt() {
             out.push_str("(interrupted)\n");
-            return ControlFlow::Break(());
+            return Ok(ControlFlow::Break(()));
         }
         if key_only {
-            out.push_str(&format!("{}\n", k.to_text_key()));
+            out.push_str(&format!("{}\n", k.k));
         } else {
             out.push_str(&format!("{}\n", k.to_text(fs)));
         }
-        ControlFlow::Continue(())
+        Ok(ControlFlow::Continue(()))
     })?;
     Ok(out)
 }
@@ -647,7 +645,7 @@ fn cmd_list_online(handle: &BcachefsHandle, fs: &Fs,
             return ControlFlow::Break(());
         }
         if key_only {
-            out.push_str(&format!("{}\n", k.to_text_key()));
+            out.push_str(&format!("{}\n", k.k));
         } else {
             out.push_str(&format!("{}\n", k.to_text(fs)));
         }
@@ -656,80 +654,45 @@ fn cmd_list_online(handle: &BcachefsHandle, fs: &Fs,
     Ok(out)
 }
 
-fn no_key_err() -> TransError {
-    TransError::from(BchError::from_errcode(
-        bch_errcode::BCH_ERR_ENOENT_bkey_type_mismatch,
-    ))
+fn no_key_err() -> BchError {
+    bch_errcode::BCH_ERR_ENOENT_bkey_type_mismatch.into()
 }
 
 fn cmd_update(
     fs: &Fs,
     btree: c::btree_id,
     pos: c::bpos,
-    assigns: &[(&str, FieldVal)],
+    assigns: &[(&str, &str)],
+    raw: bool,
 ) -> Result<String> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut user_err: Option<anyhow::Error> = None;
 
     let commit = commit_do(
         &trans,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
             let mut iter = BtreeIter::new(
-                t.trans(),
+                t,
                 btree,
                 pos,
                 RAW_EXACT | BtreeIterFlags::INTENT,
             );
-            let k = iter
-                .peek_max_flags(SPOS_MAX, BtreeIterFlags::SLOTS)
-                .map_err(TransError::from)?;
+            let k = iter.peek_max_flags(t, SPOS_MAX, BtreeIterFlags::SLOTS)?;
             let Some(k) = k.filter(|k| !k.is_deleted()) else {
                 let (inode, offset, snapshot) = (pos.inode, pos.offset, pos.snapshot);
                 user_err = Some(anyhow!("no key at {inode}:{offset}:{snapshot}"));
                 return Err(no_key_err());
             };
 
-            // Byte extent the assignments need; the value may legally be
-            // shorter than the current struct (older format version) - grow
-            // it, zero-filled, if a written field lies beyond the end. The
-            // key type is known now, so enum value names resolve here too:
-            let mut need = 0usize;
-            let mut resolved = Vec::with_capacity(assigns.len());
-            for (path, fv) in assigns {
-                match resolve_field(k.k.type_, path) {
-                    Ok((r, _)) => need = need.max(r.offset + r.len),
-                    Err(e) => {
-                        user_err = Some(e);
-                        return Err(no_key_err());
-                    }
-                }
-                match field_val(k.k.type_, path, fv) {
-                    Ok(v) => resolved.push((*path, v)),
-                    Err(e) => {
-                        user_err = Some(e);
-                        return Err(no_key_err());
-                    }
-                }
-            }
+            // A copy of the key, as it is, in a buffer set() can grow it into:
+            let mut new = t.bkey_reassemble_resized(k, BKEY_VAL_U64S_MAX)?;
+            new.k_mut().u64s = k.k.u64s;
 
-            let val_u64s = (k.k.u64s as usize - BKEY_U64S).max(need.div_ceil(8));
-            let mut new = t.bkey_reassemble_resized(k, val_u64s)
-                .map_err(TransError::from)?;
+            set_fields(fs, &mut new, assigns, raw, &mut user_err)?;
 
-            let type_ = new.k().type_;
-            let mut val_view = BkeyS::from(new.k_i_mut());
-            let val = val_view.val_bytes_mut();
-            for (path, v) in &resolved {
-                let target = resolve_field(type_, path).expect("resolved above");
-                if let Err(e) = write_field(val, &target, *v) {
-                    user_err = Some(anyhow!("{path}: {e}"));
-                    return Err(no_key_err());
-                }
-            }
-
-            t.update(&mut iter, new, UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE)
+            t.update(&iter, &new, raw_flags(UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE, raw))
         },
     );
 
@@ -739,38 +702,78 @@ fn cmd_update(
     }
 }
 
-fn cmd_set(
-    fs: &Fs,
-    btree: c::btree_id,
-    pos: c::bpos,
-    type_name: &str,
-    assigns: &[(&str, FieldVal)],
-    in_snapshot: bool,
-) -> Result<String> {
-    let ti = typeinfo::bkey_type_info_by_name(type_name)
-        .ok_or_else(|| anyhow!("unknown key type '{type_name}'"))?;
+/// The -r writes: no triggers. They would restamp what was just set (an
+/// inode's bi_journal_seq), or update other btrees and the accounting to
+/// match - and a key the accounting doesn't know about is one of the states
+/// being injected.
+fn raw_flags(flags: UpdateTriggerFlags, raw: bool) -> UpdateTriggerFlags {
+    if raw { flags | UpdateTriggerFlags::NORUN } else { flags }
+}
 
-    // The value needs the struct's fixed size, extended by whatever the
-    // assignments reach - vartail elements (damage errors[n]) lie beyond it:
-    let mut need = ti.info.size;
-    for (path, _) in assigns {
-        let (r, _) = resolve_field(ti.type_ as u8, path)?;
-        need = need.max(r.offset + r.len);
-    }
-    let val_u64s = need.div_ceil(8);
-
-    let assigns = assigns
-        .iter()
-        .map(|(path, fv)| Ok((*path, field_val(ti.type_ as u8, path, fv)?)))
-        .collect::<Result<Vec<(&str, u64)>>>()?;
-
-    let trans = BtreeTrans::new(fs);
+/// Duplicate the key at @pos at @new_pos, exactly as it is: a raw insert -
+/// triggers run, but an extent overwrites nothing, so the copy can overlap
+/// what's there - into a slot that must be empty. For an extent, @new_pos is
+/// the copy's end, its size unchanged. @raw: no triggers - see raw_flags().
+fn cmd_copy(fs: &Fs, btree: c::btree_id, pos: c::bpos, new_pos: c::bpos, raw: bool)
+    -> Result<String>
+{
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut user_err: Option<anyhow::Error> = None;
 
     let commit = commit_do(
         &trans,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
+        |t| {
+            let mut iter = BtreeIter::new(t, btree, pos, RAW_EXACT);
+            let k = iter.peek_max_flags(t, SPOS_MAX, BtreeIterFlags::SLOTS)?;
+            let Some(k) = k.filter(|k| !k.is_deleted()) else {
+                let (inode, offset, snapshot) = (pos.inode, pos.offset, pos.snapshot);
+                user_err = Some(anyhow!("no key at {inode}:{offset}:{snapshot}"));
+                return Err(no_key_err());
+            };
+
+            let mut new_iter = BtreeIter::new(t, btree, new_pos,
+                                              RAW_EXACT | BtreeIterFlags::INTENT);
+            let old = new_iter.peek_max_flags(t, SPOS_MAX, BtreeIterFlags::SLOTS)?;
+            if old.is_some_and(|old| !old.is_deleted()) {
+                let (inode, offset, snapshot) = (new_pos.inode, new_pos.offset, new_pos.snapshot);
+                user_err = Some(anyhow!("{inode}:{offset}:{snapshot} is occupied"));
+                return Err(no_key_err());
+            }
+
+            let mut new = t.bkey_reassemble(k)?;
+            new.k_mut().p = new_pos;
+
+            t.update(&new_iter, &new, raw_flags(UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE, raw))
+        },
+    );
+
+    match commit {
+        Ok(()) => Ok(String::new()),
+        Err(e) => Err(user_err.unwrap_or_else(|| anyhow!("copy failed: {e}"))),
+    }
+}
+
+fn cmd_set(
+    fs: &Fs,
+    btree: c::btree_id,
+    pos: c::bpos,
+    type_name: &str,
+    assigns: &[(&str, &str)],
+    in_snapshot: bool,
+    raw: bool,
+) -> Result<String> {
+    let ti = typeinfo::bkey_type_info_by_name(type_name)
+        .ok_or_else(|| anyhow!("unknown key type '{type_name}'"))?;
+
+    let trans = bcachefs_kernel::btree_trans!(fs);
+    let mut user_err: Option<anyhow::Error> = None;
+
+    let commit = commit_do(
+        &trans,
+        None,
+        CommitFlags::NO_ENOSPC,
         |t| {
             // Deletion has two meanings. Raw (the default): remove this
             // exact key - a filtered iter would have bch2_trans_update()
@@ -786,35 +789,24 @@ fn cmd_set(
                 (RAW_EXACT | BtreeIterFlags::INTENT,
                  UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE)
             };
+            let update_flags = raw_flags(update_flags, raw);
             let mut iter = BtreeIter::new(
-                t.trans(),
+                t,
                 btree,
                 pos,
                 iter_flags,
             );
-            iter.peek_max_flags(SPOS_MAX, BtreeIterFlags::SLOTS)
-                .map_err(TransError::from)?;
+            iter.peek_max_flags(t, SPOS_MAX, BtreeIterFlags::SLOTS)?;
 
-            let mut new = t.bkey_alloc_init(val_u64s, ti.type_ as u8, pos)
-                .map_err(TransError::from)?;
+            // A zeroed value of the struct's fixed size, in a buffer set()
+            // can grow it into - vartail elements (damage errors[n]) lie
+            // beyond the struct:
+            let mut new = t.bkey_alloc_init(BKEY_VAL_U64S_MAX, ti.type_ as u8, pos)?;
+            new.k_mut().u64s = (BKEY_U64S + ti.info.size.div_ceil(8)) as u8;
 
-            let mut val_view = BkeyS::from(new.k_i_mut());
-            let val = val_view.val_bytes_mut();
-            for (path, v) in &assigns {
-                let target = match typeinfo::resolve_with_bits(ti.info, path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        user_err = Some(anyhow!("{e}"));
-                        return Err(no_key_err());
-                    }
-                };
-                if let Err(e) = write_field(val, &target, *v) {
-                    user_err = Some(anyhow!("{path}: {e}"));
-                    return Err(no_key_err());
-                }
-            }
+            set_fields(fs, &mut new, assigns, false, &mut user_err)?;
 
-            t.update(&mut iter, new, update_flags)
+            t.update(&iter, &new, update_flags)
         },
     );
 
@@ -830,7 +822,7 @@ fn cmd_set(
 // bch2_write_super so the csum is recomputed and every sb copy updated.
 
 fn sb_field(field: &str) -> Result<FieldTarget> {
-    typeinfo::resolve_with_bits(<c::bch_sb as typeinfo::TypeInfo>::INFO, field)
+    typeinfo::resolve_with_bits(<Head<c::bch_sb> as typeinfo::TypeInfo>::INFO, field)
         .map_err(|e| anyhow!("{e}"))
 }
 
@@ -863,11 +855,13 @@ fn cmd_sb_set(fs: &Fs, dev: Option<u32>, field: &str, v: u64) -> Result<String> 
     let _lock = unsafe { crate::wrappers::sb_lock(fs.raw) };
 
     /* sb_lock is held above - disk_sb_mut's contract, and ca->disk_sb's: */
-    let buf = match &ca {
-        Some(ca) => unsafe { &mut (*ca.as_mut_ptr()).disk_sb }.sb_bytes_mut(),
-        None     => unsafe { fs.disk_sb_mut() }.sb_bytes_mut(),
+    let sb = match &ca {
+        Some(ca) => unsafe { &mut (*ca.as_mut_ptr()).disk_sb },
+        None     => unsafe { fs.disk_sb_mut() },
     };
-    write_field(buf, &target, v).map_err(|e| anyhow!("{field}: {e}"))?;
+    sb.edit_header(|h| typeinfo::write(h, &target, v))
+        .map_err(|e| anyhow!("{field}: {e}"))?
+        .map_err(|e| anyhow!("{field}: {e}"))?;
 
     // Only --rw (started) and --nostart (opened will_not_start, which makes
     // no version decisions to persist) get here - see the check in the
@@ -881,7 +875,7 @@ fn cmd_sb_set(fs: &Fs, dev: Option<u32>, field: &str, v: u64) -> Result<String> 
 // command dispatch + REPL
 
 const HELP: &str = "\
-get  [-k] <btree> <pos> [<field>..]            exact lookup (slot iteration)
+get  [-k|-r] <btree> <pos> [<field>..]         exact lookup (slot iteration)
 peek [-k] <btree> <pos> [<field>..]            first key >= pos
 peek_prev <btree> <pos> [<field>..]            last key <= pos ([-k] too)
 list [-k] <btree> [start] [end]                keys in range
@@ -890,12 +884,21 @@ list [-k] <btree> [start] [end]                keys in range
           line, instead of the display rendering - the same paths update
           takes (depth, btime.lo, skip[1]); a whole array prints its
           elements space-separated
-update    <btree> <pos> <field=val>...         modify fields of an existing key
-set  [-s] <btree> <pos> <type> [field=val]...  insert a whole new key
+          -r reads fields of the value as stored, not an inode's unpacked
+          form - what update -r writes
+update [-r] <btree> <pos> <field=val>...       modify fields of an existing key
+          -r writes the value as stored, by its own struct's fields, and
+          runs no triggers: states the inode packer or a trigger would
+          correct (has_inode_opts, a future bi_journal_seq)
+set  [-s][-r] <btree> <pos> <type> [field=val]... insert a whole new key
           values are integers; fields holding enum codewords (snapshot/
           subvolume state) also accept the value name, e.g. state=will_delete
           `set <pos> deleted` removes the exact key; with -s it deletes
           within pos's snapshot instead (whiteouts, like a runtime delete)
+copy [-r] <btree> <pos> <new_pos>              duplicate a key, as it is, elsewhere
+          raw: an extent copy can overlap what's there; new_pos may be in
+          another inode or snapshot, and must be empty. An extent's new_pos
+          is its end
 sb get [-d <dev>] <field>                      read a superblock field/flag
 sb set [-d <dev>] <field=val>                  write one, then bch2_write_super
           -d: that device's own superblock - only its per-device parts
@@ -995,7 +998,7 @@ struct Cmd {
 }
 
 const COMMANDS: &[Cmd] = &[
-    Cmd { name: "get", aliases: &[], usage: "get [-k] <btree> <pos> [<field>..]",
+    Cmd { name: "get", aliases: &[], usage: "get [-k|-r] <btree> <pos> [<field>..]",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: false, needs_journal: false, handler: h_read },
     Cmd { name: "peek", aliases: &[], usage: "peek [-k] <btree> <pos> [<field>..]",
@@ -1007,12 +1010,15 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "list", aliases: &[], usage: "list [-k] <btree> [start] [end]",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: false, needs_journal: false, handler: h_list },
-    Cmd { name: "update", aliases: &[], usage: "update <btree> <pos> <field=val>...",
+    Cmd { name: "update", aliases: &[], usage: "update [-r] <btree> <pos> <field=val>...",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: true, needs_journal: false, handler: h_update },
-    Cmd { name: "set", aliases: &[], usage: "set [-s] <btree> <pos> <type> [field=val]...",
+    Cmd { name: "set", aliases: &[], usage: "set [-s] [-r] <btree> <pos> <type> [field=val]...",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: true, needs_journal: false, handler: h_set },
+    Cmd { name: "copy", aliases: &[], usage: "copy [-r] <btree> <pos> <new_pos>",
+          completes_btree: true, subcommands: &[],
+          nostart_ok: false, needs_rw: true, needs_journal: false, handler: h_copy },
     Cmd { name: "sb", aliases: &[], usage: "sb get [-d <dev>] <field> | sb set [-d <dev>] <field=val>",
           completes_btree: false, subcommands: &["get", "set"],
           nostart_ok: true, needs_rw: false, needs_journal: false, handler: h_sb },
@@ -1058,18 +1064,21 @@ fn h_snapshot(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(
 }
 
 fn h_read(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
-    let (key_only, args) = match args {
-        ["-k", rest @ ..] => (true, rest),
-        _ => (false, args),
+    let (key_only, raw, args) = match args {
+        ["-k", rest @ ..] => (true, false, rest),
+        ["-r", rest @ ..] => (false, true, rest),
+        _ => (false, false, args),
     };
     let [btree, pos, fields @ ..] = args else {
         bail!("usage: {}", cmd.usage);
     };
-    let how = match (key_only, fields) {
-        (false, []) => Render::Full,
-        (true, []) => Render::KeyOnly,
-        (false, fields) => Render::Fields(fields),
-        (true, _) => bail!("-k and field selection are mutually exclusive"),
+    let how = match (key_only, raw, fields) {
+        (false, false, []) => Render::Full,
+        (true, _, []) => Render::KeyOnly,
+        (false, false, fields) => Render::Fields(fields),
+        (false, true, []) => bail!("-r reads fields: name them"),
+        (false, true, fields) => Render::RawFields(fields),
+        (true, _, _) => bail!("-k and field selection are mutually exclusive"),
     };
     let btree = parse_btree(btree)?;
     let ctx = repl.snapshot
@@ -1113,6 +1122,10 @@ fn h_list(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), S
 }
 
 fn h_update(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
+    let (raw, args) = match args {
+        ["-r", rest @ ..] => (true, rest),
+        _ => (false, args),
+    };
     let [btree, pos, assigns @ ..] = args else {
         bail!("usage: {}", cmd.usage);
     };
@@ -1126,14 +1139,18 @@ fn h_update(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(),
         .collect::<Result<Vec<_>>>()?;
     let btree = parse_btree(btree)?;
     let ctx = repl.snapshot.filter(|_| btree_uses_snapshots(btree));
-    Ok(ControlFlow::Continue(cmd_update(fs, btree, parse_pos_ctx(pos, ctx)?, &assigns)?))
+    Ok(ControlFlow::Continue(cmd_update(fs, btree, parse_pos_ctx(pos, ctx)?, &assigns, raw)?))
 }
 
 fn h_set(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
-    let (in_snapshot, args) = match args {
-        ["-s", rest @ ..] => (true, rest),
-        _ => (false, args),
-    };
+    let (mut in_snapshot, mut raw, mut args) = (false, false, args);
+    loop {
+        match args {
+            ["-s", rest @ ..] => { in_snapshot = true; args = rest; }
+            ["-r", rest @ ..] => { raw = true;         args = rest; }
+            _ => break,
+        }
+    }
     let [btree, pos, type_name, assigns @ ..] = args else {
         bail!("usage: {}", cmd.usage);
     };
@@ -1148,7 +1165,23 @@ fn h_set(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), St
     let btree = parse_btree(btree)?;
     let ctx = repl.snapshot.filter(|_| btree_uses_snapshots(btree));
     Ok(ControlFlow::Continue(
-        cmd_set(fs, btree, parse_pos_ctx(pos, ctx)?, type_name, &assigns, in_snapshot)?,
+        cmd_set(fs, btree, parse_pos_ctx(pos, ctx)?, type_name, &assigns, in_snapshot, raw)?,
+    ))
+}
+
+fn h_copy(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
+    let (raw, args) = match args {
+        ["-r", rest @ ..] => (true, rest),
+        _ => (false, args),
+    };
+    let [btree, pos, new_pos] = args else {
+        bail!("usage: {}", cmd.usage);
+    };
+    let fs = repl.fs.offline()?;
+    let btree = parse_btree(btree)?;
+    let ctx = repl.snapshot.filter(|_| btree_uses_snapshots(btree));
+    Ok(ControlFlow::Continue(
+        cmd_copy(fs, btree, parse_pos_ctx(pos, ctx)?, parse_pos_ctx(new_pos, ctx)?, raw)?,
     ))
 }
 
@@ -1177,10 +1210,7 @@ fn h_sb(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), Str
                        reopen with --rw, or --nostart for sb-only edits");
             }
             let (field, val) = parse_assign(assign)?;
-            let FieldVal::Int(v) = val else {
-                bail!("sb set: expected an integer value");
-            };
-            cmd_sb_set(repl.fs.offline()?, dev, field, v)?
+            cmd_sb_set(repl.fs.offline()?, dev, field, parse_int(val)?)?
         }
         _ => bail!("usage: {}", cmd.usage),
     }))
@@ -1188,10 +1218,12 @@ fn h_sb(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), Str
 
 fn h_list_journal(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
     let fs = repl.fs.offline()?;
-    let mut f = super::list_journal::JournalFilter::default();
     // Searching the journal, not auditing it: gaps in the sequence aren't
     // what we're here for, and on a damaged fs they're endless spam.
-    f.print_missing = false;
+    let mut f = super::list_journal::JournalFilter {
+        print_missing: false,
+        ..Default::default()
+    };
     let mut args = args;
     while let Some((&flag, rest)) = args.split_first() {
         match flag {
@@ -1212,7 +1244,7 @@ fn h_list_journal(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFl
         }
     }
     let interrupt: &dyn Fn() -> bool = &take_interrupt;
-    super::list_journal::list_journal_run(fs.raw, &f, false, 0, u64::MAX, None,
+    super::list_journal::list_journal_run(fs, &f, false, 0, u64::MAX, None,
                                           Some(interrupt))?;
     Ok(ControlFlow::Continue(String::new()))
 }
@@ -1251,7 +1283,7 @@ fn kvdb(cli: Cli) -> Result<()> {
     logging::setup(cli.verbose, cli.colorize);
 
     let mut fs_opts = c::bch_opts::default();
-    opt_set!(fs_opts, degraded, bch_degraded_actions::BCH_DEGRADED_very as u8);
+    opt_set!(fs_opts, degraded, bch_degraded_actions::BCH_DEGRADED_very.0 as u8);
     // An injection tool must not consume its own injections: background
     // workers in *this* fs instance would otherwise act on the state under
     // test the moment we go read-write. Snapshot deletion reaps a snapshot
@@ -1269,7 +1301,7 @@ fn kvdb(cli: Cli) -> Result<()> {
     opt_set!(
         fs_opts,
         errors,
-        c::bch_error_actions::BCH_ON_ERROR_continue as u8
+        c::bch_error_actions::BCH_ON_ERROR_continue.0 as u8
     );
     if cli.verbose > 0 {
         opt_set!(fs_opts, verbose, 1);

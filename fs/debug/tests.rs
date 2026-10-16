@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use crate::alloc::buckets::DiskReservation;
-use crate::btree::bkey::{pos, spos, BkeyCookie, BkeyS, BkeySC, POS_MIN, SPOS_MAX};
+use crate::btree::bkey::{pos, spos, BkeyI, BkeyICookie, BkeyS, BkeySC, BKEY_U64S, POS_MIN, SPOS_MAX};
+use crate::btree::bkey_buf::BkeyBuf;
 use crate::btree::iter::{
     commit_do, lockrestart_do, trans_commit_do, BtreeIter, BtreeIterFlags, BtreeNodeIter,
-    BtreeTrans, CommitFlags, CommitOpts, TransAttempt, TransError, UpdateTriggerFlags,
+    CommitFlags, TransAttempt, UpdateTriggerFlags,
 };
-use crate::data::extents::{
-    bkey_extent_entries_mut, bkey_extent_entries_sc, bkey_ptrs_mut, entry_stripe_ptr_mut,
-    extent_entry_type,
-};
+use crate::data::extents::{ExtentEntry, ExtentEntryMut};
 use crate::errcode::{
-    bch_err_throw,
     bch_errcode,
     BchError,
     ENOENT_bkey_type_mismatch,
@@ -20,12 +17,14 @@ use crate::errcode::{
 use crate::fs::{BorrowedFs, Fs};
 use crate::util::async_exec::{block_on, spawn, system_unbound, WaitGroup};
 use crate::util::kernel::{local_clock, random_u64_below};
+use crate::util::ffi::c_char;
 use crate::util::printbuf::Printbuf;
 use crate::c;
 
-use core::ffi::{c_char, c_int, CStr};
+use core::ffi::{c_int, CStr};
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use cstruct_macros::c_export;
 
 #[cfg(kernel)]
 use kernel::prelude::*;
@@ -40,23 +39,23 @@ use bcachefs_shim as kernel;
 type TestRet = Result<(), BchError>;
 type TestFn = fn(&Fs, u64) -> TestRet;
 
-const NO_ENOSPC: CommitOpts = CommitOpts::new().flags(CommitFlags::NO_ENOSPC);
+const NO_ENOSPC: CommitFlags = CommitFlags::NO_ENOSPC;
 const INTERNAL_SNAPSHOT_NODE: UpdateTriggerFlags = UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE;
 
 fn error_ret(error: BchError) -> i32 {
     -error.raw()
 }
 
-fn errcode(code: bch_errcode) -> i32 {
-    error_ret(bch_err_throw(code))
+fn errcode(fs: &Fs, code: bch_errcode) -> i32 {
+    error_ret(fs.err(code))
 }
 
-fn enomem() -> BchError {
-    bch_err_throw(bch_errcode::BCH_ERR_ENOMEM_perf_test_job)
+fn enomem(fs: &Fs) -> BchError {
+    fs.err(bch_errcode::BCH_ERR_ENOMEM_perf_test_job)
 }
 
 fn round_up(v: u64, by: u64) -> u64 {
-    ((v + by - 1) / by) * by
+    v.div_ceil(by) * by
 }
 
 fn delete_test_keys(fs: &Fs) -> TestRet {
@@ -75,7 +74,7 @@ fn delete_test_keys(fs: &Fs) -> TestRet {
     )
 }
 
-fn insert_cookie(fs: &Fs, btree: c::btree_id, k: &mut BkeyCookie) -> TestRet {
+fn insert_cookie(fs: &Fs, btree: c::btree_id, k: &mut BkeyICookie) -> TestRet {
     /*
      * A cookie has no pointers, so nothing can charge trans->extra_disk_res
      * for it - but an extents leaf update is required to have somewhere to
@@ -87,19 +86,19 @@ fn insert_cookie(fs: &Fs, btree: c::btree_id, k: &mut BkeyCookie) -> TestRet {
         btree,
         k,
         Some(&res),
-        CommitOpts::new(),
+        CommitFlags::empty(),
         BtreeIterFlags::empty(),
     )
 }
 
 fn trans_cookie_alloc<'a, 't>(
     t: &TransAttempt<'a, 't>,
-) -> Result<crate::btree::iter::TransBkey<'a, 't>, BchError> {
-    t.bkey_alloc_typed::<c::bkey_i_cookie>()
+) -> Result<crate::btree::iter::TransBkey<'a, 't, c::Cookie>, BchError> {
+    t.bkey_alloc_typed::<c::Cookie>()
 }
 
 fn test_delete(fs: &Fs, _nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(
         &trans,
         c::btree_id::xattrs,
@@ -108,25 +107,25 @@ fn test_delete(fs: &Fs, _nr: u64) -> TestRet {
     );
 
     commit_do(&trans, None, NO_ENOSPC, |t| {
-        let mut k = trans_cookie_alloc(&t)?;
-        k.k_mut().set_snapshot(u32::MAX);
-        let t = iter.traverse(t)?;
-        t.update(&mut iter, k, UpdateTriggerFlags::empty())
+        let mut k = trans_cookie_alloc(t)?;
+        k.k_mut().p.snapshot = u32::MAX;
+        iter.traverse(t)?;
+        t.update(&iter, &k, UpdateTriggerFlags::empty())
     })?;
 
     commit_do(&trans, None, NO_ENOSPC, |t| {
-        let t = iter.traverse(t)?;
-        t.delete_at(&mut iter, UpdateTriggerFlags::empty())
+        iter.traverse(t)?;
+        t.delete_at(&iter, UpdateTriggerFlags::empty())
     })?;
 
     commit_do(&trans, None, NO_ENOSPC, |t| {
-        let t = iter.traverse(t)?;
-        t.delete_at(&mut iter, UpdateTriggerFlags::empty())
+        iter.traverse(t)?;
+        t.delete_at(&iter, UpdateTriggerFlags::empty())
     })
 }
 
 fn test_delete_written(fs: &Fs, _nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(
         &trans,
         c::btree_id::xattrs,
@@ -135,18 +134,18 @@ fn test_delete_written(fs: &Fs, _nr: u64) -> TestRet {
     );
 
     commit_do(&trans, None, NO_ENOSPC, |t| {
-        let mut k = trans_cookie_alloc(&t)?;
-        k.k_mut().set_snapshot(u32::MAX);
-        let t = iter.traverse(t)?;
-        t.update(&mut iter, k, UpdateTriggerFlags::empty())
+        let mut k = trans_cookie_alloc(t)?;
+        k.k_mut().p.snapshot = u32::MAX;
+        iter.traverse(t)?;
+        t.update(&iter, &k, UpdateTriggerFlags::empty())
     })?;
 
     trans.unlock();
     fs.journal_flush_outstanding_pins();
 
     commit_do(&trans, None, NO_ENOSPC, |t| {
-        let t = iter.traverse(t)?;
-        t.delete_at(&mut iter, UpdateTriggerFlags::empty())
+        iter.traverse(t)?;
+        t.delete_at(&iter, UpdateTriggerFlags::empty())
     })
 }
 
@@ -154,27 +153,27 @@ fn test_iterate(fs: &Fs, nr: u64) -> TestRet {
     delete_test_keys(fs)?;
 
     for i in 0..nr {
-        let mut k = BkeyCookie::new();
-        k.k_mut().p.offset = i;
-        k.k_mut().p.snapshot = u32::MAX;
+        let mut k = BkeyI::<c::Cookie>::new();
+        k.k.p.offset = i;
+        k.k.p.snapshot = u32::MAX;
         insert_cookie(fs, c::btree_id::xattrs, &mut k)?;
     }
 
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut i = 0;
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
-    iter.for_each_max(&trans, pos(0, u64::MAX), |k| {
+    iter.for_each_max(&trans, pos(0, u64::MAX), |_, _, k| {
         assert!(k.k.p.offset == i);
         i += 1;
-        ControlFlow::Continue(())
+        Ok(())
     })?;
     assert_eq!(i, nr);
 
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, u64::MAX, u32::MAX), BtreeIterFlags::empty());
-    iter.for_each_reverse(&trans, POS_MIN, |k| {
+    iter.for_each_reverse(&trans, POS_MIN, |_, _, k| {
         i -= 1;
         assert!(k.k.p.offset == i);
-        ControlFlow::Continue(())
+        Ok(())
     })?;
     assert_eq!(i, 0);
     Ok(())
@@ -184,28 +183,28 @@ fn test_iterate_extents(fs: &Fs, nr: u64) -> TestRet {
     delete_test_keys(fs)?;
 
     for i in (0..nr).step_by(8) {
-        let mut k = BkeyCookie::new();
-        k.k_mut().p.offset = i + 8;
-        k.k_mut().p.snapshot = u32::MAX;
-        k.k_mut().size = 8;
+        let mut k = BkeyI::<c::Cookie>::new();
+        k.k.p.offset = i + 8;
+        k.k.p.snapshot = u32::MAX;
+        k.k.size = 8;
         insert_cookie(fs, c::btree_id::extents, &mut k)?;
     }
 
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut i = 0;
     let mut iter = BtreeIter::new(&trans, c::btree_id::extents, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
-    iter.for_each_max(&trans, pos(0, u64::MAX), |k| {
+    iter.for_each_max(&trans, pos(0, u64::MAX), |_, _, k| {
         assert_eq!(k.k.start_offset(), i);
         i = k.k.p.offset;
-        ControlFlow::Continue(())
+        Ok(())
     })?;
     assert_eq!(i, nr);
 
     let mut iter = BtreeIter::new(&trans, c::btree_id::extents, spos(0, u64::MAX, u32::MAX), BtreeIterFlags::empty());
-    iter.for_each_reverse(&trans, POS_MIN, |k| {
+    iter.for_each_reverse(&trans, POS_MIN, |_, _, k| {
         assert!(k.k.p.offset == i);
         i = k.k.start_offset();
-        ControlFlow::Continue(())
+        Ok(())
     })?;
     assert_eq!(i, 0);
     Ok(())
@@ -215,81 +214,81 @@ fn test_iterate_slots(fs: &Fs, nr: u64) -> TestRet {
     delete_test_keys(fs)?;
 
     for i in 0..nr {
-        let mut k = BkeyCookie::new();
-        k.k_mut().p.offset = i * 2;
-        k.k_mut().p.snapshot = u32::MAX;
+        let mut k = BkeyI::<c::Cookie>::new();
+        k.k.p.offset = i * 2;
+        k.k.p.snapshot = u32::MAX;
         insert_cookie(fs, c::btree_id::xattrs, &mut k)?;
     }
 
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut i = 0;
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
-    iter.for_each_max(&trans, pos(0, u64::MAX), |k| {
+    iter.for_each_max(&trans, pos(0, u64::MAX), |_, _, k| {
         assert!(k.k.p.offset == i);
         i += 2;
-        ControlFlow::Continue(())
+        Ok(())
     })?;
     assert_eq!(i, nr * 2);
 
     i = 0;
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, u32::MAX), BtreeIterFlags::SLOTS);
-    iter.for_each_max(&trans, pos(0, u64::MAX), |k| {
+    iter.for_each_max(&trans, pos(0, u64::MAX), |_, _, k| {
         if i >= nr * 2 {
-            return ControlFlow::Break(());
+            return Ok(ControlFlow::Break(()));
         }
         assert!(k.k.p.offset == i);
         assert_eq!(k.k.is_deleted(), (i & 1) != 0);
         i += 1;
-        ControlFlow::Continue(())
-    })
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(())
 }
 
 fn test_iterate_slots_extents(fs: &Fs, nr: u64) -> TestRet {
     delete_test_keys(fs)?;
 
     for i in (0..nr).step_by(16) {
-        let mut k = BkeyCookie::new();
-        k.k_mut().p.offset = i + 16;
-        k.k_mut().p.snapshot = u32::MAX;
-        k.k_mut().size = 8;
+        let mut k = BkeyI::<c::Cookie>::new();
+        k.k.p.offset = i + 16;
+        k.k.p.snapshot = u32::MAX;
+        k.k.size = 8;
         insert_cookie(fs, c::btree_id::extents, &mut k)?;
     }
 
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut i = 0;
     let mut iter = BtreeIter::new(&trans, c::btree_id::extents, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
-    iter.for_each_max(&trans, pos(0, u64::MAX), |k| {
+    iter.for_each_max(&trans, pos(0, u64::MAX), |_, _, k| {
         assert_eq!(k.k.start_offset(), i + 8);
         assert_eq!({ k.k.size }, 8);
         i += 16;
-        ControlFlow::Continue(())
+        Ok(())
     })?;
     assert_eq!(i, nr);
 
     i = 0;
     let mut iter = BtreeIter::new(&trans, c::btree_id::extents, spos(0, 0, u32::MAX), BtreeIterFlags::SLOTS);
-    iter.for_each_max(&trans, pos(0, u64::MAX), |k| {
+    iter.for_each_max(&trans, pos(0, u64::MAX), |_, _, k| {
         if i == nr {
-            return ControlFlow::Break(());
+            return Ok(ControlFlow::Break(()));
         }
         assert_eq!(k.k.is_deleted(), i % 16 == 0);
         assert_eq!(k.k.start_offset(), i);
         assert_eq!({ k.k.size }, 8);
         i = k.k.p.offset;
-        ControlFlow::Continue(())
-    })
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(())
 }
 
 fn test_peek_end_btree(fs: &Fs, btree: c::btree_id) -> TestRet {
     delete_test_keys(fs)?;
 
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(&trans, btree, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
 
     for _ in 0..2 {
-        let empty = lockrestart_do(&trans, |t| {
-            t.done(iter.peek_max(pos(0, u64::MAX))?.is_none())
-        })?;
+        let empty = lockrestart_do(&trans, |t| Ok(iter.peek_max(t, pos(0, u64::MAX))?.is_none()))?;
         assert!(empty);
     }
 
@@ -307,11 +306,11 @@ fn test_peek_end_extents(fs: &Fs, _nr: u64) -> TestRet {
 static TEST_VERSION: AtomicU64 = AtomicU64::new(0);
 
 fn insert_test_extent(fs: &Fs, start: u64, end: u64) -> TestRet {
-    let mut k = BkeyCookie::new();
-    k.k_mut().p.offset = end;
-    k.k_mut().p.snapshot = u32::MAX;
-    k.k_mut().size = (end - start) as u32;
-    k.k_mut().bversion.lo = TEST_VERSION.fetch_add(1, Ordering::Relaxed);
+    let mut k = BkeyI::<c::Cookie>::new();
+    k.k.p.offset = end;
+    k.k.p.snapshot = u32::MAX;
+    k.k.size = (end - start) as u32;
+    k.k.bversion.lo = TEST_VERSION.fetch_add(1, Ordering::Relaxed);
     insert_cookie(fs, c::btree_id::extents, &mut k)
 }
 
@@ -343,11 +342,11 @@ fn test_extent_overwrite_all(fs: &Fs, _nr: u64) -> TestRet {
 }
 
 fn insert_test_overlapping_extent(fs: &Fs, inum: u64, start: u64, len: u32, snapid: u32) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let res = DiskReservation::new(fs);
 
     commit_do(&trans, Some(&res), NO_ENOSPC, |t| {
-        let mut k = trans_cookie_alloc(&t)?;
+        let mut k = trans_cookie_alloc(t)?;
         k.k_mut().p.inode = inum;
         k.k_mut().p.offset = start + len as u64;
         k.k_mut().p.snapshot = snapid;
@@ -367,7 +366,7 @@ fn test_extent_create_overlapping(fs: &Fs, inum: u64) -> TestRet {
 }
 
 fn test_extent_create_dup(fs: &Fs, inum: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(
         &trans,
         c::btree_id::extents,
@@ -376,9 +375,9 @@ fn test_extent_create_dup(fs: &Fs, inum: u64) -> TestRet {
     );
     let res = DiskReservation::new(fs);
 
-    let ret = commit_do(&trans, Some(&res), CommitOpts::new(), |t| {
+    let ret = commit_do(&trans, Some(&res), CommitFlags::empty(), |t| {
         let fs = t.fs();
-        let k = fs.require(iter.peek_max(pos(inum, u64::MAX))?, ENOENT_bkey_type_mismatch)?;
+        let k = fs.require(iter.peek_max(t, pos(inum, u64::MAX))?, ENOENT_bkey_type_mismatch)?;
         fs.ensure(k.k.key_type() == c::bch_bkey_type::KEY_TYPE_extent, ENOENT_bkey_type_mismatch)?;
 
         let mut dup = t.bkey_make_mut_noupdate(k)?;
@@ -388,7 +387,7 @@ fn test_extent_create_dup(fs: &Fs, inum: u64) -> TestRet {
 
         if size as u64 > res.sectors() {
             // durability 1: single_device.ktest formats one device
-            res.add(size as u64 - res.sectors(), 1, c::bch_reservation_flags(0))?;
+            res.add(size as u64 - res.sectors(), 1, c::bch_reservation_flags::from_bits_retain(0))?;
         }
 
         t.insert_nonextent(c::btree_id::extents, dup, INTERNAL_SNAPSHOT_NODE)
@@ -397,29 +396,31 @@ fn test_extent_create_dup(fs: &Fs, inum: u64) -> TestRet {
     ret
 }
 
-fn test_btree_ptr_stale_dirty_key<'a, 't>(
-    t: TransAttempt<'a, 't>,
+fn test_btree_ptr_stale_dirty_key(
+    t: &TransAttempt<'_, '_>,
     k: BkeySC<'_>,
-) -> Result<TransAttempt<'a, 't>, TransError> {
+) -> Result<(), BchError> {
     let mut iter = BtreeIter::new(
-        t.trans(),
+        t,
         c::btree_id::extents,
         k.k.p,
         BtreeIterFlags::INTENT,
     );
 
-    let t = iter.traverse(t)?;
+    iter.traverse(t)?;
     let fs = t.fs();
 
-    let b = fs.require(iter.node_at_iter_level(&t), ENOENT_bkey_type_mismatch)?;
+    let b = fs.require(iter.node_at_iter_level(t), ENOENT_bkey_type_mismatch)?;
     fs.ensure(b.level() == 0, ENOENT_bkey_type_mismatch)?;
 
     let mut update = t.bkey_make_mut_noupdate(b.key_sc())?;
 
     let mut updated = false;
-    let mut update_k = BkeyS::from(update.as_mut());
-    for ptr_entry in bkey_ptrs_mut(t.fs(), &mut update_k) {
-        if ptr_entry.cached() == 0 && ptr_entry.dev() != c::BCH_SB_MEMBER_INVALID as u64 {
+    let mut update_k = BkeyS::from(update.k_i_mut());
+    for ptr_entry in update_k.ptrs_mut(t.fs()) {
+        if ptr_entry.cached() == 0 && u64::from(ptr_entry.dev()) != c::BCH_SB_MEMBER_INVALID as u64 {
+            // gen is 8 bits: one less, as C's ptr->gen-- - the setter checks
+            // that the value fits
             ptr_entry.set_generation(ptr_entry.generation().wrapping_sub(1));
             updated = true;
             break;
@@ -440,10 +441,10 @@ fn test_btree_ptr_stale_dirty_key<'a, 't>(
 }
 
 fn test_btree_ptr_stale_dirty(fs: &Fs, _nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     lockrestart_do(&trans, |t| {
         let mut iter = BtreeNodeIter::new(
-            t.trans(),
+            t,
             c::btree_id::extents,
             POS_MIN,
             0,
@@ -455,7 +456,7 @@ fn test_btree_ptr_stale_dirty(fs: &Fs, _nr: u64) -> TestRet {
         let k = fs.require(iter.peek_max_type(SPOS_MAX, BtreeIterFlags::empty())?, ENOENT_bkey_type_mismatch)?;
         fs.ensure(k.is_btree_ptr(), ENOENT_bkey_type_mismatch)?;
 
-        test_btree_ptr_stale_dirty_key(t, k).map(|t| (t, ()))
+        test_btree_ptr_stale_dirty_key(t, k)
     })
 }
 
@@ -475,9 +476,7 @@ fn test_btree_ptr_stale_dirty(fs: &Fs, _nr: u64) -> TestRet {
 /// caller must lay down erasure-coded data first (see ec.ktest); this errors
 /// out if no striped extent is found.
 fn test_inject_stripe_ptr_mismatch(fs: &Fs, _nr: u64) -> TestRet {
-    const STRIPE_PTR: u32 = c::bch_extent_entry_type::BCH_EXTENT_ENTRY_stripe_ptr as u32;
-
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(
         &trans,
         c::btree_id::extents,
@@ -487,35 +486,36 @@ fn test_inject_stripe_ptr_mismatch(fs: &Fs, _nr: u64) -> TestRet {
 
     loop {
         let outcome = lockrestart_do(&trans, |t| {
-            let Some(k) = iter.peek_max(SPOS_MAX)? else {
-                return t.done(Some(false));
+            let Some(k) = iter.peek_max(t, SPOS_MAX)? else {
+                return Ok(Some(false));
             };
 
-            let striped = bkey_extent_entries_sc(&k.v())
-                .any(|e| extent_entry_type(e) == STRIPE_PTR);
+            let striped = k.extent_entries(t.fs())
+                .any(|e| matches!(e, ExtentEntry::stripe_ptr(_)));
             if !striped {
-                return t.done(None);
+                return Ok(None);
             }
 
             let mut u = t.bkey_make_mut_noupdate(k)?;
-            let mut u_k = BkeyS::from(u.as_mut());
-            for entry in bkey_extent_entries_mut(t.fs(), &mut u_k) {
-                if extent_entry_type(entry) == STRIPE_PTR {
-                    let sp = entry_stripe_ptr_mut(entry);
-                    sp.set_block(sp.block() + 1);
-                    break;
-                }
+            let mut u_k = BkeyS::from(u.k_i_mut());
+            let sp = u_k.extent_entries_mut(t.fs())
+                .find_map(|e| match e {
+                    ExtentEntryMut::stripe_ptr(sp) => Some(sp),
+                    _ => None,
+                });
+            if let Some(sp) = sp {
+                sp.set_block(sp.block() + 1);
             }
 
-            let t = t.update(&mut iter, u, UpdateTriggerFlags::NORUN)?;
-            let t = t.commit(None, NO_ENOSPC)?;
-            t.done(Some(true))
+            t.update(&iter, &u, UpdateTriggerFlags::NORUN)?;
+            t.commit(None, NO_ENOSPC)?;
+            Ok(Some(true))
         })?;
 
         match outcome {
             Some(true) => return Ok(()),
             Some(false) => return fs.throw(ENOENT_bkey_type_mismatch),
-            None => iter.advance(),
+            None => { iter.advance(); }
         }
     }
 }
@@ -540,22 +540,25 @@ fn test_inject_stripe_ptr_mismatch(fs: &Fs, _nr: u64) -> TestRet {
 /// out if no stripe is found.
 fn test_stripe_open_invalidates_update(fs: &Fs, _nr: u64) -> TestRet {
     for _ in 0..100 {
-        let updater = BtreeTrans::new(fs);
+        let updater = crate::btree_trans!(fs);
         let mut u_iter = BtreeIter::new(&updater, c::btree_id::stripes, POS_MIN,
                                         BtreeIterFlags::INTENT);
 
         let idx = lockrestart_do(&updater, |t| {
             let fs = t.fs();
-            let k = fs.require(u_iter.peek_max(SPOS_MAX)?, ENOENT_bkey_type_mismatch)?;
+            let k = fs.require(u_iter.peek_max(t, SPOS_MAX)?, ENOENT_bkey_type_mismatch)?;
             let idx = k.k.p.offset;
 
             let u = t.bkey_make_mut_noupdate(k)?;
-            let t = t.update(&mut u_iter, u, UpdateTriggerFlags::NORUN)?;
-            t.done(idx)
+            t.update(&u_iter, &u, UpdateTriggerFlags::NORUN)?;
+            Ok(idx)
         })?;
 
         updater.unlock();
         if unsafe { c::bch2_trans_relock_notrace(updater.raw()) } != 0 {
+            // A failed relock leaves the transaction in restart: end it, as a
+            // restart loop would, before it's put.
+            updater.begin_raw();
             continue;
         }
         updater.unlock();
@@ -565,23 +568,22 @@ fn test_stripe_open_invalidates_update(fs: &Fs, _nr: u64) -> TestRet {
         // declaration comes through as a zero-sized type.
         let mut handle: c::ec_stripe_handle = unsafe { core::mem::zeroed() };
         {
-            let opener = BtreeTrans::new(fs);
+            let opener = crate::btree_trans!(fs);
             let mut o_iter = BtreeIter::new(&opener, c::btree_id::stripes, pos(0, idx),
                                             BtreeIterFlags::INTENT);
 
             let mut attempt = 0;
             let opened = lockrestart_do(&opener, |t| {
                 let fs = t.fs();
-                fs.require(o_iter.peek_max(pos(0, idx))?, ENOENT_bkey_type_mismatch)?;
+                fs.require(o_iter.peek_max(t, pos(0, idx))?, ENOENT_bkey_type_mismatch)?;
 
                 attempt += 1;
                 assert!(handle.idx == 0,
                         "attempt {}: handle already claimed (idx {})", attempt, handle.idx);
 
-                let ret = unsafe {
+                ret_to_result(unsafe {
                     c::bch2_stripe_handle_tryget_existing(o_iter.raw_mut(), &mut handle)
-                };
-                t.result_value(ret_to_result(ret))
+                })
             })?;
 
             if opened != 1 {
@@ -598,6 +600,8 @@ fn test_stripe_open_invalidates_update(fs: &Fs, _nr: u64) -> TestRet {
                              idx);
             return fs.throw(bch_errcode::BCH_ERR_EINVAL_test_stripe_open_relock_not_invalidated);
         }
+        // The relock failed, as it should: in restart, as above.
+        updater.begin_raw();
         return Ok(());
     }
 
@@ -606,15 +610,15 @@ fn test_stripe_open_invalidates_update(fs: &Fs, _nr: u64) -> TestRet {
 }
 
 fn test_snapshot_filter(fs: &Fs, snapid_lo: u32, snapid_hi: u32) -> TestRet {
-    let mut cookie = BkeyCookie::new();
-    cookie.k_mut().p.snapshot = snapid_hi;
+    let mut cookie = BkeyI::<c::Cookie>::new();
+    cookie.k.p.snapshot = snapid_hi;
     insert_cookie(fs, c::btree_id::xattrs, &mut cookie)?;
 
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, snapid_lo), BtreeIterFlags::empty());
 
     let snapshot = lockrestart_do(&trans, |t| {
-        t.done(iter.peek_max(pos(0, u64::MAX))?.map_or(0, |k| k.k.p.snapshot))
+        Ok(iter.peek_max(t, pos(0, u64::MAX))?.map_or(0, |k| k.k.p.snapshot))
     })?;
 
     assert_eq!(snapshot, u32::MAX);
@@ -622,8 +626,8 @@ fn test_snapshot_filter(fs: &Fs, snapid_lo: u32, snapid_hi: u32) -> TestRet {
 }
 
 fn test_snapshots(fs: &Fs, _nr: u64) -> TestRet {
-    let mut cookie = BkeyCookie::new();
-    cookie.k_mut().p.snapshot = u32::MAX;
+    let mut cookie = BkeyI::<c::Cookie>::new();
+    cookie.k.p.snapshot = u32::MAX;
     insert_cookie(fs, c::btree_id::xattrs, &mut cookie)?;
 
     let mut snapids = [0u32; 2];
@@ -640,16 +644,70 @@ fn test_snapshots(fs: &Fs, _nr: u64) -> TestRet {
     test_snapshot_filter(fs, snapids[0], snapids[1])
 }
 
+/// Fill @buf with a key of its size, value words counting up from @seed.
+fn bkey_buf_test_key(buf: &mut [u64], seed: u64) -> BkeySC<'_> {
+    let u64s = buf.len();
+    for (i, v) in buf[BKEY_U64S..].iter_mut().enumerate() {
+        *v = seed + i as u64;
+    }
+
+    let mut h = c::bkey::new();
+    h.u64s = u64s as u8;
+    h.p.offset = seed;
+
+    let p = buf.as_mut_ptr().cast::<c::bkey_i>();
+    // SAFETY: the header written at the start of @buf, its u64s all of @buf
+    let k = unsafe {
+        (&raw mut (*p).k).write(h);
+        &*BkeyI::from_raw(p)
+    };
+    BkeySC::from(k)
+}
+
+fn bkey_buf_holds(b: &BkeyBuf, k: BkeySC<'_>) -> bool {
+    let held = b.sc();
+    held.k.u64s == k.k.u64s && held.k.p.offset == k.k.p.offset &&
+        held.val_bytes() == k.val_bytes()
+}
+
+/// BkeyBuf through both of its buffers - a key that fits in the struct, then
+/// one that needs the heap - moved after each copy, which the C bkey_buf,
+/// pointing into itself, couldn't survive.
+fn test_bkey_buf(_fs: &Fs, _nr: u64) -> TestRet {
+    let mut small = [0u64; 12];
+    let mut big = [0u64; 64];
+
+    let mut b = BkeyBuf::new();
+    assert!(b.sc().is_deleted());
+
+    let k = bkey_buf_test_key(&mut small, 100);
+    b.reassemble(k);
+    let b = core::hint::black_box(b);
+    assert!(bkey_buf_holds(&b, k));
+
+    let mut b = b;
+    let k = bkey_buf_test_key(&mut big, 1000);
+    b.reassemble(k);
+    let mut b = core::hint::black_box(b);
+    assert!(bkey_buf_holds(&b, k));
+
+    // Back to a small key, from the heap:
+    let k = bkey_buf_test_key(&mut small, 100);
+    b.reassemble(k);
+    assert!(bkey_buf_holds(&b, k));
+    Ok(())
+}
+
 fn test_rand() -> u64 {
     random_u64_below(u64::MAX)
 }
 
 fn rand_insert(fs: &Fs, nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
 
     for _ in 0..nr {
         commit_do(&trans, None, NO_ENOSPC, |t| {
-            let mut k = trans_cookie_alloc(&t)?;
+            let mut k = trans_cookie_alloc(t)?;
             k.k_mut().p.offset = test_rand();
             k.k_mut().p.snapshot = u32::MAX;
             t.insert(c::btree_id::xattrs, k, UpdateTriggerFlags::empty())
@@ -660,17 +718,17 @@ fn rand_insert(fs: &Fs, nr: u64) -> TestRet {
 }
 
 fn rand_insert_multi(fs: &Fs, nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
 
     for _ in (0..nr).step_by(8) {
-        commit_do(&trans, None, NO_ENOSPC, |mut t| {
+        commit_do(&trans, None, NO_ENOSPC, |t| {
             for _ in 0..8 {
-                let mut k = trans_cookie_alloc(&t)?;
+                let mut k = trans_cookie_alloc(t)?;
                 k.k_mut().p.offset = test_rand();
                 k.k_mut().p.snapshot = u32::MAX;
-                t = t.insert(c::btree_id::xattrs, k, UpdateTriggerFlags::empty())?;
+                t.insert(c::btree_id::xattrs, k, UpdateTriggerFlags::empty())?;
             }
-            Ok(t)
+            Ok(())
         })?;
     }
 
@@ -678,14 +736,14 @@ fn rand_insert_multi(fs: &Fs, nr: u64) -> TestRet {
 }
 
 fn rand_lookup(fs: &Fs, nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
 
     for _ in 0..nr {
         iter.set_pos(spos(0, test_rand(), u32::MAX));
         lockrestart_do(&trans, |t| {
-            iter.peek()?;
-            t.done(())
+            iter.peek(t)?;
+            Ok(())
         })?;
     }
 
@@ -693,23 +751,23 @@ fn rand_lookup(fs: &Fs, nr: u64) -> TestRet {
 }
 
 fn rand_mixed(fs: &Fs, nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
 
     for i in 0..nr {
         let rand = test_rand();
-        commit_do(&trans, None, NO_ENOSPC, |mut t| {
+        commit_do(&trans, None, NO_ENOSPC, |t| {
             iter.set_pos(spos(0, rand, u32::MAX));
 
-            let found = iter.peek()?.is_some();
+            let found = iter.peek(t)?.is_some();
 
             if (i & 3) == 0 && found {
-                let mut cookie = trans_cookie_alloc(&t)?;
+                let mut cookie = trans_cookie_alloc(t)?;
                 cookie.k_mut().p = iter.pos();
-                t = t.update(&mut iter, cookie, UpdateTriggerFlags::empty())?;
+                t.update(&iter, &cookie, UpdateTriggerFlags::empty())?;
             }
 
-            Ok(t)
+            Ok(())
         })?;
     }
 
@@ -717,7 +775,7 @@ fn rand_mixed(fs: &Fs, nr: u64) -> TestRet {
 }
 
 fn rand_delete(fs: &Fs, nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
 
     for _ in 0..nr {
         let p = spos(0, test_rand(), u32::MAX);
@@ -730,11 +788,11 @@ fn rand_delete(fs: &Fs, nr: u64) -> TestRet {
 }
 
 fn seq_insert(fs: &Fs, nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
 
     for i in 0..nr {
         commit_do(&trans, None, NO_ENOSPC, |t| {
-            let mut insert = trans_cookie_alloc(&t)?;
+            let mut insert = trans_cookie_alloc(t)?;
             insert.k_mut().p = spos(0, i, u32::MAX);
             t.insert(c::btree_id::xattrs, insert, UpdateTriggerFlags::empty())
         })?;
@@ -744,26 +802,26 @@ fn seq_insert(fs: &Fs, nr: u64) -> TestRet {
 }
 
 fn seq_lookup(fs: &Fs, _nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, u32::MAX), BtreeIterFlags::empty());
-    iter.for_each_max(&trans, pos(0, u64::MAX), |_k| ControlFlow::Continue(()))
+    iter.for_each_max(&trans, pos(0, u64::MAX), |_, _, _| Ok(()))?;
+    Ok(())
 }
 
 fn seq_overwrite(fs: &Fs, _nr: u64) -> TestRet {
-    let trans = BtreeTrans::new(fs);
+    let trans = crate::btree_trans!(fs);
     let mut iter = BtreeIter::new(&trans, c::btree_id::xattrs, spos(0, 0, u32::MAX), BtreeIterFlags::INTENT);
 
     loop {
         let done = lockrestart_do(&trans, |t| {
-            let Some(k) = iter.peek()? else {
-                return t.done(true);
+            let Some(k) = iter.peek(t)? else {
+                return Ok(true);
             };
             let u = t.bkey_reassemble(k)?;
-            let t = t.update(&mut iter, u, UpdateTriggerFlags::empty())?;
-            let t = t.commit(None, NO_ENOSPC)?;
-            t.done(false)
-        })
-        ?;
+            t.update(&iter, &u, UpdateTriggerFlags::empty())?;
+            t.commit(None, NO_ENOSPC)?;
+            Ok(false)
+        })?;
 
         if done {
             break;
@@ -812,6 +870,7 @@ fn lookup_test(testname: &CStr) -> Option<(&'static [u8], TestFn)> {
         (b"test_inject_stripe_ptr_mismatch", test_inject_stripe_ptr_mismatch),
         (b"test_stripe_open_invalidates_update", test_stripe_open_invalidates_update),
         (b"test_snapshots", test_snapshots),
+        (b"test_bkey_buf", test_bkey_buf),
     ];
 
     TESTS.iter().copied().find(|(name, _)| testname.to_bytes() == *name)
@@ -843,7 +902,7 @@ impl TestJob {
         // kernel alloc inherited its context from `current` (scoped memalloc
         // flags) instead of threading GFP per call, even this would unify.
         #[cfg(kernel)]
-        let job = Arc::new(job, GFP_KERNEL).map_err(|_| enomem())?;
+        let job = Arc::new(job, GFP_KERNEL).map_err(|_| enomem(fs))?;
         #[cfg(not(kernel))]
         let job = Arc::new(job);
 
@@ -887,7 +946,13 @@ fn print_perf_result(
     );
 }
 
-#[no_mangle]
+/// Run perf test @testname, @nr iterations on @nr_threads threads: what
+/// sysfs's perf_test does.
+///
+/// # Safety
+/// @raw_fs is a live filesystem for the call, and @testname NULL or a
+/// NUL-terminated string.
+#[c_export]
 pub unsafe extern "C" fn bch2_btree_perf_test(
     raw_fs:     *mut c::bch_fs,
     testname:   *const c_char,
@@ -897,18 +962,18 @@ pub unsafe extern "C" fn bch2_btree_perf_test(
     let fs = unsafe { Fs::borrow_raw(raw_fs) };
 
     if nr == 0 || nr_threads == 0 {
-        return errcode(bch_errcode::BCH_ERR_EINVAL_test_zero_nr_or_threads);
+        return errcode(&fs, bch_errcode::BCH_ERR_EINVAL_test_zero_nr_or_threads);
     }
 
-    let Some(testname) = (!testname.is_null()).then(|| unsafe { CStr::from_ptr(testname) }) else {
-        return errcode(bch_errcode::BCH_ERR_EINVAL_test_unknown_test);
+    let Some(testname) = (!testname.is_null()).then(|| unsafe { CStr::from_ptr(testname.cast()) }) else {
+        return errcode(&fs, bch_errcode::BCH_ERR_EINVAL_test_unknown_test);
     };
 
     let Some((name, test)) = lookup_test(testname) else {
-        return errcode(bch_errcode::BCH_ERR_EINVAL_test_unknown_test);
+        return errcode(&fs, bch_errcode::BCH_ERR_EINVAL_test_unknown_test);
     };
 
-    let job = match TestJob::new(&*fs, nr, nr_threads, test) {
+    let job = match TestJob::new(&fs, nr, nr_threads, test) {
         Ok(job) => job,
         Err(e) => return error_ret(e),
     };
@@ -916,7 +981,7 @@ pub unsafe extern "C" fn bch2_btree_perf_test(
     let queue = system_unbound();
     let wg = match WaitGroup::new(nr_threads) {
         Ok(wg) => wg,
-        Err(_) => return error_ret(enomem()),
+        Err(_) => return error_ret(enomem(&fs)),
     };
 
     // Fork the workers and wait for all of them: `block_on` drives the join on
@@ -950,7 +1015,7 @@ pub unsafe extern "C" fn bch2_btree_perf_test(
     });
 
     let Some((start, ret_code)) = outcome else {
-        return error_ret(enomem());
+        return error_ret(enomem(&fs));
     };
 
     let finish = local_clock();
@@ -959,22 +1024,14 @@ pub unsafe extern "C" fn bch2_btree_perf_test(
     let mut nr_buf = Printbuf::new();
     let mut per_sec_buf = Printbuf::new();
     nr_buf.human_readable_u64(nr);
-    per_sec_buf.human_readable_u64(if time != 0 {
-        // nr is caller-supplied — for the unit tests it's an inode number, not an op
-        // count — so nr * NSEC_PER_SEC overflows u64 (C wrapped it silently; the debug
-        // build BUGs on the overflow check). saturating_mul caps instead: real perf
-        // runs (sane nr) stay exact, the unit tests get a bounded-nonsense number.
-        // NOT u128 — 128-bit division pulls in __udivti3, which the kernel lacks.
-        nr.saturating_mul(c::NSEC_PER_SEC as u64) / time
-    } else {
-        0
-    });
+    // nr is caller-supplied — for the unit tests it's an inode number, not an op
+    // count — so nr * NSEC_PER_SEC overflows u64 (C wrapped it silently; the debug
+    // build BUGs on the overflow check). saturating_mul caps instead: real perf
+    // runs (sane nr) stay exact, the unit tests get a bounded-nonsense number.
+    // NOT u128 — 128-bit division pulls in __udivti3, which the kernel lacks.
+    per_sec_buf.human_readable_u64(nr.saturating_mul(c::NSEC_PER_SEC as u64).checked_div(time).unwrap_or(0));
 
-    let nsec_per_iter = if nr != 0 {
-        (time * nr_threads as u64) / nr
-    } else {
-        0
-    };
+    let nsec_per_iter = (time * nr_threads as u64).checked_div(nr).unwrap_or(0);
 
     print_perf_result(name, nr_threads, time, nsec_per_iter, &nr_buf, &per_sec_buf);
 

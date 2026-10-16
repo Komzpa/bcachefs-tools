@@ -111,9 +111,9 @@
 
 #include <linux/hash.h>
 
-#include "journal/types.h"
+#include "journal/types_gen.h"
 
-struct bch_fs;
+#include "journal/journal_gen.h"
 
 static inline void journal_wake(struct journal *j)
 {
@@ -379,12 +379,6 @@ static inline union journal_res_state journal_state_buf_put(struct journal *j, u
 	return s;
 }
 
-enum journal_cycle_flags {
-	JOURNAL_CYCLE_must_close	= BIT(0),
-	JOURNAL_CYCLE_must_open		= BIT(1),
-	JOURNAL_CYCLE_force_close	= BIT(2),
-};
-
 int bch2_journal_cycle_locked(struct journal *, enum journal_cycle_flags flags);
 void bch2_journal_cycle(struct journal *, enum journal_cycle_flags flags);
 
@@ -437,12 +431,6 @@ static inline void bch2_journal_res_put(struct journal *j,
 
 int bch2_journal_res_get_slowpath(struct journal *, struct journal_res *,
 				  unsigned, struct btree_trans *);
-
-/* First bits for BCH_WATERMARK: */
-enum journal_res_flags {
-	__JOURNAL_RES_GET_NONBLOCK	= BCH_WATERMARK_BITS,
-	__JOURNAL_RES_GET_CHECK,
-};
 
 #define JOURNAL_RES_GET_NONBLOCK	(1 << __JOURNAL_RES_GET_NONBLOCK)
 #define JOURNAL_RES_GET_CHECK		(1 << __JOURNAL_RES_GET_CHECK)
@@ -537,7 +525,6 @@ static inline void bch2_journal_res_flush(struct journal *j, struct journal_res 
 }
 
 int bch2_journal_flush_seq(struct journal *, u64, unsigned);
-int bch2_journal_flush(struct journal *);
 void bch2_journal_advance_rewind_seq(struct journal *, u64);
 int bch2_journal_add_rewind_range(struct bch_fs *, u64, u64);
 bool bch2_journal_noflush_seq(struct journal *, u64, u64);
@@ -548,12 +535,8 @@ int bch2_journal_meta(struct journal *);
 void bch2_journal_halt_locked(struct journal *);
 void bch2_journal_halt(struct journal *);
 
-struct bch_dev;
-
 void bch2_journal_unblock(struct journal *);
 void bch2_journal_block(struct journal *);
-
-struct journal_block { struct journal *j; };
 
 DEFINE_CLASS(journal_block, struct journal_block,
 	     bch2_journal_unblock(_T.j),
@@ -566,6 +549,7 @@ static inline void *class_journal_block_lock_ptr(class_journal_block_t *_T)
 	return _T;
 }
 
+bool bch2_journal_pin_fifo_want_resize(struct journal *);
 int bch2_journal_pin_fifo_resize(struct journal *);
 
 struct journal_buf *bch2_next_write_buffer_flush_journal_buf(struct journal *, u64, bool *);

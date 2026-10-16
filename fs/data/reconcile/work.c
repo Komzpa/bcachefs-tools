@@ -823,10 +823,16 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 	if (cuckoo_u64_test(&c->reconcile.stripes_pending, k.k->p.offset))
 		return 0;
 
+	/*
+	 * Repair drops our locks to do IO: @k points into the btree - into the
+	 * key cache, for a retry (do_retry_stripe()) - and may be freed or
+	 * reused by the time it returns. Only the copy is used past this point.
+	 */
 	struct bkey_buf stack_k __cleanup(bch2_bkey_buf_exit);
 	bch2_bkey_buf_init(&stack_k);
 	bch2_bkey_buf_reassemble(&stack_k, k);
-	s = bkey_i_to_s_c_stripe(stack_k.k);;
+	s = bkey_i_to_s_c_stripe(stack_k.k);
+	k = bkey_s_c_null;
 
 	int ret = bch2_stripe_repair(ctxt, iter, s);
 
@@ -839,7 +845,7 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 	if (ret == -BCH_ERR_stripe_needs_block_evacuate) {
 		if (retry) {
 			darray_push(retry, ((stripe_retry) {
-					    .idx	= k.k->p.offset,
+					    .idx	= s.k->p.offset,
 					    .io_seq	= ctxt->io_seq,
 			}));
 		} else {
@@ -847,7 +853,7 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 			CLASS(bch_log_msg_ratelimited, msg)(c);
 			prt_printf(&msg.m, "error retrying stripe: %s\n", bch2_err_str(ret));
 			bch2_bkey_val_to_text(&msg.m, c, s.s_c);
-			reconcile_stripe_park(c, k.k->p.offset);
+			reconcile_stripe_park(c, s.k->p.offset);
 		}
 		ret = 0;
 	} else if (ret && !bch2_err_matches(ret, BCH_ERR_transaction_restart)) {
@@ -862,7 +868,7 @@ static int do_reconcile_stripe(struct moving_context *ctxt,
 		prt_printf(&msg.m, "error repairing stripe, leaving it for a later pass: %s\n",
 			   bch2_err_str(ret));
 		bch2_bkey_val_to_text(&msg.m, c, s.s_c);
-		reconcile_stripe_park(c, k.k->p.offset);
+		reconcile_stripe_park(c, s.k->p.offset);
 		ret = 0;
 	}
 
@@ -1429,7 +1435,9 @@ static int do_reconcile_scan(struct moving_context *ctxt,
 					    r->scan_start.pos, r->scan_end.pos));
 	}
 
-	try(bch2_clear_reconcile_needs_scan(trans, cookie_pos, cookie));
+	/* do_reconcile() clears the pending cookie after the pending phases. */
+	if (s.type != RECONCILE_SCAN_pending)
+		try(bch2_clear_reconcile_needs_scan(trans, cookie_pos, cookie));
 
 	*sectors_scanned += atomic64_read(&r->scan_stats.sectors_seen);
 	/*
@@ -1644,10 +1652,14 @@ static int do_reconcile_phys(struct bch_fs *c, unsigned reconcile_phase)
 		nr_started++;
 	}
 
-	/* The threads freeze in place, so our wait for them must be freezable too: */
+	/*
+	 * The threads freeze in place, so our wait for them must be freezable
+	 * too. TASK_IDLE: we sleep here for the whole pass, which on a large
+	 * rotational device can be hours - that's not a hung task:
+	 */
 	for (unsigned i = 0; i < nr_started; i++)
 		wait_for_completion_state(&thrs.data[i].done,
-					  TASK_UNINTERRUPTIBLE|TASK_FREEZABLE);
+					  TASK_IDLE|TASK_FREEZABLE);
 	return ret;
 }
 
@@ -1785,9 +1797,15 @@ static int do_reconcile_phase_iter(struct reconcile_pass *p, u32 kick,
 		if (bch2_err_matches(ret, BCH_ERR_data_update_fail_need_copygc)) {
 			bch2_trans_unlock_long(trans);
 			bch2_copygc_wakeup(c);
-			wait_event(c->copygc.running_wq,
-				   c->copygc.run_count != *p->copygc_run_count ||
-				   kthread_should_stop());
+			/*
+			 * Freezable: copygc freezes in place, so a plain
+			 * wait_event() here would stall the freezer. Idle: a
+			 * copygc run can take longer than the hung task timeout:
+			 */
+			wait_event_state(c->copygc.running_wq,
+					 c->copygc.run_count != *p->copygc_run_count ||
+					 kthread_should_stop(),
+					 (TASK_IDLE|TASK_FREEZABLE));
 			*p->copygc_run_count = c->copygc.run_count;
 			ret = 0;
 			continue;
@@ -1961,7 +1979,9 @@ static int do_reconcile(struct moving_context *ctxt)
 			break;
 	}
 out:
-	if (!ret && !bkey_deleted(&pending_cookie.k))
+	if (!ret &&
+	    r->phase == ARRAY_SIZE(reconcile_phases) &&
+	    !bkey_deleted(&pending_cookie.k))
 		try(bch2_clear_reconcile_needs_scan(trans,
 				pending_cookie.k.p, pending_cookie.v.cookie));
 

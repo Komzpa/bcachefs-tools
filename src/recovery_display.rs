@@ -21,15 +21,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use rustix::fs::{flock, FlockOperation};
 
 use bch_bindgen::c;
+use bcachefs_kernel::util::vstructs::{Unvalidated, UnvalidatedEntries};
 
 use crate::commands::fs_usage::replicas_spare_redundancy;
 use crate::thread_with_file::StatusDisplay;
 use crate::wrappers::accounting::data_type;
 use crate::wrappers::ioctl::{
-    ioctl_ptr, ioctl_rw, IoctlBuf, BCH_IOCTL_FS_USAGE, BCH_IOCTL_RECOVERY_STATUS,
+    grow_on_erange, ioctl_ptr, ioctl_rw, IoctlBuf, BCH_IOCTL_FS_USAGE, BCH_IOCTL_RECOVERY_STATUS,
 };
 use crate::wrappers::sysfs::DevInfo;
 
@@ -132,8 +134,9 @@ impl<'a> RecoveryDisplay<'a> {
         }
 
         let line = match self.read_redundancy() {
-            Some(r) => format!("{head}, current redundancy {r}"),
-            None    => format!("{head}, redundancy unavailable"),
+            Ok(Some(r)) => format!("{head}, current redundancy {r}"),
+            Ok(None)    => format!("{head}, redundancy unavailable"),
+            Err(e)      => format!("{head}, redundancy unavailable: {e:#}"),
         };
         self.devices_line = Some(line.clone());
         line
@@ -141,18 +144,15 @@ impl<'a> RecoveryDisplay<'a> {
 
     /// How many more devices can go before some data is unreadable: the
     /// worst-off replicas entry decides, so the minimum over all of them.
-    fn read_redundancy(&self) -> Option<i32> {
-        let usage = fs_usage(self.fd).ok()?;
+    fn read_redundancy(&self) -> anyhow::Result<Option<i32>> {
+        let usage = fs_usage(self.fd).context("BCH_IOCTL_FS_USAGE")?;
+        let replicas = usage.replicas().collect::<Result<Vec<_>, _>>()
+            .context("BCH_IOCTL_FS_USAGE reply")?;
 
-        usage.replicas()
-            .filter(|r| r.r.data_type as u32 != u32::from(data_type::cached))
-            .map(|r| {
-                let devs = unsafe {
-                    std::slice::from_raw_parts(r.r.devs.as_ptr(), r.r.nr_devs as usize)
-                };
-                replicas_spare_redundancy(r.r.nr_devs, r.r.nr_required, devs, &self.devs)
-            })
-            .min()
+        Ok(replicas.iter()
+            .filter(|u| u.r.data_type as u32 != u32::from(data_type::cached))
+            .map(|u| replicas_spare_redundancy(u.r.nr_devs, u.r.nr_required, &u.devs, &self.devs))
+            .min())
     }
 
     /// ENODEV is ordinary, not a failure: the ioctl only answers while a
@@ -386,36 +386,12 @@ struct FsUsage {
     bytes: usize,
 }
 
-/// Rust's spelling of replicas_usage_bytes() - the C inline can't cross
-/// bindgen, and the length has to come from the entry's own nr_devs because
-/// that is what makes these variable-size.
-fn replicas_usage_bytes(u: &c::bch_replicas_usage) -> usize {
-    std::mem::offset_of!(c::bch_replicas_usage, r)
-        + std::mem::size_of::<c::bch_replicas_entry_v1>()
-        + u.r.nr_devs as usize
-}
-
 impl FsUsage {
-    fn replicas(&self) -> impl Iterator<Item = &c::bch_replicas_usage> + '_ {
-        let trailing = self.buf.trailing_bytes(self.bytes);
-        let mut off = 0usize;
-
-        std::iter::from_fn(move || {
-            // A truncated tail is the kernel and us disagreeing about the
-            // layout; stop rather than read past what it wrote.
-            if off + std::mem::size_of::<c::bch_replicas_usage>() > trailing.len() {
-                return None;
-            }
-
-            let u = unsafe { &*(trailing.as_ptr().add(off) as *const c::bch_replicas_usage) };
-            let len = replicas_usage_bytes(u);
-
-            if len == 0 || off + len > trailing.len() {
-                return None;
-            }
-            off += len;
-            Some(u)
-        })
+    /// Each entry, as long as its nr_devs says - checked against what's left
+    /// of the tail: one that doesn't fit, the kernel and us disagreeing
+    /// about the layout, an error.
+    fn replicas(&self) -> UnvalidatedEntries<'_, c::bch_replicas_usage<Unvalidated>> {
+        UnvalidatedEntries::new(self.buf.trailing_bytes(self.bytes))
     }
 }
 
@@ -425,23 +401,14 @@ impl FsUsage {
 /// name, and the replicas entries are exactly what we don't know in advance:
 /// which combinations of devices exist is the question.
 fn fs_usage(fd: BorrowedFd<'_>) -> io::Result<FsUsage> {
-    let mut bytes = 4096usize;
-
-    loop {
-        let mut buf = IoctlBuf::<c::bch_ioctl_fs_usage>::new::<u8>(bytes);
+    grow_on_erange(4096, 1 << 20, |bytes| {
+        let mut buf = IoctlBuf::<c::bch_ioctl_fs_usage>::with_trailing_bytes(bytes);
         buf.hdr_mut().replica_entries_bytes = bytes as u32;
+        unsafe { ioctl_ptr::<BCH_IOCTL_FS_USAGE>(fd, buf.as_mut_ptr())? };
 
-        match unsafe { ioctl_ptr::<BCH_IOCTL_FS_USAGE>(fd, buf.as_mut_ptr()) } {
-            Ok(_) => {
-                let n = buf.hdr().replica_entries_bytes as usize;
-                return Ok(FsUsage { buf, bytes: n });
-            }
-            Err(e) if e.raw_os_error() == Some(libc::ERANGE) && bytes < 1 << 20 => {
-                bytes *= 2;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+        let bytes = buf.hdr().replica_entries_bytes as usize;
+        Ok(FsUsage { buf, bytes })
+    })
 }
 
 fn mask_count(m: &c::bch_recovery_pass_mask) -> u32 {
@@ -466,7 +433,7 @@ fn pass_name(pass: u32) -> &'static str {
 }
 
 fn units_name(units: u32) -> &'static str {
-    if units == c::bch_progress_units::BCH_PROGRESS_UNITS_keys as u32 {
+    if units == c::bch_progress_units::BCH_PROGRESS_UNITS_keys.0 {
         "keys"
     } else {
         "nodes"

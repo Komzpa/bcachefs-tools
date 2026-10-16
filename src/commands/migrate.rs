@@ -21,6 +21,7 @@ use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
 use bcachefs_kernel::fs::Fs;
 use bcachefs_kernel::opt_set;
+use bcachefs_kernel::util::vstructs::Head;
 use clap::Parser;
 
 use crate::commands::format::take_opt_value;
@@ -310,7 +311,7 @@ fn add_default_sb_layout(sb: &mut c::bch_sb) -> Result<u32> {
     }
 
     for i in 0..sb.layout.nr_superblocks as usize {
-        let off = u64::from_le(sb.layout.sb_offset[i]);
+        let off = sb.layout.sb_offset[i].get();
         if off == bch_sb_sector || off == bch_sb_sector + sb_size as u64 {
             bail!("Superblock layout already has default superblocks");
         }
@@ -320,8 +321,8 @@ fn add_default_sb_layout(sb: &mut c::bch_sb) -> Result<u32> {
     let nr = sb.layout.nr_superblocks as usize;
     sb.layout.sb_offset.copy_within(0..nr, 2);
     sb.layout.nr_superblocks += 2;
-    sb.layout.sb_offset[0] = bch_sb_sector.to_le();
-    sb.layout.sb_offset[1] = (bch_sb_sector + sb_size as u64).to_le();
+    sb.layout.sb_offset[0] = bch_sb_sector.into();
+    sb.layout.sb_offset[1] = (bch_sb_sector + sb_size as u64).into();
 
     Ok(sb_size)
 }
@@ -430,7 +431,7 @@ fn migrate_fs(
         bail!("format failed");
     }
 
-    let sb_offset_val = u64::from_le(unsafe { (*sb).layout.sb_offset[0] });
+    let sb_offset_val = (unsafe { (*sb).layout.sb_offset[0] }).get();
 
     // Add encryption key if needed
     if !passphrase.is_null() {
@@ -463,7 +464,7 @@ fn migrate_fs(
 
     // Set no_default_sb feature — prevents rw mount until migrate-superblock is run
     let sb = unsafe { &mut *(*fs.raw).disk_sb.sb };
-    sb.features[0] |= (1u64 << c::bch_sb_feature::BCH_FEATURE_no_default_sb as u64).to_le();
+    sb.features[0].set(sb.features[0].get() | (1u64 << c::bch_sb_feature::BCH_FEATURE_no_default_sb.0 as u64));
     {
         let _lock = fs.sb_lock();
         fs.write_super_ret()
@@ -547,7 +548,7 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
     let sb_size = add_default_sb_layout(sb.sb_mut())?;
 
     // Zero the start of the disk to blow away the old superblock
-    let zeroes_len = ((c::BCH_SB_SECTOR as usize) << 9) + std::mem::size_of::<c::bch_sb>();
+    let zeroes_len = ((c::BCH_SB_SECTOR as usize) << 9) + std::mem::size_of::<Head<c::bch_sb>>();
     let zeroes = vec![0u8; zeroes_len];
     {
         use std::os::unix::fs::FileExt;
@@ -580,9 +581,9 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
         let fs_raw = fs.raw;
         let _lock = fs.sb_lock();
         let sb = &mut *(*fs_raw).disk_sb.sb;
-        sb.features[0] &= !(1u64 << c::bch_sb_feature::BCH_FEATURE_no_default_sb as u64).to_le();
+        sb.features[0].set(sb.features[0].get() & !(1u64 << c::bch_sb_feature::BCH_FEATURE_no_default_sb.0 as u64));
         // Also update the cached copy — c->sb.features is host-endian
-        (*fs_raw).sb.features &= !(1u64 << c::bch_sb_feature::BCH_FEATURE_no_default_sb as u64);
+        (*fs_raw).sb.features &= !(1u64 << c::bch_sb_feature::BCH_FEATURE_no_default_sb.0 as u64);
         fs.write_super_ret()
             .map_err(|e| anyhow!("Error writing superblock: {}", e))?;
 
@@ -599,7 +600,7 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
     assert_eq!(actual_sb_size, sb_size, "sb_max_size_bits mismatch after recovery");
 
     // Apply superblock layout changes (FS is already RW)
-    let sb_ref = unsafe { &mut *(*ca).disk_sb.sb };
+    let sb_ref = unsafe { (*ca).disk_sb.sb_mut() };
     add_default_sb_layout(sb_ref)?;
 
     // Mark the new sb buckets in FS metadata
@@ -618,7 +619,7 @@ fn migrate_superblock(dev_path: &str, sb_offset: u64) -> Result<()> {
 // ---- Public command entry points ----
 
 fn cmd_migrate(argv: Vec<String>) -> Result<()> {
-    let opt_flags = c::opt_flags::OPT_FORMAT as u32;
+    let opt_flags = c::opt_flags::OPT_FORMAT.bits();
 
     let mut fs_path: Option<String> = None;
     let mut encrypted = false;
@@ -641,7 +642,7 @@ fn cmd_migrate(argv: Vec<String>) -> Result<()> {
             let name = raw_name.replace('-', "_");
 
             if let Some((opt_id, opt, negated)) = bch_opt_lookup_negated(&name) {
-                if opt.flags as u32 & opt_flags != 0 {
+                if opt.flags.bits() & opt_flags != 0 {
                     let val_str = if negated {
                         "0".to_string()
                     } else if let Some(v) = inline_val {

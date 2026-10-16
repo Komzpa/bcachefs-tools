@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _BCACHEFS_DATA_EC_TRIGGER_H
 #define _BCACHEFS_DATA_EC_TRIGGER_H
+#include "data/ec/trigger_gen.h"
 
 int bch2_stripe_validate(struct bch_fs *, struct bkey_s_c,
 			 const struct bkey_validate_context *);
@@ -14,7 +15,6 @@ int bch2_trigger_stripe(struct btree_trans *, struct btree_trigger_op);
 	.swab		= bch2_ptr_swab,		\
 	.trigger	= bch2_trigger_stripe,		\
 	.check_repair	= bch2_check_fix_ptrs,		\
-	.min_val_size	= 8,				\
 })
 
 static inline unsigned stripe_csums_per_device(const struct bch_stripe *s)
@@ -236,9 +236,8 @@ bool bch2_stripe_is_open(struct bch_fs *, u64);
 
 /* Hash-only claim for an unallocated stripe slot. */
 bool bch2_stripe_handle_tryget(struct bch_fs *, struct ec_stripe_handle *, u64);
-/* Intent-locked existing key: 1 acquired, 0 busy, negative error/restart. */
-int bch2_stripe_handle_tryget_existing(struct btree_iter *, struct ec_stripe_handle *);
-void bch2_stripe_handle_put(struct bch_fs *, struct ec_stripe_handle *);
+void bch2_stripe_handle_move(struct bch_fs *, struct ec_stripe_handle *,
+			     struct ec_stripe_handle *);
 
 #endif /* _BCACHEFS_DATA_EC_TRIGGER_H */
 

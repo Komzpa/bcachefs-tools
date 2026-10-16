@@ -6,6 +6,8 @@
 #include "sb/members.h"
 #include "util/eytzinger.h"
 
+#include "alloc/accounting_defs_gen.h"
+
 static inline void bch2_u64s_neg(u64 *v, unsigned nr)
 {
 	for (unsigned i = 0; i < nr; i++)
@@ -97,11 +99,6 @@ static inline struct bpos disk_accounting_pos_to_bpos(struct disk_accounting_pos
 	return p;
 }
 
-int bch2_disk_accounting_mod_normal(struct btree_trans *, struct disk_accounting_pos *,
-			     s64 *, unsigned);
-int bch2_disk_accounting_mod_gc(struct btree_trans *, struct disk_accounting_pos *,
-			     s64 *, unsigned);
-
 static inline int bch2_disk_accounting_mod(struct btree_trans *trans,
 			     struct disk_accounting_pos *k,
 			     s64 *d, unsigned nr, bool gc)
@@ -137,7 +134,6 @@ void bch2_accounting_swab(const struct bch_fs *, struct bkey_s);
 	.key_validate	= bch2_accounting_validate,	\
 	.val_to_text	= bch2_accounting_to_text,	\
 	.swab		= bch2_accounting_swab,		\
-	.min_val_size	= 8,				\
 })
 
 int bch2_accounting_update_sb(struct btree_trans *);
@@ -148,12 +144,6 @@ static inline int accounting_pos_cmp(const void *_l, const void *_r)
 
 	return bpos_cmp(*l, *r);
 }
-
-enum bch_accounting_mode {
-	BCH_ACCOUNTING_normal,
-	BCH_ACCOUNTING_gc,
-	BCH_ACCOUNTING_read,
-};
 
 int bch2_accounting_mem_insert(struct bch_fs *, struct bkey_s_c_accounting, enum bch_accounting_mode);
 int bch2_accounting_mem_insert_locked(struct bch_fs *, struct bkey_s_c_accounting, enum bch_accounting_mode);

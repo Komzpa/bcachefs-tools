@@ -6,14 +6,8 @@
 
 #include <linux/version.h>
 
-#include "data/write_types.h"
-
-struct bch_writepage_io {
-	struct bch_inode_info		*inode;
-
-	/* must be last: */
-	struct bch_write_op		op;
-};
+#include "data/write_gen.h"
+#include "vfs/buffered_gen.h"
 
 int bch2_read_single_folio(struct folio *, struct address_space *, bool);
 int bch2_read_folio(struct file *, struct folio *);

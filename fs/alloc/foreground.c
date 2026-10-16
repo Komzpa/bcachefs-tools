@@ -240,8 +240,11 @@ static inline bool is_superblock_bucket(struct bch_fs *c, struct bch_dev *ca, u6
 
 static void open_bucket_free_unused(struct bch_fs *c, struct open_bucket *ob)
 {
-	BUG_ON(c->allocator.open_buckets_partial_nr >=
-	       ARRAY_SIZE(c->allocator.open_buckets_partial));
+	if (unlikely(c->allocator.open_buckets_partial_nr >=
+		     ARRAY_SIZE(c->allocator.open_buckets_partial))) {
+		bch2_open_bucket_put(c, ob);
+		return;
+	}
 
 	scoped_guard(spinlock, &c->allocator.freelist_lock) {
 		guard(rcu)();
@@ -256,6 +259,38 @@ static void open_bucket_free_unused(struct bch_fs *c, struct open_bucket *ob)
 
 	scoped_guard(rcu)
 		bch2_alloc_wake_dev(bch2_dev_have_ref(c, ob->dev));
+}
+
+void bch2_open_bucket_reclaim_unused_partials(struct bch_fs *c, unsigned min_free)
+{
+	struct bch_fs_allocator *a = &c->allocator;
+
+	while (1) {
+		struct open_bucket *ob;
+		unsigned dev;
+
+		scoped_guard(spinlock, &a->freelist_lock) {
+			if (a->open_buckets_nr_free > min_free || !a->open_buckets_partial_nr)
+				return;
+
+			ob = a->open_buckets +
+				a->open_buckets_partial[--a->open_buckets_partial_nr];
+			dev = ob->dev;
+			ob->on_partial_list = false;
+
+			scoped_guard(rcu)
+				bch2_dev_rcu(c, ob->dev)->nr_partial_buckets--;
+		}
+
+		bch2_open_bucket_put(c, ob);
+
+		scoped_guard(rcu) {
+			struct bch_dev *ca = bch2_dev_rcu_noerror(c, dev);
+
+			if (ca)
+				bch2_alloc_wake_dev(ca);
+		}
+	}
 }
 
 static inline bool may_alloc_bucket(struct bch_fs *c,
@@ -288,9 +323,9 @@ static inline bool may_alloc_bucket_journal_seq(struct bch_fs *c,
 	return true;
 }
 
-static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
-					      struct alloc_request *req,
-					      u64 bucket, u8 gen)
+static struct open_bucket *try_alloc_bucket_locked(struct bch_fs *c,
+						   struct alloc_request *req,
+						   u64 bucket, u8 gen)
 {
 	struct bch_dev *ca = req->ca;
 
@@ -302,6 +337,7 @@ static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 		return NULL;
 	}
 
+	bch2_open_bucket_reclaim_unused_partials(c, bch2_open_buckets_reserved(req->watermark));
 	guard(spinlock)(&c->allocator.freelist_lock);
 
 	if (unlikely(c->allocator.open_buckets_nr_free <= bch2_open_buckets_reserved(req->watermark))) {
@@ -309,13 +345,9 @@ static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 
 		if (req->cl) {
 			closure_wait(&c->allocator.open_buckets_wait, req->cl);
-			return ERR_PTR(alloc_trace_add(req, U8_MAX,
-					bch_err_throw(c, open_bucket_alloc_blocked),
-					0, 0, false));
+			return ERR_PTR(bch_err_throw(c, open_bucket_alloc_blocked));
 		} else {
-			return ERR_PTR(alloc_trace_add(req, U8_MAX,
-					bch_err_throw(c, open_buckets_empty),
-					0, 0, false));
+			return ERR_PTR(bch_err_throw(c, open_buckets_empty));
 		}
 	}
 
@@ -342,6 +374,28 @@ static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
 	track_event_change(&c->times[BCH_TIME_blocked_allocate_open_bucket], false);
 	track_event_change(&c->times[BCH_TIME_blocked_allocate], false);
 
+	return ob;
+}
+
+static struct open_bucket *__try_alloc_bucket(struct bch_fs *c,
+					      struct alloc_request *req,
+					      u64 bucket, u8 gen)
+{
+	struct bch_dev *ca = req->ca;
+
+	if (unlikely(is_superblock_bucket(c, ca, bucket)))
+		return NULL;
+
+	if (unlikely(bch2_bucket_nouse(ca, bucket))) {
+		req->counters.skipped_nouse++;
+		return NULL;
+	}
+
+	struct open_bucket *ob = try_alloc_bucket_locked(c, req, bucket, gen);
+
+	/* Not under freelist_lock: the trace is a darray, and pushing can allocate */
+	if (IS_ERR(ob))
+		alloc_trace_add(req, U8_MAX, PTR_ERR(ob), 0, 0, false);
 	return ob;
 }
 
@@ -741,6 +795,9 @@ static bool req_dev_sizes_mismatched(struct bch_fs *c, struct alloc_request *req
  * already has) instead of waiting on freelist_wait. Bails iff the request
  * has at least one replica's worth to commit AND any of:
  *
+ *  - the device has left rw_devs: bch2_dev_allocator_remove() is waiting for
+ *    our open buckets. (Not ca->mi.state, which isn't updated until after.)
+ *
  *  - copygc_can_make_progress is false: the per-device check (set above by
  *    the caller from bch2_copygc_can_make_progress(ca)) says copygc can't
  *    free buckets here. No reason to wait — copygc isn't going to help.
@@ -767,7 +824,8 @@ static bool req_alloc_should_bail(struct bch_fs *c, struct alloc_request *req)
 	if (!have_replicas)
 		return false;
 
-	return !req->copygc_can_make_progress ||
+	return !test_bit(req->ca->dev_idx, c->allocator.rw_devs[req->data_type].d) ||
+	       !req->copygc_can_make_progress ||
 	       (req->watermark == BCH_WATERMARK_copygc &&
 		req->data_type != BCH_DATA_btree) ||
 	       req_dev_sizes_mismatched(c, req);

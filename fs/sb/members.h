@@ -2,7 +2,7 @@
 #ifndef _BCACHEFS_SB_MEMBERS_H
 #define _BCACHEFS_SB_MEMBERS_H
 
-#include "btree/bkey_types.h"
+#include "btree/bkey_gen.h"
 #include "util/enumerated_ref.h"
 #include "util/darray.h"
 
@@ -38,13 +38,6 @@ static inline struct bch_member bch2_members_v1_get(struct bch_sb_field_members_
 }
 
 int bch2_sb_members_v2_init(struct bch_fs *c);
-int bch2_sb_members_cpy_v2_v1(struct bch_sb_handle *disk_sb);
-struct bch_member *bch2_members_v2_get_mut(struct bch_sb *sb, int i);
-struct bch_member bch2_sb_member_get(struct bch_sb *sb, int i);
-
-void bch2_member_to_text(struct printbuf *, struct bch_member *,
-			 struct bch_sb_field_disk_groups *,
-			 struct bch_sb *, unsigned);
 
 /* Superblock only - usable before the filesystem has been opened: */
 void bch2_member_to_text_short_sb(struct printbuf *, struct bch_member *,
@@ -416,8 +409,6 @@ static inline bool bch2_member_exists(struct bch_sb *sb, unsigned dev)
 	return false;
 }
 
-unsigned bch2_sb_nr_devices(const struct bch_sb *);
-
 static inline struct bch_member_cpu bch2_mi_to_cpu(struct bch_member *mi)
 {
 	return (struct bch_member_cpu) {
@@ -496,6 +487,8 @@ static inline bool bch2_dev_btree_bitmap_marked_sectors_any(struct bch_dev *ca, 
 bool bch2_dev_btree_bitmap_marked(struct bch_fs *, struct bkey_s_c);
 bool bch2_dev_btree_bitmap_marked_nogc(struct bch_fs *, struct bkey_s_c);
 
+#include "sb/members_defs_gen.h"
+
 struct sb_write;
 void bch2_dev_btree_bitmap_mark_locked(struct bch_fs *, struct bkey_s_c, struct sb_write *);
 void bch2_dev_btree_bitmap_mark(struct bch_fs *, struct bkey_s_c);
@@ -508,13 +501,6 @@ void bch2_maybe_schedule_btree_bitmap_gc(struct bch_fs *);
 
 int bch2_sb_member_alloc(struct bch_fs *);
 void bch2_sb_members_clean_deleted(struct bch_fs *);
-
-struct bch_dev_identity {
-	char name[sizeof(((struct bch_member *) NULL)->device_name) + 1];
-	char model[sizeof(((struct bch_member *) NULL)->device_model) + 1];
-	char serial[sizeof(((struct bch_member *) NULL)->device_serial) + 1];
-	bool rotational;
-};
 
 void bch2_dev_mi_field_read(struct bch_dev *, struct bch_dev_identity *);
 void bch2_dev_mi_field_upgrades_locked(struct bch_fs *, struct bch_dev *,
