@@ -15,7 +15,7 @@
 #include "alloc/accounting.h"
 #include "btree/write_buffer.h"
 #include "data/reconcile/trigger.h"
-#include "data/reflink_format.h"
+#include "data/reflink_format_gen.h"
 
 #include "init/chardev.h"
 #include "init/fs.h"
@@ -795,27 +795,24 @@ static int bch2_readdir_flags_emit(const struct qstr *name, u64 inum,
 				   u8 d_type,
 				   char __user *buf, u32 buf_size, u32 *used)
 {
-	u32 name_offset = offsetof(struct bch_ioctl_readdir_entry, name);
-	u32 name_bytes = name->len + 1;
-	u32 reclen = ALIGN(name_offset + name_bytes, 8);
-
-	if (*used + reclen > buf_size)
-		return -BCH_ERR_readdir_buf_full;
-
 	struct bch_ioctl_readdir_entry ent = {
-		.inum		= inum,
+		.reclen		= ALIGN(sizeof(ent) + name->len + 1, 8),
 		.d_type		= d_type,
-		.name_len	= name_bytes,
+		.inum		= inum,
 	};
 
-	try(copy_to_user_errcode(buf + *used, &ent, name_offset));
-	try(copy_to_user_errcode(buf + *used + name_offset, name->name, name->len));
+	if (*used + ent.reclen > buf_size)
+		return -BCH_ERR_readdir_buf_full;
 
-	u32 written = name_offset + name->len;
-	if (clear_user(buf + *used + written, reclen - written))
+	try(copy_to_user_errcode(buf + *used, &ent, sizeof(ent)));
+	try(copy_to_user_errcode(buf + *used + sizeof(ent), name->name, name->len));
+
+	/* The NUL, and padding to the next entry */
+	u32 written = sizeof(ent) + name->len;
+	if (clear_user(buf + *used + written, ent.reclen - written))
 		return -EFAULT;
 
-	*used += reclen;
+	*used += ent.reclen;
 	return 0;
 }
 
@@ -1434,6 +1431,7 @@ static long bch2_ioc_set_reflink_p_may_update_opts(struct bch_fs *c,
 	subvol_inum inum = inode_inum(inode);
 
 	CLASS(btree_trans, trans)(c);
+	CLASS(disk_reservation, res)(c);
 
 	return for_each_btree_key_in_subvolume_max(trans, iter,
 			BTREE_ID_extents,
@@ -1442,6 +1440,8 @@ static long bch2_ioc_set_reflink_p_may_update_opts(struct bch_fs *c,
 			inum.subvol,
 			BTREE_ITER_intent, k, ({
 		int ret = 0;
+		bch2_disk_reservation_put(c, &res.r);
+
 		if (k.k->type == KEY_TYPE_reflink_p &&
 		    !REFLINK_P_MAY_UPDATE_OPTIONS(bkey_s_c_to_reflink_p(k).v)) {
 			struct bkey_i_reflink_p *p =
@@ -1449,7 +1449,7 @@ static long bch2_ioc_set_reflink_p_may_update_opts(struct bch_fs *c,
 			ret = PTR_ERR_OR_ZERO(p);
 			if (!ret) {
 				SET_REFLINK_P_MAY_UPDATE_OPTIONS(&p->v, true);
-				ret = bch2_trans_commit(trans, NULL, NULL,
+				ret = bch2_trans_commit(trans, &res.r, NULL,
 							BCH_TRANS_COMMIT_no_enospc);
 			}
 			if (!ret) {

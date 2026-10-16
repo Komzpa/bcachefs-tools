@@ -25,6 +25,7 @@ use std::process;
 use anyhow::{anyhow, bail, Result};
 use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
+use bcachefs_kernel::util::vstructs::Validated;
 use bcachefs_kernel::fs::Fs;
 use bcachefs_kernel::sb::sb_field_type;
 use bcachefs_kernel::{metadata_version, opt_id};
@@ -68,11 +69,11 @@ pub(crate) fn version_to_string(v: u32) -> String {
 
 fn format_usage() {
     let fs_opts = opts_usage_str(
-        c::opt_flags::OPT_FORMAT as u32 | c::opt_flags::OPT_FS as u32,
-        c::opt_flags::OPT_DEVICE as u32,
+        c::opt_flags::OPT_FORMAT.bits() | c::opt_flags::OPT_FS.bits(),
+        c::opt_flags::OPT_DEVICE.bits(),
     );
     let dev_opts = opts_usage_str(
-        c::opt_flags::OPT_DEVICE as u32,
+        c::opt_flags::OPT_DEVICE.bits(),
         0,
     );
 
@@ -231,9 +232,9 @@ fn warn_same_parent_disk_replicas(cfg: &FormatConfig, devices: &[DevOpts]) {
 }
 
 fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
-    let opt_flags = c::opt_flags::OPT_FORMAT as u32
-        | c::opt_flags::OPT_FS as u32
-        | c::opt_flags::OPT_DEVICE as u32;
+    let opt_flags = c::opt_flags::OPT_FORMAT.bits()
+        | c::opt_flags::OPT_FS.bits()
+        | c::opt_flags::OPT_DEVICE.bits();
 
     let mut devices: Vec<DevConfig> = Vec::new();
     let mut force = false;
@@ -305,7 +306,7 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
             let name = raw_name.replace('-', "_");
 
             if let Some((opt_id, opt, negated)) = bch_opt_lookup_negated(&name) {
-                if opt.flags as u32 & opt_flags != 0 {
+                if opt.flags.bits() & opt_flags != 0 {
                     let val_str = if negated {
                         "0".to_string()
                     } else if let Some(v) = inline_val {
@@ -321,7 +322,7 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
                             // Value needs a superblock to resolve against
                             // (labels, targets); device option values are
                             // per device, fs option values resolve once:
-                            if opt.flags as u32 & c::opt_flags::OPT_DEVICE as u32 != 0 {
+                            if opt.flags.bits() & c::opt_flags::OPT_DEVICE.bits() != 0 {
                                 push_dev_opt_str!(opt_id, val_str);
                             } else {
                                 deferred_opts.push((opt_id, val_str));
@@ -337,10 +338,10 @@ fn parse_format_args(argv: Vec<String>) -> Result<FormatConfig> {
                             // the string silently:
                             if opt.type_ == c::opt_type::BCH_OPT_STR_MEMBER {
                                 push_dev_opt_str!(opt_id, val_str);
-                            } else if opt.flags as u32 & c::opt_flags::OPT_DEVICE as u32 != 0 {
+                            } else if opt.flags.bits() & c::opt_flags::OPT_DEVICE.bits() != 0 {
                                 bcachefs_kernel::opts::opt_set_by_id(&mut cur_dev_opts, opt_id, v);
                                 unconsumed_dev_option = true;
-                            } else if opt.flags as u32 & c::opt_flags::OPT_FS as u32 != 0 {
+                            } else if opt.flags.bits() & c::opt_flags::OPT_FS.bits() != 0 {
                                 bcachefs_kernel::opts::opt_set_by_id(&mut fs_opts, opt_id, v);
                             }
                         }
@@ -632,9 +633,8 @@ fn cmd_format(argv: Vec<String>) -> Result<()> {
             256 << 10
         };
 
-        let bits = unsafe {
-            c::bch2_shard_inode_numbers_bits_default(nr_cpus, total_fs_size, btree_node_bytes)
-        } as u64;
+        let bits = bcachefs_kernel::inode::shard_bits_default(nr_cpus, total_fs_size,
+                                                              btree_node_bytes) as u64;
         bcachefs_kernel::opts::opt_set_by_id(
             &mut cfg.fs_opts,
             opt_id::shard_inode_numbers_bits,
@@ -652,7 +652,9 @@ fn cmd_format(argv: Vec<String>) -> Result<()> {
         let mut buf = Printbuf::new();
         buf.set_human_readable(true);
         let fields = sb_field_type::members_v2.bit();
-        unsafe { crate::wrappers::sb_display::sb_to_text_with_names(&mut buf, std::ptr::null_mut(), &*sb, false, fields, -1) };
+        // SAFETY: the superblock format() built, as long as its count says
+        let sb = unsafe { c::bch_sb::<Validated>::from_ffi(sb) };
+        unsafe { crate::wrappers::sb_display::sb_to_text_with_names(&mut buf, std::ptr::null_mut(), sb, false, fields, -1) };
         print!("{}", buf);
     }
     unsafe { libc::free(sb as *mut _) };

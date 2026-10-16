@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _BCACHEFS_RECOVERY_H
 #define _BCACHEFS_RECOVERY_H
+#include "init/recovery_gen.h"
 
 int bch2_btree_lost_data(struct bch_fs *, struct printbuf *, enum btree_id);
-void bch2_set_btree_clean(struct bch_fs *, enum btree_id);
-void bch2_clear_btree_clean(struct bch_fs *, enum btree_id);
 void bch2_ignore_journal_rewind_errors(struct bch_fs *);
 
 int bch2_set_may_go_rw(struct bch_fs *);

@@ -1,0 +1,341 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# bcachefs's Rust, for the kernel build; included from fs/Makefile. mod.o is
+# a member object of bcachefs.ko. It include!s the bindings to the kernel APIs
+# kernel::bindings doesn't cover (rust/bindings.rs), with C wrappers for those
+# that are static inlines (rust/extern.c): codegen.rs, the kernel's counterpart
+# of bcachefs-shim, built and run as a host tool.
+#
+# It builds against the kernel's own Rust, or failing that our vendored copy
+# (Makefile.rust.vendor); failing both, say why. BCACHEFS_RUST_VENDOR=1 forces
+# the vendored one, for testing.
+
+# Can we build against the kernel's Rust, or our own? "y", or why not.
+bch-rust-available = $(shell RUSTC='$(RUSTC)' HOSTRUSTC='$(HOSTRUSTC)'	\
+	BINDGEN='$(BINDGEN)' CC='$(CC)' KERNEL_SRC='$(srctree)'		\
+	KERNEL_OBJ='$(objtree)' CONFIG_RUSTC_VERSION='$(CONFIG_RUSTC_VERSION)' \
+	RUST_LIB_SRC='$(RUST_LIB_SRC)'						\
+	RUSTC_MIN=1.85.0 $(CONFIG_SHELL) $(src)/scripts/rust-available.sh $(1))
+
+# Why the kernel's Rust can't be used, or empty.
+ifndef CONFIG_RUST
+bcachefs-kernel-rust-why := kernel $(KERNELVERSION) was built without CONFIG_RUST
+else ifeq ($(BCACHEFS_RUST_VENDOR),1)
+bcachefs-kernel-rust-why := vendored Rust forced with BCACHEFS_RUST_VENDOR=1
+else ifdef BCACHEFS_DKMS
+bcachefs-kernel-rust-why := $(filter-out y,$(call bch-rust-available,kernel))
+# --target: on x86 a generated scripts/target.json, which headers may lack.
+bcachefs-kernel-rust-target := $(patsubst --target=%,%,$(filter --target=%.json,$(KBUILD_RUSTFLAGS)))
+ifeq ($(bcachefs-kernel-rust-why),)
+bcachefs-kernel-rust-why := $(if $(filter-out $(wildcard $(bcachefs-kernel-rust-target)),$(bcachefs-kernel-rust-target)),missing $(bcachefs-kernel-rust-target))
+endif
+else
+# In-tree, the kernel's Rust matches by construction; we still need bindgen.
+bcachefs-kernel-rust-why := $(if $(shell command -v $(BINDGEN) 2>/dev/null),,bindgen ($(BINDGEN)) not found)
+endif
+
+# The on-disk format's endian integers are zerocopy's, which the kernel's Rust
+# has only had since 7.2:
+ifeq ($(bcachefs-kernel-rust-why),)
+bcachefs-kernel-rust-why := $(if $(wildcard $(objtree)/rust/libzerocopy.rmeta),,kernel $(KERNELVERSION)'s Rust has no zerocopy)
+endif
+
+# Paranoid FineIBT (x86; cfi=auto on IBT hardware without FRED) rewrites each
+# kCFI indirect call site as 20 bytes, taking the thunk call to be 6, as
+# -mindirect-branch-cs-prefix makes C's. The kernel passes rustc no equivalent
+# (as of 7.3), so Rust's are 5 and the byte after each is clobbered at boot,
+# vmlinux's own core::fmt included. The vendored stack is built with
+# -Zindirect-branch-cs-prefix, and doesn't call into the kernel's Rust.
+ifeq ($(bcachefs-kernel-rust-why),)
+ifdef CONFIG_FINEIBT
+bcachefs-kernel-rust-why := $(if $(filter -Zindirect-branch-cs-prefix,$(KBUILD_RUSTFLAGS)),,kernel $(KERNELVERSION)'s Rust is built without -Zindirect-branch-cs-prefix and breaks under paranoid FineIBT)
+endif
+endif
+
+ifneq ($(bcachefs-kernel-rust-why),)
+bcachefs-vendor-rust-probe := $(call bch-rust-available,vendored)
+ifeq ($(bcachefs-vendor-rust-probe),y)
+bcachefs-vendor-rust := y
+else ifneq ($(.DEFAULT_GOAL),__clean)
+# (Not on clean: kbuild reads this then without the kernel config.) Both
+# reasons: "no CONFIG_RUST" alone sends people asking their distro for it,
+# when installing rust-src may be all that's needed.
+$(error bcachefs requires Rust. Can't use the kernel's Rust: $(bcachefs-kernel-rust-why). Can't build bcachefs' own copy either: $(bcachefs-vendor-rust-probe))
+endif
+endif
+
+# Where the leaf crates find core: the kernel's, or the vendored stack's - never
+# both, or rustc may pick a stale one (E0464).
+bch-rust-L := -L$(objtree)/rust
+
+# bindgen has to see the headers as the C build does, or struct layouts diverge
+# silently (NO_BCACHEFS_FS gates bch_fs.vfs; -fplan9-extensions changes struct
+# filename): so the kernel's full C flags, less the ones libclang can't parse.
+# That list is rust/Makefile's bindgen_skip_c_flags, which isn't reachable
+# out-of-tree - keep it in sync.
+#
+# Also dropped: $(CC_FLAGS_LTO), whose -fvisibility=hidden makes bindgen skip
+# every extern; -funsigned-char, so char binds as c_char, as in userspace. -w:
+# CONFIG_WERROR, and clang's noise on kernel headers. No NOSTDINC_FLAGS: libclang
+# brings its own freestanding headers. -D__BINDGEN__ as the kernel's bindgen
+# sets it; -DRUST_BINDGEN swaps DECLARE_FLEX_ARRAY for a layout-identical s[0].
+bcachefs-codegen-skip-cflags := \
+	-mno-fp-ret-in-387 -mpreferred-stack-boundary=% \
+	-mskip-rax-setup -mgeneral-regs-only -msign-return-address=% \
+	-mindirect-branch=thunk-extern -mindirect-branch-register \
+	-mfunction-return=thunk-extern -mrecord-mcount -mabi=lp64 \
+	-mindirect-branch-cs-prefix -mstack-protector-guard% -mtraceback=no \
+	-mno-pointers-to-nested-functions -mno-string \
+	-mno-strict-align -mstrict-align -mdirect-extern-access \
+	-mexplicit-relocs -mno-check-zero-division \
+	-fconserve-stack -falign-jumps=% -falign-loops=% \
+	-femit-struct-debug-baseonly -fno-ipa-cp-clone -fno-ipa-sra \
+	-fno-partial-inlining -fplugin-arg-arm_ssp_per_task_plugin-% \
+	-fno-reorder-blocks -fno-allow-store-data-races -fasan-shadow-offset=% \
+	-fzero-call-used-regs=% -fno-stack-clash-protection \
+	-fno-inline-functions-called-once -fsanitize=bounds-strict \
+	-fstrict-flex-arrays=% -fmin-function-alignment=% \
+	-fzero-init-padding-bits=% -mno-fdpic \
+	-fdiagnostics-show-context -fdiagnostics-show-context=% \
+	--param=% --param asan-% -fno-isolate-erroneous-paths-dereference \
+	$(CC_FLAGS_LTO)
+
+# For cross builds, compute a target to pass to bindgen. We cannot use kernel's
+# per-arch BINDGEN_TARGET table as it isn't reachable from here (or from an
+# out-of-tree build). Instead of duplicating it, under LLVM=1, --target is
+# already in $(KBUILD_CPPFLAGS) and thus there's nothing to add.
+# For GCC, query the target from the cross compiler. The GCC target triple is
+# sometimes different from LLVM, but it is good enough for bindgen/libclang
+# for all supported arches. Only when cross compiling: a native build's target
+# is the host's, which bindgen defaults to, and a distro GCC's own triple
+# (x86_64-redhat-linux, x86_64-pc-linux-gnu, ...) is one more thing that could
+# go wrong in the build every DKMS install does.
+bcachefs-codegen-target := $(if $(CONFIG_CC_IS_CLANG),,$(if $(CROSS_COMPILE),--target=$(shell $(CC) -dumpmachine)))
+
+bcachefs-codegen-cflags := \
+	$(LINUXINCLUDE) $(KBUILD_CPPFLAGS) \
+	$(filter-out -funsigned-char $(bcachefs-codegen-skip-cflags),$(KBUILD_CFLAGS)) \
+	$(bcachefs-config-cppflags) \
+	-I$(src) -I$(obj)/rust -include $(srctree)/include/linux/compiler_types.h \
+	-w -D__BINDGEN__ -DRUST_BINDGEN $(bcachefs-codegen-target)
+
+# Types from outside fs/ are blocklisted, and come from kernel::bindings (as
+# userspace gets them from bcachefs-shim).
+bcachefs-codegen-blocklist := \
+	$(srctree)/include:$(objtree)/include:$(srctree)/arch/$(SRCARCH)/include:$(objtree)/arch/$(SRCARCH)/include
+
+# The codegen tool: plain host rustc, linked with $(HOSTCC) as kbuild's host
+# Rust is. codegen_main.rs include!s codegen.rs.
+quiet_cmd_bch_codegen_host = HOSTRUSTC $@
+      cmd_bch_codegen_host = $(HOSTRUSTC) --edition 2021 -O \
+	-Clinker-flavor=gcc -Clinker=$(HOSTCC) $< -o $@
+
+$(obj)/codegen: $(src)/codegen_main.rs $(src)/codegen.rs FORCE
+	$(call if_changed,bch_codegen_host)
+
+# The clang flags go after --, as separate words, exactly as the C compile gets
+# them: quoting them as one argument breaks flags with embedded quotes (arm64's
+# -DARM64_ASM_ARCH='"armv8.5-a"').
+#
+# We do not pass codegen tool's own --target, since non-empty clang driver args
+# always override it.
+quiet_cmd_bch_codegen = CODEGEN $(obj)/rust
+      cmd_bch_codegen = $(obj)/codegen --out $(obj)/rust \
+	--blocklist '$(bcachefs-codegen-blocklist)' \
+	-- $(bcachefs-codegen-cflags)
+
+# The vendored header it binds is a prerequisite: if_changed ignores FORCE, so
+# an edit to it wouldn't otherwise regenerate the bindings. (Kernel-header edits
+# ride in via a cflags or tool change, or a full rebuild.)
+$(obj)/rust/bindings.rs: $(obj)/codegen $(src)/vendor/closure.h FORCE
+	$(call if_changed,bch_codegen)
+
+# extern.c, from the same run: bindgen's wrappers have no prototypes, and its
+# warnings shouldn't fail CONFIG_WERROR builds - it's generated code (#819).
+$(obj)/rust/extern.c: $(obj)/rust/bindings.rs ;
+CFLAGS_rust/extern.o += -Wno-missing-prototypes -Wno-missing-declarations \
+			-Wno-error
+
+# mod.rs tests cfg(kernel), to take the kernel-compat types from the kernel
+# crate (userspace has bcachefs-shim), and __KERNEL__, as C does.
+RUSTFLAGS_mod.o += --cfg kernel --cfg __KERNEL__
+# And our CONFIG defines, which the kernel's rustc_cfg doesn't have, not being
+# in its .config: -DCONFIG_FOO=1 is --cfg CONFIG_FOO. The Rust tests them as
+# the C does, and a define one side sees and the other doesn't is code that
+# exists on one side only.
+RUSTFLAGS_mod.o += $(foreach f,$(bcachefs-config-cppflags),--cfg $(firstword $(subst =, ,$(patsubst -D%,%,$(f)))))
+
+# In kernel 7.3+, pin-init unified PinInit to use __init instead of __pinned_init
+# in-kernel.
+ifneq ($(bcachefs-vendor-rust),y)
+bch-pin-init-v2 := $(shell [ -f $(objtree)/rust/libpin_init.rmeta ] && \
+	! grep -qa "__pinned_init" $(objtree)/rust/libpin_init.rmeta 2>/dev/null && echo y)
+ifeq ($(bch-pin-init-v2),y)
+RUSTFLAGS_mod.o += --cfg bch_pin_init_v2
+endif
+endif
+
+# ---- crates kbuild doesn't build for us -------------------------------------
+# These, and Makefile.rust.vendor's. The crate name comes from the target -
+# foo.o, libfoo.so, libfoo.rmeta; per target, rs-flags (externs, cfgs) and
+# rs-edition (default 2021).
+#
+# The cfgs describing the kernel config and its rustc; Makefile.rust.vendor
+# points this at a copy describing ours.
+bch-rustc-cfg = $(objtree)/include/generated/rustc_cfg
+bch-crate = $(patsubst lib%,%,$(basename $(notdir $@)))
+bch-edition = --edition=$(or $(rs-edition),2021)
+
+# Kernel-side rlibs, linked into bcachefs.ko, with kbuild's per-object flags
+# (KASAN, KCOV, RUSTFLAGS_foo.o) as the kernel builds its own crates.
+quiet_cmd_bch_rlib = RUSTC L  $@
+      cmd_bch_rlib = $(rs-env) $(RUSTC) $(filter-out --edition=%,$(_rust_flags)) \
+	@$(bch-rustc-cfg) $(bch-edition) $(rs-flags) -Zunstable-options \
+	--sysroot=/dev/null $(bch-rust-L) --crate-type rlib --crate-name $(bch-crate) \
+	--emit=dep-info=$(depfile) --emit=metadata=$(dir $@)lib$(bch-crate).rmeta \
+	--emit=obj=$@ $<$(rs-post)
+
+# Proc-macros, for the host.
+quiet_cmd_bch_procmacro = RUSTC P  $@
+      cmd_bch_procmacro = $(RUSTC) $(filter-out --edition=%,$(rust_common_flags)) \
+	@$(bch-rustc-cfg) $(bch-edition) $(rs-flags) \
+	-Clinker-flavor=gcc -Clinker=$(HOSTCC) \
+	-Clink-args='$(call escsq,$(KBUILD_PROCMACROLDFLAGS))' \
+	--extern proc_macro --crate-type proc-macro --crate-name $(bch-crate) \
+	--emit=dep-info=$(depfile) --emit=link=$@ $<
+
+# Our rustc's version, as CONFIG_RUSTC_VERSION has it: 1.85.0 is 108500.
+bch-rustc-version := $(shell $(RUSTC) --version 2>/dev/null | \
+	awk '{ split($$2, v, "."); print v[1] * 100000 + v[2] * 100 + v[3] }')
+bch-rustc-min = $(shell [ "$(bch-rustc-version)" -ge $(1) ] 2>/dev/null && echo y)
+
+# proc-macro2, quote, syn: host rlibs, for the proc-macros - bitfield-struct's
+# here, the vendored stack's in Makefile.rust.vendor - with either Rust: the
+# kernel doesn't ship its own built for the host. From the vendored stack's
+# sources.
+bch-host := $(obj)/rust-host
+bch-host-src := $(src)/vendor/kernel-rust
+
+quiet_cmd_bch_host = RUSTC H  $@
+      cmd_bch_host = $(RUSTC) $(filter-out --edition=%,$(rust_common_flags)) \
+	$(bch-edition) $(rs-flags) --cap-lints=allow -L$(bch-host) \
+	--crate-type rlib --crate-name $(bch-crate) --emit=dep-info=$(depfile) \
+	--emit=metadata=$@ --emit=link=$(bch-host)/lib$(bch-crate).rlib $<
+
+$(bch-host)/libproc_macro2.rmeta: private rs-flags := --cfg 'feature="proc-macro"' \
+	--cfg wrap_proc_macro \
+	$(if $(call bch-rustc-min,108800),--cfg proc_macro_span_file --cfg proc_macro_span_location)
+$(bch-host)/libproc_macro2.rmeta: $(bch-host-src)/proc-macro2/lib.rs FORCE
+	$(call if_changed_dep,bch_host)
+
+$(bch-host)/libquote.rmeta: private rs-edition := 2018
+$(bch-host)/libquote.rmeta: private rs-flags := --cfg 'feature="proc-macro"' \
+	--extern proc_macro2=$(bch-host)/libproc_macro2.rlib
+$(bch-host)/libquote.rmeta: $(bch-host-src)/quote/lib.rs $(bch-host)/libproc_macro2.rmeta FORCE
+	$(call if_changed_dep,bch_host)
+
+$(bch-host)/libsyn.rmeta: private rs-flags := $(foreach f,clone-impls derive extra-traits \
+	full parsing printing proc-macro visit visit-mut,--cfg 'feature="$(f)"') \
+	--extern proc_macro2=$(bch-host)/libproc_macro2.rlib --extern quote=$(bch-host)/libquote.rlib
+$(bch-host)/libsyn.rmeta: $(bch-host-src)/syn/lib.rs $(bch-host)/libquote.rmeta FORCE
+	$(call if_changed_dep,bch_host)
+
+# The proc-macros on them:
+bch-pmac := --cap-lints=allow -L$(bch-host) --extern proc_macro2=$(bch-host)/libproc_macro2.rlib \
+	--extern quote=$(bch-host)/libquote.rlib --extern syn=$(bch-host)/libsyn.rlib
+bch-pmac-deps := $(bch-host)/libsyn.rmeta FORCE
+
+# Vendored crates get --cap-lints=allow: the kernel's lints are about how our
+# own code is written, not whether someone else's is correct (as cargo does for
+# dependencies) - and a rustc bump would otherwise break the build (#830).
+# cstruct-macros is ours, and gets the lints.
+$(obj)/libpaste.so $(obj)/bitfield.o $(obj)/bitflags.o $(obj)/uuid.o: private rs-flags := --cap-lints=allow
+$(obj)/libbitfield_struct.so $(obj)/libnestify.so: private rs-flags := $(bch-pmac)
+
+$(obj)/libpaste.so: $(src)/vendor/paste/src/lib.rs FORCE
+	$(call if_changed_dep,bch_procmacro)
+# cstruct-macros include!s its parser from types/cstruct.rs: the dep-info
+# tracks it.
+$(obj)/libcstruct_macros.so: $(src)/cstruct-macros/src/lib.rs FORCE
+	$(call if_changed_dep,bch_procmacro)
+$(obj)/libbitfield_struct.so: $(src)/vendor/bitfield-struct/src/lib.rs $(bch-pmac-deps)
+	$(call if_changed_dep,bch_procmacro)
+# nestify: tagged_union! hands it the arm types defined in its block.
+# fs/vendor/nestify is a commit of our fork, exactly: scripts/vendor.sh.
+$(obj)/libnestify.so: $(src)/vendor/nestify/src/lib.rs $(bch-pmac-deps)
+	$(call if_changed_dep,bch_procmacro)
+
+$(obj)/bitfield.o: $(src)/vendor/bitfield/src/lib.rs FORCE
+	$(call if_changed_dep,bch_rlib)
+$(obj)/bitflags.o: $(src)/vendor/bitflags/src/lib.rs FORCE
+	$(call if_changed_dep,bch_rlib)
+$(obj)/uuid.o: $(src)/vendor/uuid/src/lib.rs FORCE
+	$(call if_changed_dep,bch_rlib)
+
+# mod.o gets them as externs, and the codegen output via OUT_DIR, as in
+# userspace - and the crate's directory as cargo gives it, CARGO_MANIFEST_DIR,
+# which c_xmacro_from_c! reads C's headers relative to.
+bch-externs := paste:libpaste.so \
+	cstruct_macros:libcstruct_macros.so bitfield_struct:libbitfield_struct.so \
+	nestify:libnestify.so \
+	bitfield:libbitfield.rmeta bitflags:libbitflags.rmeta uuid:libuuid.rmeta
+RUSTFLAGS_mod.o += $(foreach e,$(bch-externs),--extern $(subst :,=$(obj)/,$(e)))
+$(obj)/mod.o: export OUT_DIR := $(abspath $(obj)/rust)
+$(obj)/mod.o: export CARGO_MANIFEST_DIR := $(abspath $(src))
+$(obj)/mod.o: $(obj)/rust/bindings.rs $(obj)/libpaste.so \
+	$(obj)/libcstruct_macros.so $(obj)/libbitfield_struct.so $(obj)/libnestify.so \
+	$(obj)/bitfield.o $(obj)/bitflags.o $(obj)/uuid.o
+
+# mod.o carries the records of the types defined in Rust that C shares
+# (types/lib.rs), in .discard.bch_cstruct: the headers are generated from them,
+# and linking the module discards them.
+RUSTFLAGS_mod.o += --cfg bch_cstruct_records
+
+targets += codegen rust/bindings.rs libpaste.so \
+	libcstruct_macros.so libbitfield_struct.so libnestify.so bitfield.o bitflags.o uuid.o \
+	$(addprefix rust-host/,libproc_macro2.rmeta libquote.rmeta libsyn.rmeta)
+bcachefs-rust-y := mod.o bitfield.o bitflags.o uuid.o
+bcachefs-y += $(bcachefs-rust-y) rust/extern.o
+
+# And what those rules write besides their targets: the rest of the codegen's
+# output, the rlibs' metadata, and the vendored stack's directory - here, as
+# clean doesn't always read Makefile.rust.vendor.
+clean-files += rust rust-host vrust lib*.rmeta
+
+# Makefile.rust.vendor builds mod.o against the vendored stack; otherwise kbuild
+# builds it.
+ifeq ($(bcachefs-vendor-rust),y)
+include $(src)/Makefile.rust.vendor
+endif
+
+# ---- the C of the types defined in Rust ------------------------------------
+# foo/types_gen.h for foo/types.rs (types/lib.rs), written from mod.o's
+# records by rust_types_gen, a host program. In $(obj)/rust, never $(src):
+# userspace generates its own. Every C object waits for them; mod.o and the
+# bindings it's built from can't - they come first.
+#
+# Each record is a section of its own, all of the same name: ld -r makes them
+# one, which objcopy extracts.
+$(obj)/rust_types_gen: $(src)/types/main.rs $(src)/types/cstruct.rs FORCE
+	$(call if_changed,bch_codegen_host)
+
+quiet_cmd_bch_cstruct_gen = GEN     $(obj)/rust/*_gen.h
+      cmd_bch_cstruct_gen = $(LD) -r -o $(obj)/rust/cstruct.o $< && \
+	$(OBJCOPY) -O binary -j .discard.bch_cstruct $(obj)/rust/cstruct.o $(obj)/rust/cstruct.bin && \
+	$(obj)/rust_types_gen $(obj)/rust/cstruct.bin $(src) $(obj)/rust && \
+	touch $@
+
+$(obj)/rust/cstruct.stamp: $(obj)/mod.o $(obj)/rust_types_gen FORCE
+	$(call if_changed,bch_cstruct_gen)
+
+targets += rust_types_gen rust/cstruct.stamp
+
+# After the vendored stack's include: its objects are in bcachefs-y by now.
+subdir-ccflags-y += -I$(obj)/rust
+$(addprefix $(obj)/,$(filter-out $(bcachefs-rust-y) vrust/%,$(bcachefs-y))): | $(obj)/rust/cstruct.stamp
+
+# The headers come from the stamp's recipe: without saying so, make reads their
+# times before it runs, and an object whose header just changed isn't rebuilt.
+# rust_types_gen rewrites only the headers that changed.
+$(obj)/rust/%_gen.h: $(obj)/rust/cstruct.stamp
+	@:

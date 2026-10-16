@@ -1383,3 +1383,64 @@ __sched int bch2_bit_wait_io_timeout(struct wait_bit_key *word, int mode)
 
 	return 0;
 }
+
+/*
+ * For Rust: the kernel's Rust allocator API has no __GFP_NOFAIL. Out of line,
+ * as util/locking.c's shims are, for the same reason.
+ */
+void *rust_kzalloc_nofail(size_t size)
+{
+	return kzalloc(size, GFP_KERNEL|__GFP_NOFAIL);
+}
+
+void rust_kfree(const void *p)
+{
+	kfree(p);
+}
+
+/*
+ * For Rust, what it can't call itself: static inlines and macros, and in
+ * places which of the two differs between the kernel and userspace.
+ */
+u64 bch2_local_clock(void)
+{
+	return local_clock();
+}
+
+u64 bch2_get_random_u64(void)
+{
+	return get_random_u64();
+}
+
+void bch2_ktime_get_coarse_real_ts64(struct timespec64 *ts)
+{
+	ktime_get_coarse_real_ts64(ts);
+}
+
+/* queue_work() is a static inline in the kernel, a function in userspace: */
+bool bch2_queue_work(struct workqueue_struct *wq, struct work_struct *work)
+{
+	return queue_work(wq, work);
+}
+
+/* capable() is a function in the kernel, a macro (true) in userspace's blkdev.h */
+bool bch2_capable(int cap)
+{
+	return capable(cap);
+}
+
+#ifdef __KERNEL__
+#include <linux/cpumask.h>
+#include <linux/numa.h>
+
+/* NUMA_NO_NODE is a macro, nr_cpu_ids a variable - or a macro, without SMP */
+unsigned bch2_cpumask_local_spread(unsigned i)
+{
+	return cpumask_local_spread(i, NUMA_NO_NODE);
+}
+
+unsigned bch2_nr_cpu_ids(void)
+{
+	return nr_cpu_ids;
+}
+#endif

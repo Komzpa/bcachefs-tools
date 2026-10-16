@@ -247,6 +247,32 @@ void __bch2_print(struct bch_fs *c, const char *fmt, ...)
 	va_end(args);
 }
 
+/*
+ * For Rust's ratelimited log macros, which keep a ratelimit_state per call
+ * site as bch2_ratelimit() does, but have to initialize it at runtime:
+ */
+void bch2_ratelimit_state_init(struct ratelimit_state *rs)
+{
+	ratelimit_default_init(rs);
+}
+
+/* __bch2_ratelimit(), with the caller's function name for the "suppressed" message: */
+bool bch2_ratelimit_suppress(struct bch_fs *c, struct ratelimit_state *rs, const char *func)
+{
+	return c->opts.ratelimit_errors && !___ratelimit(rs, func);
+}
+
+/*
+ * For Rust's warn_on!() in the kernel build: the kernel's own warn_on!() pulls
+ * the arch's WARN asm from a file generated in the kernel's build tree
+ * (rust/kernel/generated_arch_warn_asm.rs), which distro headers packages
+ * don't ship, so a DKMS build against them fails:
+ */
+void bch2_rust_warn(const char *file, unsigned line)
+{
+	WARN(1, "WARNING at %s:%u\n", file, line);
+}
+
 static void bch2_fs_release(struct kobject *);
 static void bch2_fs_counters_release(struct kobject *k)
 {
@@ -633,13 +659,16 @@ static int __bch2_fs_read_write(struct bch_fs *c, bool early)
 		  bch2_btree_write_buffer_start(c) ?:
 		  bch2_copygc_start(c) ?:
 		  (!c->opts.read_only
-		   ? bch2_reconcile_start(c)
+		   ? bch2_reconcile_start(c) ?:
+		     (!early ? bch2_dev_start_member_reconcile_scans(c) : 0)
 		   : 0);
 	if (ret) {
 		bch2_fs_read_only(c);
 		return ret;
 	}
 
+	/* copygc was started before recovery, and waits for BCH_FS_rw: */
+	bch2_copygc_wakeup(c);
 	bch2_do_discards_async(c);
 	bch2_do_invalidates(c);
 	bch2_do_stripe_deletes(c);
@@ -689,7 +718,9 @@ static void __bch2_fs_free(struct bch_fs *c)
 	bch2_btree_write_buffer_stop(c);
 	bch2_free_pending_node_rewrites(c);
 	bch2_free_fsck_errs(c);
+	darray_exit(&c->recovery.logged_ops_unfinished);
 	bch2_fs_vfs_exit(c);
+	bch2_fs_subvolumes_exit(c);
 	bch2_fs_snapshots_exit(c);
 	bch2_fs_replicas_exit(c);
 	bch2_fs_reconcile_exit(c);
@@ -1151,25 +1182,6 @@ static int bch2_fs_opt_version_init(struct bch_fs *c, struct printbuf *out)
 			return bch_err_throw(c, EINVAL_version_min_too_old);
 		}
 	}
-
-#ifdef __KERNEL__
-#ifdef CONFIG_BCACHEFS_RUST
-	prt_str(out, "Rust support enabled\n");
-#else
-	/*
-	 * Not CONFIG_RUST: bcachefs vendors its own Rust stack, so a kernel
-	 * built without CONFIG_RUST is fine. What matters is what the module
-	 * build couldn't find, which fs/Makefile records here - telling someone
-	 * to go ask their distribution for CONFIG_RUST when the actual problem
-	 * is a missing bindgen wastes everyone's time.
-	 */
-	prt_str(out, "built without Rust support; this will be required in the near future\n");
-#ifdef BCACHEFS_NO_RUST_REASON
-	prt_printf(out, "  reason: %s\n", BCACHEFS_NO_RUST_REASON);
-#endif
-	prt_str(out, "  rebuild the module with rustc, bindgen and rust-src available to enable it\n");
-#endif
-#endif
 
 	bch2_fs_mi_field_upgrades(c);
 

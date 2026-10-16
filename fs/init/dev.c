@@ -213,6 +213,7 @@
 
 #include "btree/interior.h"
 
+#include "data/ec/create.h"
 #include "data/ec/init.h"
 #include "data/migrate.h"
 #include "data/reconcile/work.h"
@@ -628,7 +629,7 @@ static void bch2_dev_attach(struct bch_fs *c, struct bch_dev *ca,
 			    unsigned dev_idx)
 {
 	ca->dev_idx = dev_idx;
-	__set_bit(ca->dev_idx, ca->self.d);
+	__set_bit(ca->dev_idx, ca->self_mask.d);
 
 	if (!ca->name[0])
 		scnprintf(ca->name, sizeof(ca->name), "dev-%u", dev_idx);
@@ -880,6 +881,10 @@ int __bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
 		? (struct reconcile_scan) { .type = RECONCILE_SCAN_pending }
 		: (struct reconcile_scan) { .type = RECONCILE_SCAN_device, .dev = ca->dev_idx };
 
+	/* empty stripes hold their buckets until deleted: */
+	if (new_state == BCH_MEMBER_STATE_evacuating)
+		bch2_do_stripe_deletes(c);
+
 	if (ca->mi.state == new_state) {
 		if (new_state == BCH_MEMBER_STATE_evacuating)
 			return bch2_set_reconcile_needs_scan(c, s, true);
@@ -956,6 +961,61 @@ int bch2_dev_set_state(struct bch_fs *c, struct bch_dev *ca,
 		return bch_err_throw(c, device_has_been_removed);
 
 	return __bch2_dev_set_state(c, ca, new_state, flags, err);
+}
+
+int bch2_dev_start_member_reconcile_scans(struct bch_fs *c)
+{
+	/*
+	 * Best effort: a failure to queue or record a scan must not fail the
+	 * read-write transition. The member flag is only cleared after the
+	 * scan is queued, so anything that fails here is retried on the next
+	 * read-write transition.
+	 */
+	unsigned nr_devices;
+	scoped_guard(mutex_noio, &c->sb_lock)
+		nr_devices = c->disk_sb.sb->nr_devices;
+
+	for (unsigned dev_idx = 0; dev_idx < nr_devices; dev_idx++) {
+		struct bch_member m;
+
+		scoped_guard(mutex_noio, &c->sb_lock)
+			m = bch2_sb_member_get(c->disk_sb.sb, dev_idx);
+
+		if (!BCH_MEMBER_NEEDS_RECONCILE_SCAN(&m))
+			continue;
+
+		int ret = bch2_set_reconcile_needs_scan(c,
+			(struct reconcile_scan) {
+				.type	= RECONCILE_SCAN_device,
+				.dev	= dev_idx,
+			}, true);
+		if (ret) {
+			bch_err_fn(c, ret);
+			continue;
+		}
+
+		/* The superblock intent may only be cleared after the queued cookie
+		 * is durable; otherwise a crash here loses the only record of the scan.
+		 */
+		ret = bch2_journal_flush_seq(&c->journal,
+					     atomic64_read(&c->journal.seq),
+					     TASK_UNINTERRUPTIBLE);
+		if (ret) {
+			bch_err_fn(c, ret);
+			continue;
+		}
+
+		scoped_guard(mutex_noio, &c->sb_lock) {
+			struct bch_member *member =
+				bch2_members_v2_get_mut(c->disk_sb.sb, dev_idx);
+			SET_BCH_MEMBER_NEEDS_RECONCILE_SCAN(member, false);
+			ret = bch2_write_super(c);
+		}
+		if (ret)
+			bch_err_fn(c, ret);
+	}
+
+	return 0;
 }
 
 /* Device add/removal: */

@@ -20,14 +20,17 @@ std = ["dep:zeroize"]
 
 [dependencies]
 bcachefs-shim = { path = "../bcachefs-shim" }
-bcachefs-typeinfo-macros = { path = "typeinfo-macros" }
+bcachefs-cstruct-macros = { path = "cstruct-macros" }
+bitfield-struct = { path = "vendor/bitfield-struct" }
+nestify = { path = "vendor/nestify" }
 bitfield = { path = "vendor/bitfield" }
 bitflags = { path = "vendor/bitflags" }
 paste    = { path = "vendor/paste" }
 uuid     = "1.2.2"
+# The target's ioctl number layout (util/ioctl.rs): bindgen output of each
+# architecture's own headers. Userspace only - the kernel build has no
+# crates.io.
+linux-raw-sys = { version = "0.12", default-features = false, features = ["general", "no_std"] }
+# Endian-typed integers for the on-disk format: byteorder::{little,big}_endian.
+zerocopy = "0.8"
 zeroize  = { version = "1", optional = true, features = ["std", "zeroize_derive"] }
-
-[build-dependencies]
-# build.rs drives the `bindgen` CLI (see codegen.rs) rather than the bindgen
-# library, so the only build-dep is cc, for the static-inline wrappers.
-cc = "1.0"

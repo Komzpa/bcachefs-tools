@@ -6,6 +6,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::FromRawFd;
 
 use bch_bindgen::c;
+use bcachefs_kernel::util::vstructs::{Head, SelfSized};
 
 /// Print error to stderr and exit with failure status.
 /// Matches the C `die()` function behavior.
@@ -22,14 +23,8 @@ pub fn borrowed_file(fd: i32) -> std::mem::ManuallyDrop<std::fs::File> {
     std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-/// Compute the total byte size of a variable-length superblock struct.
-/// Equivalent to C's `vstruct_bytes(sb)`.
-pub fn vstruct_bytes_sb(sb: &c::bch_sb) -> usize {
-    std::mem::size_of::<c::bch_sb>() + u32::from_le(sb.u64s) as usize * 8
-}
-
 /// Compute the superblock checksum using the csum type stored in the sb.
-fn csum_vstruct_sb(sb: *mut c::bch_sb) -> c::bch_csum {
+fn csum_vstruct_sb(sb: *mut Head<c::bch_sb>) -> c::bch_csum {
     unsafe { c::rust_csum_vstruct_sb(sb) }
 }
 
@@ -41,17 +36,17 @@ pub fn bch2_super_write<S: SbAccess>(fd: i32, sb: &mut S) {
 
     let bs = crate::wrappers::bdev::get_blocksize_physical_hint(fd) as usize;
     let layout_range = {
-        let off = std::mem::offset_of!(c::bch_sb, layout);
+        let off = std::mem::offset_of!(Head<c::bch_sb>, layout);
         off..off + std::mem::size_of::<c::bch_sb_layout>()
     };
 
     let nr_superblocks = sb.sb().layout.nr_superblocks as usize;
     for i in 0..nr_superblocks {
         let offset_le = sb.sb().layout.sb_offset[i];
-        let offset_sectors = u64::from_le(offset_le);
+        let offset_sectors = offset_le.get();
 
         sb.sb_mut().offset = offset_le;
-        sb.sb_mut().csum = csum_vstruct_sb(sb.sb_mut());
+        sb.sb_mut().csum = csum_vstruct_sb(sb.sb_mut().as_ffi_mut());
 
         let sb_src = sb.sb_bytes();
         let sb_bytes = sb_src.len();
@@ -101,14 +96,14 @@ pub fn super_read(fd: i32, sector: u64) -> anyhow::Result<SbBuf> {
     let file = borrowed_file(fd);
 
     // Read the fixed-size header to learn the full extent
-    let header_size = std::mem::size_of::<c::bch_sb>();
+    let header_size = std::mem::size_of::<Head<c::bch_sb>>();
     let mut buf = vec![0u8; header_size];
     file.read_exact_at(&mut buf, sector << 9)
         .map_err(|e| anyhow::anyhow!("pread failed at offset {}: {}", sector << 9, e))?;
 
-    let u64s_off = std::mem::offset_of!(c::bch_sb, u64s);
-    let u64s = u32::from_le_bytes(buf[u64s_off..u64s_off + 4].try_into().unwrap());
-    let bytes = header_size + u64s as usize * 8;
+    // SAFETY: header_size bytes, and any bytes are a header
+    let hdr = unsafe { buf.as_ptr().cast::<Head<c::bch_sb>>().read_unaligned() };
+    let bytes = hdr.bytes();
 
     buf.resize(bytes, 0);
     file.read_exact_at(&mut buf, sector << 9)
@@ -161,7 +156,7 @@ pub fn sb_layout_init(
             sb_pos = sb_pos.div_ceil(align) * align;
         }
 
-        l.sb_offset[i] = sb_pos.to_le();
+        l.sb_offset[i] = sb_pos.into();
         sb_pos += sb_size as u64;
     }
 
@@ -182,7 +177,7 @@ pub fn sb_layout_init(
         let bucket_sectors = (bucket_size >> 9) as u64;
         let backup_sb = (sb_end - sb_max_size) / bucket_sectors * bucket_sectors;
         let idx = l.nr_superblocks as usize;
-        l.sb_offset[idx] = backup_sb.to_le();
+        l.sb_offset[idx] = backup_sb.into();
         l.nr_superblocks += 1;
     }
 

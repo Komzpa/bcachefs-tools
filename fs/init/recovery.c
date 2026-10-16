@@ -26,6 +26,7 @@
 
 #include "init/error.h"
 #include "init/fs.h"
+#include "init/dev.h"
 #include "init/passes.h"
 #include "init/progress.h"
 #include "init/recovery.h"
@@ -344,6 +345,9 @@ int bch2_set_may_go_rw(struct bch_fs *c)
 	move_gap(keys, keys->nr);
 
 	set_bit(BCH_FS_may_go_rw, &c->flags);
+
+	/* Before going rw, and anything that could start a logged op: */
+	try(bch2_logged_ops_note_unfinished(c));
 
 	if (go_rw_in_recovery(c)) {
 		if (c->sb.features & BIT_ULL(BCH_FEATURE_no_alloc_info)) {
@@ -828,7 +832,13 @@ static int __bch2_fs_recovery(struct bch_fs *c)
 		if (c->opts.read_journal_only)
 			return 0;
 
-		if (mustfix_fsck_err_on(c->sb.clean && !journal_start.clean,
+		/*
+		 * bch2_journal_read() leaves clean false if it found no flush
+		 * entry at all - an empty journal, not a dirty one:
+		 */
+		if (mustfix_fsck_err_on(c->sb.clean &&
+					journal_start.replay_end &&
+					!journal_start.clean,
 					c, clean_but_journal_not_empty,
 					"filesystem marked clean but journal not empty")) {
 			c->sb.compat &= ~(1ULL << BCH_COMPAT_alloc_info);
@@ -1251,6 +1261,8 @@ int bch2_fs_initialize(struct bch_fs *c)
 
 	try(bch2_set_may_go_rw(c));
 	try(bch2_journal_replay(c));
+	if (!c->opts.read_only)
+		try(bch2_dev_start_member_reconcile_scans(c));
 	try(bch2_initialize_subvolumes(c));
 	try(bch2_snapshots_read(c));
 	try(bch2_presplit_shard_boundaries(c));
