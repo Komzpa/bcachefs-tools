@@ -4,10 +4,10 @@
 
 #include "fs/inode.h"
 #include "fs/str_hash.h"
-#include "fs/quota_types.h"
+#include "fs/quota_gen.h"
 
 #include "util/two_state_shared_lock.h"
-#include "vfs/types.h"
+#include "vfs/types_gen.h"
 
 #include <linux/seqlock.h>
 #include <linux/stat.h>
@@ -30,63 +30,7 @@ static inline void inode_state_set_raw(struct inode *inode, unsigned flags)
 }
 #endif
 
-struct bch_inode_info {
-	struct inode		v;
-	struct rhash_head	hash;
-	/*
-	 * Read it with inode_inum(); the layout is private so that
-	 * bch2_inode_or_descendents_is_open() can walk entries without knowing
-	 * about bch_inode_info at all.
-	 */
-	struct bch_inum_hash_entry ei_inum_hash;
-
-	/*
-	 * Cached extent allocation state for [start, end), for skipping btree
-	 * lookups when initializing bch_folio state in sequential buffered
-	 * writes.
-	 *
-	 * Staleness contract: extents may change toward allocated without
-	 * notice (worst case we over-reserve); anything that deallocates must
-	 * clear the range, under pagecache_block so no fill (under
-	 * pagecache_add) can straddle the deallocation. Fillers build their
-	 * result in locals and publish it in one go: fillers aren't
-	 * serialized against each other (page_mkwrite fills without i_rwsem),
-	 * and incremental publishing would let two fills interleave into a
-	 * range neither of them scanned.
-	 */
-	u64			ei_reserved_start;
-	u64			ei_reserved_end;
-	u8			ei_reserved_replicas;
-	u8			ei_reserved_state;
-	spinlock_t		ei_reserved_lock;
-
-	unsigned		ei_inodes_idx;
-	unsigned long		ei_flags;
-
-	struct mutex		ei_update_lock;
-	u64			ei_quota_reserved;
-	unsigned long		ei_last_dirtied;
-	two_state_lock_t	ei_pagecache_lock;
-
-	struct mutex		ei_quota_lock;
-	struct bch_qid		ei_qid;
-
-	/*
-	 * When we've been doing nocow writes we'll need to issue flushes to the
-	 * underlying block devices
-	 *
-	 * XXX: a device may have had a flush issued by some other codepath. It
-	 * would be better to keep for each device a sequence number that's
-	 * incremented when we isusue a cache flush, and track here the sequence
-	 * number that needs flushing.
-	 */
-	struct bch_devs_mask	ei_devs_need_flush;
-
-	/* copy of inode in btree: */
-	struct bch_inode_unpacked ei_inode;
-
-	struct delayed_work	ei_writeback_timer;
-};
+#include "vfs/fs_gen.h"
 
 #define bch2_pagecache_add_put(i)	bch2_two_state_unlock(&(i)->ei_pagecache_lock, 0)
 #define bch2_pagecache_add_tryget(i)	bch2_two_state_trylock(&(i)->ei_pagecache_lock, 0)
@@ -134,11 +78,6 @@ static inline int ptrcmp(void *l, void *r)
 {
 	return cmp_int(l, r);
 }
-
-enum bch_inode_lock_op {
-	INODE_PAGECACHE_BLOCK	= (1U << 0),
-	INODE_UPDATE_LOCK	= (1U << 1),
-};
 
 #define bch2_lock_inodes(_locks, ...)					\
 do {									\
@@ -198,8 +137,6 @@ static inline bool inode_attrs_changing(struct bch_inode_info *dir,
 	return false;
 }
 
-struct bch_inode_unpacked;
-
 #ifndef NO_BCACHEFS_FS
 
 struct bch_inode_info *
@@ -213,8 +150,6 @@ void bch2_dir_casefold_changed(struct dentry *);
 static inline void bch2_dentry_set_casefold_ops(struct dentry *dentry, struct inode *vinode) {}
 static inline void bch2_dir_casefold_changed(struct dentry *dentry) {}
 #endif
-
-int bch2_inode_or_descendents_is_open(struct btree_trans *trans, struct bpos p);
 
 int bch2_fs_quota_transfer(struct bch_fs *,
 			   struct bch_inode_info *,
@@ -238,24 +173,10 @@ static inline int bch2_set_projid(struct bch_fs *c,
 struct bch_inode_info *bch2_vfs_inode_get_trans(struct btree_trans *, subvol_inum, const char *);
 struct inode *bch2_vfs_inode_get(struct bch_fs *, subvol_inum, const char *);
 
-/* returns 0 if we want to do the update, or error is passed up */
-typedef int (*inode_set_fn)(struct btree_trans *,
-			    struct bch_inode_info *,
-			    struct bch_inode_unpacked *, void *);
-
-void bch2_inode_update_after_write(struct btree_trans *,
-				   struct bch_inode_info *,
-				   struct bch_inode_unpacked *,
-				   unsigned);
-int __must_check bch2_write_inode(struct bch_fs *, struct bch_inode_info *,
-				  inode_set_fn, void *, unsigned);
-
 int bch2_setattr_nonsize(struct mnt_idmap *,
 			 struct bch_inode_info *,
 			 struct iattr *);
 int __bch2_unlink(struct inode *, struct dentry *, bool);
-
-void bch2_evict_subvolume_inodes(struct bch_fs *, snapshot_id_list *);
 
 int bch2_fiemap(struct inode *, struct fiemap_extent_info *, u64, u64);
 

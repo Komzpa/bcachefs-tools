@@ -716,6 +716,7 @@ bool bch2_stripe_handle_tryget(struct bch_fs *c,
 	return ret;
 }
 
+/* Intent-locked existing key: 1 acquired, 0 busy, negative error/restart. */
 int bch2_stripe_handle_tryget_existing(struct btree_iter *iter,
 				       struct ec_stripe_handle *s)
 {
@@ -768,4 +769,28 @@ void bch2_stripe_handle_put(struct bch_fs *c, struct ec_stripe_handle *s)
 	hlist_del_init(&s->hash);
 
 	s->idx = 0;
+}
+
+/*
+ * Move a claim on a stripe from @src to @dst, which must hold none, without the
+ * stripe ever being seen unclaimed.
+ */
+void bch2_stripe_handle_move(struct bch_fs *c, struct ec_stripe_handle *dst,
+			     struct ec_stripe_handle *src)
+{
+	BUG_ON(dst->idx);
+
+	if (!src->idx)
+		return;
+
+	unsigned hash = hash_64(src->idx, ilog2(ARRAY_SIZE(c->ec.stripes_new)));
+
+	guard(spinlock)(&c->ec.stripes_new_lock);
+	BUG_ON(bch2_open_stripe_find(c, src->idx) != src);
+	hlist_del_init(&src->hash);
+
+	dst->idx = src->idx;
+	hlist_add_head(&dst->hash, &c->ec.stripes_new[hash]);
+
+	src->idx = 0;
 }

@@ -73,6 +73,27 @@ static void raid_gen(int nd, int np, size_t size, void **v)
 	BUG_ON(np > 2);
 }
 
+/*
+ * raid6_recov_2data() and raid6_recov_datap() handle at most a page: they stand
+ * the zero page in for the missing blocks while generating the syndrome.
+ */
+static void raid6_recov_paged(int disks, size_t size, int faila, int failb, void **v)
+{
+	void *p[BCH_BKEY_PTRS_MAX];
+
+	for (size_t offset = 0; offset < size; offset += PAGE_SIZE) {
+		size_t bytes = min_t(size_t, size - offset, PAGE_SIZE);
+
+		for (int i = 0; i < disks; i++)
+			p[i] = v[i] + offset;
+
+		if (failb < disks - 2)
+			raid6_recov_2data(disks, bytes, faila, failb, p);
+		else
+			raid6_recov_datap(disks, bytes, faila, p);
+	}
+}
+
 static void raid_rec(int nr, int *ir, int nd, int np, size_t size, void **v)
 {
 	switch (nr) {
@@ -87,12 +108,12 @@ static void raid_rec(int nr, int *ir, int nd, int np, size_t size, void **v)
 	case 2:
 		if (ir[1] < nd) {
 			/* data+data failure. */
-			raid6_recov_2data(nd + np, size, ir[0], ir[1], v);
+			raid6_recov_paged(nd + np, size, ir[0], ir[1], v);
 		} else if (ir[0] < nd) {
 			/* data + p/q failure */
 
 			if (ir[1] == nd) /* data + p failure */
-				raid6_recov_datap(nd + np, size, ir[0], v);
+				raid6_recov_paged(nd + np, size, ir[0], ir[1], v);
 			else { /* data + q failure */
 				raid5_recov(nd + 1, ir[0], size, v);
 				raid6_gen_syndrome(nd + np, size, v);
@@ -150,6 +171,22 @@ void bch2_ec_stripe_buf_exit(struct ec_stripe_buf *buf)
 	__bch2_ec_stripe_buf_exit(buf);
 
 	closure_debug_destroy(&buf->io);
+}
+
+/*
+ * Move @src's buffers, read results and key into @dst, which must be empty. The
+ * IO closure belongs to the buffer's owner and doesn't move.
+ */
+void bch2_ec_stripe_buf_move(struct ec_stripe_buf *dst, struct ec_stripe_buf *src)
+{
+	EBUG_ON(dst->c);
+
+	closure_sync(&src->io);
+
+	dst->contents = src->contents;
+
+	src->c = NULL;
+	memset(src->data, 0, sizeof(src->data));
 }
 
 int bch2_ec_stripe_buf_init(struct bch_fs *c,
@@ -814,9 +851,15 @@ int bch2_ec_read_extent(struct btree_trans *trans, struct bch_read_bio *rbio,
 
 	bch2_stripe_buf_read(c, buf);
 
+	/*
+	 * A block went stale under us: the stripe was deleted or replaced, so
+	 * the extent has changed. Retry as a direct read of a stale pointer is.
+	 */
 	ret = bch2_stripe_buf_validate(c, buf, false, EC_BLOCKS_ALL);
 	if (ret == -BCH_ERR_stripe_reconstruct_stale_race)
-		return bch_err_throw(c, data_read_ptr_stale_race);
+		return rbio->flags & BCH_READ_retry_if_stale
+			? bch_err_throw(c, data_read_ptr_stale_retry)
+			: bch_err_throw(c, data_read_ptr_stale_race);
 
 	if (!ret)
 		memcpy_to_bio(&rbio->bio, rbio->bio.bi_iter,

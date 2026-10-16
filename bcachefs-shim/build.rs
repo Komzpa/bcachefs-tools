@@ -6,6 +6,9 @@
 // exactly once.
 use std::path::PathBuf;
 
+include!("../clang_target.rs");
+include!("../fs/build_config.rs");
+
 fn main() {
     let out_dir: PathBuf = std::env::var_os("OUT_DIR")
         .expect("ENV Var 'OUT_DIR' Expected")
@@ -24,15 +27,19 @@ fn main() {
         .join("wrapper.h");
 
     println!("cargo:rerun-if-changed={}", wrapper.display());
+    println!("cargo:rerun-if-changed=../clang_target.rs");
+    println!("cargo:rerun-if-changed=../fs/build_config.rs");
+    rerun_if_userspace_config_changed(&root);
     println!("cargo:rerun-if-changed={}", include_dir.display());
 
     let urcu = pkg_config::probe_library("liburcu").expect("Failed to find urcu lib");
     let target = std::env::var("TARGET").unwrap();
+    let clang_target = clang_target_for_rust_target(&target);
 
     let bindings = bindgen::builder()
         .formatter(bindgen::Formatter::Prettyplease)
         .header(wrapper.display().to_string())
-        .clang_arg(format!("--target={}", target))
+        .clang_arg(format!("--target={}", clang_target))
         .clang_args(
             urcu.include_paths
                 .iter()
@@ -42,9 +49,7 @@ fn main() {
         .clang_arg(format!("-I{}", fs_dir.display()))
         .clang_arg(format!("-I{}", root.join("c_src").display()))
         .clang_arg(format!("-I{}", include_dir.display()))
-        .clang_arg("-DZSTD_STATIC_LINKING_ONLY")
-        .clang_arg("-DNO_BCACHEFS_FS")
-        .clang_arg("-D_GNU_SOURCE")
+        .clang_args(userspace_config_args(&root))
         .clang_arg("-DRUST_BINDGEN")
         .clang_arg("-fkeep-inline-functions")
         .derive_debug(true)
@@ -66,10 +71,25 @@ fn main() {
         .allowlist_type("uid_t")
         .allowlist_type("gid_t")
         .allowlist_type("cds_.*")
+        // File mode bits: the kernel crate's bindings have them in-kernel.
+        .allowlist_var("S_IF.*")
+        .allowlist_var("S_ISGID")
+        // errnos, for bch2_err_matches() against a bare errno, or returning
+        // one as C does (darray_push()'s -ENOMEM) - the kernel crate's
+        // bindings have them in-kernel; add as needed:
+        .allowlist_var("ENOENT|ENOMEM|EINVAL|ENAMETOOLONG|ERANGE|ENODATA|E2BIG|EACCES")
+        .allowlist_var("ECHILD|EROFS|EXDEV|ENOTDIR|EIO|ENOTEMPTY")
+        // The vendored C fs/ uses - closures - is the shim's too: not
+        // bcachefs's, so not the fs crate's to define.
+        .allowlist_file(format!("{}/vendor/closure.h", fs_dir.display()))
         // Never emit fs/ types: those are bcachefs-kernel's, and some (printbuf)
         // even carry Rust impls there. allowlist_recursively would otherwise
-        // pull them in through an include/ reference.
-        .blocklist_file(format!("{}/.*", fs_dir.display()))
+        // pull them in through an include/ reference. fs/vendor/ isn't
+        // bcachefs's: "under fs/ but not under fs/vendor/", as an alternation
+        // over the prefixes of vendor/ that can't be completed.
+        .blocklist_file(format!(
+            r"{}/(?:[^v]|v(?:[^e]|e(?:[^n]|n(?:[^d]|d(?:[^o]|o(?:[^r]|r[^/])))))).*",
+            fs_dir.display()))
         // The kernel's DEFINE_LOCK_GUARD / DEFINE_CLASS cleanup machinery
         // (class_*_constructor/destructor/lock_ptr) are never called from Rust,
         // and wrap_static_fns can't emit valid C wrappers for them.
@@ -87,6 +107,12 @@ fn main() {
         .opaque_type("rhash_lock_head")
         .opaque_type("srcu_struct")
         .opaque_type("bch_ioctl_data_event")
+        // the shim's own stand-ins for kernel structs, empty in
+        // include/linux/: reached through bch_fs and bch_dev
+        .opaque_type("device")
+        .opaque_type("class")
+        .opaque_type("blk_plug")
+        .opaque_type("idr")
         .generate_inline_functions(true)
         .wrap_static_fns(true)
         .wrap_static_fns_path(out_dir.join("extern.c"))
@@ -105,12 +131,12 @@ fn main() {
         .include(&fs_dir)
         .include(root.join("c_src"))
         .include(&include_dir)
-        .define("ZSTD_STATIC_LINKING_ONLY", None)
-        .define("NO_BCACHEFS_FS", None)
-        .define("_GNU_SOURCE", None)
         .define("RUST_BINDGEN", None)
         .flag("-fkeep-inline-functions")
         .warnings(false);
+    for f in userspace_config_args(&root) {
+        wrappers.flag(f);
+    }
     for p in &urcu.include_paths {
         wrappers.include(p);
     }

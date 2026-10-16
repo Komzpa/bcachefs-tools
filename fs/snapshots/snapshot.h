@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _BCACHEFS_SNAPSHOT_H
 #define _BCACHEFS_SNAPSHOT_H
+#include "snapshots/snapshot_gen.h"
+#include "snapshots/check_snapshots_gen.h"
 
 void bch2_snapshot_tree_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 int bch2_snapshot_tree_validate(struct bch_fs *, struct bkey_s_c,
@@ -9,14 +11,8 @@ int bch2_snapshot_tree_validate(struct bch_fs *, struct bkey_s_c,
 #define bch2_bkey_ops_snapshot_tree ((struct bkey_ops) {	\
 	.key_validate	= bch2_snapshot_tree_validate,		\
 	.val_to_text	= bch2_snapshot_tree_to_text,		\
-	.min_val_size	= 8,					\
 })
 
-struct bkey_i_snapshot_tree *__bch2_snapshot_tree_create(struct btree_trans *);
-
-int bch2_snapshot_tree_lookup(struct btree_trans *, u32, struct bch_snapshot_tree *);
-
-void bch2_snapshot_to_text(struct printbuf *, const struct bch_snapshot *);
 void bch2_snapshot_key_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 int bch2_snapshot_validate(struct bch_fs *, struct bkey_s_c,
 			   const struct bkey_validate_context *);
@@ -30,9 +26,16 @@ int bch2_check_snapshot_needs_deletion(struct btree_trans *, struct bkey_s_c, u3
 	.key_validate	= bch2_snapshot_validate,		\
 	.val_to_text	= bch2_snapshot_key_to_text,		\
 	.trigger	= bch2_snapshot_trigger,		\
-	.min_val_size	= 24,					\
 })
 
+/*
+ * The raw state field. A key that predates it reads 0, which matches no state:
+ * == SNAPSHOT_STATE_deleted is false for a deleted legacy node, and
+ * != SNAPSHOT_STATE_live true for a live one.
+ *
+ * Use bch2_snapshot_state_compat() to decide what to do with a node; this is for
+ * validation and the migration, which care what's in the field.
+ */
 static inline enum bch_snapshot_state bch2_snapshot_state(const struct bch_snapshot *s)
 {
 	return le32_to_cpu(s->state);
@@ -49,6 +52,10 @@ static inline enum bch_snapshot_state bch2_snapshot_state_from_flags(const struc
 	return SNAPSHOT_STATE_live;
 }
 
+/*
+ * The node's state, on any key: zero isn't a valid state, so a zero field means
+ * the key predates it, and the old flag bits are authoritative.
+ */
 static inline enum bch_snapshot_state bch2_snapshot_state_compat(const struct bch_snapshot *s)
 {
 	return s->state
@@ -67,34 +74,6 @@ static inline bool bch2_snapshot_state_valid(enum bch_snapshot_state state)
 		return false;
 	}
 }
-
-/*
- * Nearest-codeword decode for a corrupted state field: the state codewords
- * are >= 14 bits apart, so a corruption of <= 6 bits lands strictly nearest
- * its original and >= 8 from every other - a uniquely decodable bitflip.
- * Returns the nearest state; @dist is its Hamming distance from @v (0 iff @v
- * is already a valid codeword). The caller corrects only within the
- * uniquely-decodable radius.
- */
-static inline enum bch_snapshot_state
-bch2_snapshot_state_nearest(u32 v, unsigned *dist)
-{
-	enum bch_snapshot_state best = SNAPSHOT_STATE_live;
-	unsigned best_dist = 33;
-
-#define x(n, val)						\
-	if (hweight32(v ^ (val)) < best_dist) {			\
-		best_dist = hweight32(v ^ (val));		\
-		best = SNAPSHOT_STATE_##n;			\
-	}
-	BCH_SNAPSHOT_STATES()
-#undef x
-	*dist = best_dist;
-	return best;
-}
-
-const char *bch2_snapshot_state_str(enum bch_snapshot_state);
-void bch2_snapshot_state_set(struct bch_snapshot *, enum bch_snapshot_state);
 
 static inline struct snapshot_t *__snapshot_t(struct snapshot_table *t, u32 id)
 {
@@ -174,8 +153,6 @@ static inline u32 bch2_snapshot_nth_parent(struct bch_fs *c, u32 id, u32 n)
 	return id;
 }
 
-u32 bch2_snapshot_skiplist_get(struct bch_fs *, u32);
-
 static inline u32 bch2_snapshot_root(struct bch_fs *c, u32 id)
 {
 	guard(rcu)();
@@ -209,8 +186,6 @@ static inline bool bch2_snapshot_exists(struct bch_fs *c, u32 id)
 	return bch2_snapshot_id_state(c, id) == SNAPSHOT_ID_live;
 }
 
-u32 bch2_snapshot_redundant_interior(struct bch_fs *, u32);
-
 static inline int bch2_snapshot_is_internal_node(struct bch_fs *c, u32 id)
 {
 	guard(rcu)();
@@ -226,6 +201,14 @@ static inline int bch2_snapshot_is_leaf(struct bch_fs *c, u32 id)
 	return !ret;
 }
 
+/*
+ * No NULL check, unlike the helpers above: @parent must be an ancestor of a node
+ * the caller already found in the table. The table is indexed by U32_MAX - id
+ * and IDs descend, so a table covering a node covers all its ancestors.
+ *
+ * Returning 0 for a missing entry would write a wrong depth during repair; an
+ * oops at least stops.
+ */
 static inline u32 bch2_snapshot_depth(struct bch_fs *c, u32 parent)
 {
 	guard(rcu)();
@@ -272,8 +255,6 @@ static inline int bch2_snapshot_live_descendent(struct bch_fs *c, u32 id, u32 *l
 	}
 }
 
-bool __bch2_snapshot_is_ancestor(struct btree_trans *, u32, u32);
-
 static inline bool bch2_snapshot_is_ancestor(struct btree_trans *trans, u32 id, u32 ancestor)
 {
 	EBUG_ON(!id);
@@ -283,8 +264,6 @@ static inline bool bch2_snapshot_is_ancestor(struct btree_trans *trans, u32 id, 
 		? true
 		: __bch2_snapshot_is_ancestor(trans, id, ancestor);
 }
-
-bool bch2_snapshot_is_ancestor_early(struct bch_fs *, u32, u32);
 
 static inline bool bch2_snapshot_has_children(struct bch_fs *c, u32 id)
 {
@@ -348,22 +327,6 @@ u32 bch2_snapshot_tree_next(struct bch_fs *, u32, unsigned *);
 	     _id && _id <= _start;					\
 	     _id = bch2_snapshot_tree_next(_c, _id, _depth))
 
-int bch2_snapshot_lookup(struct btree_trans *trans, u32 id,
-			 struct bch_snapshot *s);
-int bch2_snapshot_lookup_key(struct btree_trans *trans, u32 id,
-			     struct bkey_i_snapshot *k);
-
-/* only exported for tests: */
-int bch2_snapshot_node_create(struct btree_trans *, u32,
-			      u32 *, u32 *, unsigned);
-
-int bch2_check_snapshot_trees(struct bch_fs *);
-int bch2_check_snapshots_trans(struct btree_trans *);
-int bch2_check_snapshots(struct bch_fs *);
-int bch2_reconstruct_snapshots(struct bch_fs *);
-
-int __bch2_check_key_has_snapshot(struct btree_trans *, struct btree_iter *, struct bkey_s_c);
-
 static inline int bch2_check_key_has_snapshot(struct btree_trans *trans,
 					      struct btree_iter *iter,
 					      struct bkey_s_c k)
@@ -390,11 +353,7 @@ static inline int bch2_get_snapshot_overwrites(struct btree_trans *trans,
 
 }
 
-int bch2_snapshot_node_set_deleted(struct btree_trans *, u32);
 int bch2_snapshot_node_delete(struct btree_trans *, u32);
-int bch2_snapshot_node_undelete(struct btree_trans *, struct bkey_i_snapshot *);
-int bch2_snapshot_accounting_totals(struct bch_fs *, u32, u64 *, u64 *,
-				    u64 *, struct printbuf *);
 
 int __bch2_key_has_snapshot_overwrites(struct btree_trans *, enum btree_id, struct bpos);
 
@@ -409,15 +368,11 @@ static inline int bch2_key_has_snapshot_overwrites(struct btree_trans *trans,
 	return __bch2_key_has_snapshot_overwrites(trans, id, pos);
 }
 
-int bch2_delete_dead_snapshot_key(struct btree_trans *, struct btree_iter *,
-				  struct bkey_s_c, u32);
-
 int __bch2_delete_dead_snapshots(struct bch_fs *);
 int bch2_delete_dead_snapshots(struct bch_fs *);
 void bch2_snapshot_delete_status_to_text(struct printbuf *, struct bch_fs *);
 
 int bch2_delete_dead_interior_snapshots(struct bch_fs *);
-int bch2_snapshot_table_rebuild(struct btree_trans *);
 int bch2_snapshots_read(struct bch_fs *);
 void bch2_fs_snapshots_exit(struct bch_fs *);
 void bch2_fs_snapshots_init_early(struct bch_fs *);

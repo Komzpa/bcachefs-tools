@@ -261,7 +261,7 @@ const struct bch_devs_mask *bch2_target_to_mask(struct bch_fs *c, unsigned targe
 		struct bch_dev *ca = t.dev < c->sb.nr_devices
 			? rcu_dereference(c->devs[t.dev])
 			: NULL;
-		return ca ? &ca->self : NULL;
+		return ca ? &ca->self_mask : NULL;
 	}
 	case TARGET_GROUP: {
 		struct bch_disk_groups_cpu *g = rcu_dereference(c->disk_groups);
@@ -459,6 +459,7 @@ int bch2_disk_path_find(struct bch_sb_handle *sb, const char *name)
 	return v;
 }
 
+/* Exported for userspace bcachefs-tools: */
 int bch2_disk_path_find_or_create(struct bch_sb_handle *sb, const char *name)
 {
 	struct bch_sb_field_disk_groups *groups;

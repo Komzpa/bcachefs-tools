@@ -2,15 +2,17 @@ use std::{collections::{HashMap, HashSet}, ffi::CStr, mem, os::fd::OwnedFd,
     path::{Path, PathBuf}, process::ExitCode};
 use chrono::{Local, TimeZone};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use bch_bindgen::c::{
-    BCH_SUBVOL_SNAPSHOT_RO, bch_ioctl_snapshot_node, bch_ioctl_snapshot_node_v2,
+    BCH_SUBVOL_SNAPSHOT_RO, bch_ioctl_snapshot_node_v2,
     bch_ioctl_snapshot_tree_query, bch_ioctl_snapshot_tree_query_v2,
     bch_ioctl_subvol_dirent, bch_ioctl_subvol_readdir, bch_ioctl_subvol_to_path,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::util::{fmt_sectors_human, fmt_bytes_human, fmt_num_human, open_dir, subvol_root};
+use bcachefs_kernel::util::vstructs::{plain_bytes, FlexArray, Plain, UnvalidatedRefEntries};
+
 use crate::wrappers::handle::BcachefsHandle;
 use crate::wrappers::ioctl::{ioctl_ptr, ioctl_rw, Ioctl, IoctlBuf,
     BCH_IOCTL_SNAPSHOT_TREE, BCH_IOCTL_SNAPSHOT_TREE_v2,
@@ -176,27 +178,28 @@ const BCH_SUBVOLUME_UNLINKED: u32 = 1 << 2;
 
 /// A header-plus-flexible-array ioctl with capacity/total retry protocol:
 /// nr in is capacity, ERANGE reports the required total.
-trait FlexArrayIoctl: Sized {
-    type Node: Copy;
+trait FlexArrayIoctl: FlexArray + Plain + Copy {
     type Ioc: Ioctl<Arg = Self>;
     fn set_capacity(&mut self, n: u32);
-    fn nr(&self) -> u32;
     fn total(&self) -> u32;
-    /// The trailing array, through the struct's flexible array member.
-    /// Caller guarantees `nr` entries exist past the header.
-    unsafe fn nodes(&self, nr: usize) -> &[Self::Node];
+
+    /// Bytes from one element of the reply to the next, given the header we
+    /// sent: our element's size, unless the header says what the kernel's is.
+    fn stride(&self, _sent: &Self) -> usize {
+        mem::size_of::<Self::Elem>()
+    }
 }
 
 fn bcachefs_flex_ioctl<H: FlexArrayIoctl>(
     fd: &OwnedFd,
     mut arg: H,
-) -> Result<(H, Vec<H::Node>)> {
+) -> Result<(H, Vec<H::Elem>)> {
     let mut capacity = 256u32;
 
     loop {
         arg.set_capacity(capacity);
-        let mut buf = IoctlBuf::<H>::new::<H::Node>(capacity as usize);
-        unsafe { std::ptr::copy_nonoverlapping(&arg, buf.as_mut_ptr(), 1) };
+        let mut buf = IoctlBuf::<H>::new(capacity as usize);
+        *buf.hdr_mut() = arg;
 
         match unsafe { ioctl_ptr::<H::Ioc>(fd, buf.as_mut_ptr()) } {
             Ok(_) => {}
@@ -207,36 +210,38 @@ fn bcachefs_flex_ioctl<H: FlexArrayIoctl>(
             Err(e) => return Err(e.into()),
         }
 
-        let nr = (buf.hdr().nr() as usize).min(capacity as usize);
-        let nodes = unsafe { buf.hdr().nodes(nr) }.to_vec();
-        return Ok((unsafe { std::ptr::read(buf.hdr()) }, nodes));
+        let stride = buf.hdr().stride(&arg);
+        ensure!(stride > 0, "{}: the kernel says its elements are 0 bytes", std::any::type_name::<H>());
+        let nodes = buf.tail_strided(stride)?;
+        return Ok((*buf.hdr(), nodes));
     }
 }
 
 impl FlexArrayIoctl for bch_ioctl_snapshot_tree_query {
-    type Node = bch_ioctl_snapshot_node;
     type Ioc = BCH_IOCTL_SNAPSHOT_TREE;
     fn set_capacity(&mut self, n: u32) { self.nr = n; }
-    fn nr(&self) -> u32 { self.nr }
     fn total(&self) -> u32 { self.total }
-    unsafe fn nodes(&self, nr: usize) -> &[Self::Node] { self.nodes.as_slice(nr) }
 }
 
 impl FlexArrayIoctl for bch_ioctl_snapshot_tree_query_v2 {
-    type Node = bch_ioctl_snapshot_node_v2;
     type Ioc = BCH_IOCTL_SNAPSHOT_TREE_v2;
     fn set_capacity(&mut self, n: u32) { self.nr = n; }
-    fn nr(&self) -> u32 { self.nr }
     fn total(&self) -> u32 { self.total }
-    unsafe fn nodes(&self, nr: usize) -> &[Self::Node] { self.nodes.as_slice(nr) }
+
+    /// node_size: ours going in, the kernel's coming back. It writes the
+    /// smaller of the two per node, and steps by that.
+    fn stride(&self, sent: &Self) -> usize {
+        self.node_size.min(sent.node_size) as usize
+    }
 }
 
 fn subvol_readdir(fd: &OwnedFd, pos: &mut u32) -> Result<Vec<SubvolEntry>> {
-    let buf_size = 64 * 1024u32;
-    let mut buf = vec![0u8; buf_size as usize];
+    // u64s: the kernel writes each dirent at a multiple of 8 from the start,
+    // aligned for one if the buffer is
+    let mut buf = Box::new([0u64; (64 << 10) / 8]);
     let mut arg = bch_ioctl_subvol_readdir {
         pos: *pos,
-        buf_size,
+        buf_size: mem::size_of_val(&*buf) as u32,
         buf: buf.as_mut_ptr() as u64,
         used: 0,
         pad: 0,
@@ -246,33 +251,28 @@ fn subvol_readdir(fd: &OwnedFd, pos: &mut u32) -> Result<Vec<SubvolEntry>> {
         .context("BCH_IOCTL_SUBVOLUME_LIST")?;
     *pos = arg.pos;
 
-    let mut entries = Vec::new();
-    let mut offset = 0usize;
-    let used = arg.used as usize;
-    let hdr_size = mem::size_of::<bch_ioctl_subvol_dirent>();
+    let reply = plain_bytes(&*buf).get(..arg.used as usize).ok_or_else(|| {
+        anyhow!("BCH_IOCTL_SUBVOLUME_LIST: {} bytes used, of {}", arg.used, arg.buf_size)
+    })?;
 
-    while offset + hdr_size <= used {
-        let dirent = unsafe { &*(buf.as_ptr().add(offset) as *const bch_ioctl_subvol_dirent) };
-        let reclen = dirent.reclen as usize;
-        if reclen < hdr_size || offset + reclen > used { break; }
+    UnvalidatedRefEntries::<bch_ioctl_subvol_dirent>::new(reply)
+        .map(|d| {
+            let d = d?;
+            let path = &d.as_bytes()[mem::offset_of!(bch_ioctl_subvol_dirent, path)..];
+            let path = CStr::from_bytes_until_nul(path)
+                .map_err(|_| anyhow!("subvolume {}: path not NUL-terminated", d.subvolid))?;
 
-        let path_bytes = &buf[offset + hdr_size..offset + reclen];
-        let path = CStr::from_bytes_until_nul(path_bytes)
-            .map(|c| c.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        entries.push(SubvolEntry {
-            subvolid: dirent.subvolid,
-            flags: dirent.flags,
-            snapshot_parent: dirent.snapshot_parent,
-            otime_sec: dirent.otime_sec as i64,
-            otime_nsec: dirent.otime_nsec,
-            path,
-        });
-        offset += reclen;
-    }
-
-    Ok(entries)
+            Ok(SubvolEntry {
+                subvolid: d.subvolid,
+                flags: d.flags,
+                snapshot_parent: d.snapshot_parent,
+                otime_sec: d.otime_sec as i64,
+                otime_nsec: d.otime_nsec,
+                path: path.to_string_lossy().into_owned(),
+            })
+        })
+        .collect::<Result<_>>()
+        .context("BCH_IOCTL_SUBVOLUME_LIST reply")
 }
 
 fn list_children(fd: &OwnedFd) -> Result<Vec<SubvolEntry>> {
@@ -919,6 +919,8 @@ fn cmd_snapshot(read_only: bool, source: Option<PathBuf>, dest: PathBuf) -> Resu
     Ok(())
 }
 
+// List's flags, as the dispatch destructures every subcommand's
+#[allow(clippy::too_many_arguments)]
 fn cmd_list(json: bool, tree: bool, recursive: bool, snapshots: bool,
             readonly: bool, sort: Option<SortBy>, target: PathBuf,
             skipped: &mut Skipped) -> Result<()> {

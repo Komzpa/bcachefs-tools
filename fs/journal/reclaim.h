@@ -7,6 +7,25 @@
 
 #define JOURNAL_PIN	(32 * 1024)
 
+/*
+ * Ceiling on dirty journal entries. The pin fifo grows on demand up to this,
+ * and never past it: what it bounds is how far the journal can run ahead of
+ * reclaim, and so how many entries the next mount has to replay - small
+ * fsync-heavy entries can otherwise pile up by the million, bounded only by
+ * journal space.
+ *
+ * A filesystem from before the ceiling can come up with more than this dirty;
+ * the fifo is allocated to fit, reclaim works it back down, and the fifo
+ * shrinks to the ceiling once it can (bch2_journal_pin_fifo_resize()).
+ */
+#define JOURNAL_PIN_MAX	(1024 * 1024)
+
+/* The most dirty journal entries we let accumulate before reclaim must act */
+static inline u64 journal_pin_limit(struct journal *j)
+{
+	return min_t(u64, j->pin.size, JOURNAL_PIN_MAX);
+}
+
 static inline void journal_reclaim_kick(struct journal *j)
 {
 	struct task_struct *p = READ_ONCE(j->reclaim_thread);
@@ -100,12 +119,7 @@ void bch2_journal_pin_list_check_retired(struct journal *,
 					 struct journal_entry_pin_list *, u64);
 void bch2_journal_update_last_seq(struct journal *);
 
-typedef struct {
-	unsigned			nr_refs;
-	union bch_replicas_padded	replicas;
-} replicas_entry_refs;
-
-DEFINE_DARRAY_PREALLOCATED(replicas_entry_refs, 16);
+#include "journal/reclaim_gen.h"
 
 int bch2_journal_update_last_seq_ondisk(struct journal *, u64,
 					darray_replicas_entry_refs *);
@@ -152,8 +166,6 @@ int bch2_journal_reclaim(struct journal *);
 
 void bch2_journal_reclaim_stop(struct journal *);
 int bch2_journal_reclaim_start(struct journal *);
-
-bool bch2_journal_flush_pins(struct journal *, u64);
 
 static inline bool bch2_journal_flush_all_pins(struct journal *j)
 {

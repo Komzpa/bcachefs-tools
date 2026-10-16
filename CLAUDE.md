@@ -70,6 +70,16 @@ later work can see what's been analyzed and what was decided.
 documentation for general consumption. Anything that belongs in the
 repository proper goes in `doc/`, written for that audience.
 
+Untracked means `make-release-tarball.sh`'s `git clean -xfd` deletes it,
+which it did, taking every note with it. So `.claude/` is a symlink out
+of the tree, to
+
+    ~/.claude/projects/-home-kent-ktest-tests-fs-bcachefs-bcachefs-tools/notes
+
+The symlink is untracked too and gets removed by the same clean — but
+only the symlink. Recreate it with `ln -sfn` after a release; the notes
+themselves are never in the worktree.
+
 ### Calibrate to the risk
 
 - **Kernel code** (`fs/`): Go slow. Research thoroughly. Always discuss
@@ -156,7 +166,7 @@ clean and make it easy to compare old vs new or revert.
 - `bch_bindgen` generates Rust bindings via bindgen, plus hand-written
   safe wrappers for btree iteration, journal parsing, extent iteration,
   printbuf, and superblock access
-- Typed bkey dispatch (`BkeyValSC`, `BkeyValI`) is code-generated from
+- Typed bkey dispatch (`BkeyValSC`, `BkeyValS`) is code-generated from
   the `KEY_TYPE_*` x-macro
 - Transaction restart handling uses `lockrestart_do` / `for_each`
   patterns that retry on restart errors

@@ -21,7 +21,7 @@
 // rather than re-styling the hand-written fs/ code and bindgen's output.
 #![allow(unsafe_op_in_unsafe_fn)]
 // The in-kernel build enables missing_docs; the generated bindings (bindgen's C
-// enums + the codegen BkeyVal* enums) have undocumented variants. The kernel's
+// enums + the codegen Bkey*Typed enums) have undocumented variants. The kernel's
 // own bindings crate allows it for the same reason.
 #![allow(missing_docs)]
 // The kernel passes its whole rust_allowed_features list as a crate attribute,
@@ -29,9 +29,12 @@
 // using every feature in it is not a defect in this crate, but under
 // -D warnings (CONFIG_WERROR) unused_features makes it a build failure.
 #![allow(unused_features)]
-// Generated extern blocks reference kernel types bindgen flags as not FFI-safe
-// (e.g. its_array); harmless, and allowed on the kernel's own bindings crate.
-#![allow(improper_ctypes)]
+// The kernel build's generated extern blocks reference kernel types bindgen
+// flags as not FFI-safe (e.g. its_array); harmless, and allowed on the
+// kernel's own bindings crate. Userspace's are clean, so there it warns -
+// though not of c_extern!'s declarations, which rustc doesn't lint in what a
+// proc macro generates: c_extern! checks its own pointers are thin.
+#![cfg_attr(kernel, allow(improper_ctypes))]
 
 #[cfg(kernel)]
 const __LOG_PREFIX: &[u8] = b"bcachefs\0";
@@ -44,22 +47,64 @@ pub mod btree;
 pub mod debug {
     pub mod tests;
 }
+#[path = "fs/acl.rs"]          pub mod acl;
+#[path = "fs/check.rs"]        pub mod check;
+#[path = "fs/check_dir_structure.rs"] pub mod check_dir_structure;
+#[path = "fs/check_nlinks.rs"] pub mod check_nlinks;
+#[path = "fs/check_dirents.rs"] pub mod check_dirents;
+#[path = "fs/check_extents.rs"] pub mod check_extents;
+#[path = "fs/check_inodes.rs"] pub mod check_inodes;
+#[path = "fs/check_root.rs"]   pub mod check_root;
+#[path = "fs/check_unreachable_inodes.rs"] pub mod check_unreachable_inodes;
+#[path = "fs/check_xattrs.rs"] pub mod check_xattrs;
+#[path = "fs/fix_reflink_p.rs"] pub mod fix_reflink_p;
 #[path = "fs/dirent.rs"]       pub mod dirent;
 #[path = "init/fs.rs"]          pub mod fs;
+pub mod init {
+    #[path = "damage.rs"] pub mod damage;
+    #[path = "error.rs"] pub mod error;
+    #[path = "passes.rs"] pub mod passes;
+    #[path = "progress.rs"] pub mod progress;
+}
 #[path = "fs/inode.rs"]        pub mod inode;
+#[path = "fs/lostfound.rs"]    pub mod lostfound;
 #[path = "journal/read.rs"]     pub mod journal;
 #[path = "fs/namei.rs"]        pub mod namei;
 pub mod sb;
-/// Name<->value tables for the snapshot/subvolume state codewords, generated
-/// from the BCH_*_STATES() x-macros in snapshots/format.h:
+pub mod snapshots {
+    #[path = "check_snapshots.rs"] pub mod check_snapshots;
+    #[path = "snapshot.rs"] pub mod snapshot;
+    #[path = "subvolume.rs"] pub mod subvolume;
+}
+/// Name<->value tables for the snapshot/subvolume state codewords, from the
+/// BCH_*_STATES() x-macros:
 pub mod snapshot_states {
-    include!(concat!(env!("OUT_DIR"), "/snapshot_states_gen.rs"));
+    macro_rules! value_table {
+        ($table:ident, $(($name:tt, $value:expr $(, $($rest:tt)*)?)),* $(,)?) => {
+            pub const $table: &[(&str, u64)] = &[$((stringify!($name), $value),)*];
+        };
+    }
+    macro_rules! snapshot_states { ($($e:tt)*) => { value_table!(SNAPSHOT_STATE_VALUES, $($e)*); }; }
+    macro_rules! subvolume_states { ($($e:tt)*) => { value_table!(SUBVOLUME_STATE_VALUES, $($e)*); }; }
+    crate::c::BCH_SNAPSHOT_STATES!(snapshot_states);
+    crate::c::BCH_SUBVOLUME_STATES!(subvolume_states);
 }
 #[path = "fs/str_hash.rs"]     pub mod str_hash;
+/// The records types defined in Rust that C shares are written from.
+#[path = "types/lib.rs"]       pub mod types;
+pub mod cstructs;
 pub mod typeinfo;
 pub mod util;
+/// The VFS, for its Rust entry points - kernel only, as C's
+/// #ifndef NO_BCACHEFS_FS.
+#[cfg(kernel)]
+pub mod vfs {
+    pub mod dentry;
+    pub mod inode;
+}
 #[path = "fs/xattr.rs"]        pub mod xattr;
 pub mod data {
+    pub mod checksum;
     pub mod extents;
     pub mod io_misc;
 }
@@ -80,26 +125,39 @@ pub mod c {
     #![allow(unused)]
     #![allow(unnecessary_transmutes)]
 
-    // Kernel types (bio, __u64, locks, …) that the fs/ bindings reference are
-    // blocklisted by build.rs and resolved here. Userspace and local builds
-    // source them from bcachefs-shim; the in-kernel build (`--cfg kernel`)
-    // sources them from the kernel crate's raw bindings instead.
+    // The kernel's types and functions (bio, __u64, locks, …). Userspace
+    // builds take them from bcachefs-shim; the in-kernel build (`--cfg
+    // kernel`) from the kernel crate's raw bindings, and what those don't
+    // cover - the CRCs, genradix, the vendored closures - from codegen.rs's.
     #[cfg(not(kernel))]
     pub use bcachefs_shim::c::*;
     #[cfg(kernel)]
     pub use kernel::bindings::*;
+    #[cfg(kernel)]
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+    // The types defined in Rust that C shares. printbuf the shim has too - ours.
+    pub use crate::cstructs::c::*;
+    pub use crate::cstructs::c::printbuf;
 
     // Userspace #defines timespec64 → timespec (include/linux/time64.h), so
     // bindgen never emits a timespec64; alias it so fs/ can name the kernel's
     // real return type (timespec64) uniformly across both builds.
     #[cfg(not(kernel))]
     pub type timespec64 = timespec;
+    // Likewise list_head and the hlists, which are liburcu's
+    // (include/linux/list.h): for the types defined in Rust that hold them.
+    #[cfg(not(kernel))]
+    pub type list_head = cds_list_head;
+    #[cfg(not(kernel))]
+    pub type hlist_head = cds_hlist_head;
+    #[cfg(not(kernel))]
+    pub type hlist_node = cds_hlist_node;
+    // And the kernel's rcu_head, which is #define rcu_head callback_head: a
+    // macro, which the kernel crate's bindings don't have.
+    #[cfg(kernel)]
+    pub type rcu_head = callback_head;
 
-    // The generated bindings carry #[derive(TypeInfo)] on the bch_* family
-    // (injected by codegen.rs); bring the derive macro into scope for them.
-    use typeinfo_macros::TypeInfo;
-
-    include!(concat!(env!("OUT_DIR"), "/bcachefs.rs"));
 
     crate::impl_darray!(bch_sb_handles, bch_sb_handle);
 
@@ -117,8 +175,8 @@ pub mod c {
     impl bch_sb_field_crypt {
         pub fn scrypt_flags(&self) -> Option<bch_scrypt_flags> {
             use core::convert::TryInto;
-            match bch_kdf_types(bch_crypt_flags(self.flags).TYPE().try_into().ok()?) {
-                bch_kdf_types::BCH_KDF_SCRYPT => Some(bch_scrypt_flags(self.kdf_flags)),
+            match bch_kdf_types(bch_crypt_flags(self.flags.get()).TYPE().try_into().ok()?) {
+                bch_kdf_types::BCH_KDF_SCRYPT => Some(bch_scrypt_flags(self.kdf_flags.get())),
                 _ => None,
             }
         }
@@ -152,11 +210,11 @@ pub mod c {
 
         /// Plaintext (unencrypted) key for the crypt field (remove-passphrase).
         pub fn new_unencrypted(key: bch_key) -> Self {
-            Self { magic: u64::from_le_bytes(*Self::MAGIC).to_le(), key }
+            Self { magic: u64::from_le_bytes(*Self::MAGIC).into(), key }
         }
 
         pub fn is_encrypted(&self) -> bool {
-            u64::from_le(self.magic) != u64::from_le_bytes(*Self::MAGIC)
+            self.magic.get() != u64::from_le_bytes(*Self::MAGIC)
         }
 
         pub fn into_key(self) -> bch_key {
@@ -228,14 +286,57 @@ pub type opt_id = c::bch_opt_id;
 #[allow(non_camel_case_types)]
 pub type btree_id = c::btree_id;
 
-include!(concat!(env!("OUT_DIR"), "/newtype_enum_aliases_gen.rs"));
-include!(concat!(env!("OUT_DIR"), "/btree_ids_gen.rs"));
+// The x-macro enums' values by their list names - btree_id::extents for
+// BTREE_ID_extents - and their count: an x-macro list, with [the enum, the
+// prefix its values have, nr|max = its count].
+macro_rules! newtype_enum_aliases {
+    ([$ty:ident, $prefix:ident, $nr_alias:ident = $nr:ident] $(($name:tt $(, $($rest:tt)*)?)),* $(,)?) => {
+        #[allow(non_upper_case_globals)]
+        impl c::$ty {
+            $(newtype_enum_aliases!(@alias $prefix $name);)*
+            pub const $nr_alias: Self = Self::$nr;
+        }
+    };
+    // a name that isn't an identifier - 31bit_dirent_offset - has none
+    (@alias $prefix:ident $name:ident) => { ::paste::paste! {
+        pub const $name: Self = Self::[<$prefix _ $name>];
+    } };
+    (@alias $prefix:ident $name:tt) => {};
+}
+c::BCH_METADATA_VERSIONS!(newtype_enum_aliases [bcachefs_metadata_version, bcachefs_metadata_version, max = bcachefs_metadata_version_max]);
+c::BCH_OPTS!(newtype_enum_aliases [bch_opt_id, Opt, nr = bch2_opts_nr]);
+c::BCH_BTREE_IDS!(newtype_enum_aliases [btree_id, BTREE_ID, nr = BTREE_ID_NR]);
+c::BCH_BKEY_TYPES!(newtype_enum_aliases [bch_bkey_type, KEY_TYPE, nr = KEY_TYPE_MAX]);
+c::BCH_DATA_TYPES!(newtype_enum_aliases [bch_data_type, BCH_DATA, nr = BCH_DATA_NR]);
+c::BCH_COMPRESSION_TYPES!(newtype_enum_aliases [bch_compression_type, BCH_COMPRESSION_TYPE, nr = BCH_COMPRESSION_TYPE_NR]);
+c::BCH_JSET_ENTRY_TYPES!(newtype_enum_aliases [bch_jset_entry_type, BCH_JSET_ENTRY, nr = BCH_JSET_ENTRY_NR]);
+c::BCH_SB_COMPAT!(newtype_enum_aliases [bch_sb_compat, BCH_COMPAT, nr = BCH_COMPAT_NR]);
+c::BCH_SB_FIELDS!(newtype_enum_aliases [bch_sb_field_type, BCH_SB_FIELD, nr = BCH_SB_FIELD_NR]);
+c::BCH_DISK_ACCOUNTING_TYPES!(newtype_enum_aliases [disk_accounting_type, BCH_DISK_ACCOUNTING, nr = BCH_DISK_ACCOUNTING_TYPE_NR]);
+c::BCH_RECONCILE_ACCOUNTING!(newtype_enum_aliases [bch_reconcile_accounting_type, BCH_RECONCILE_ACCOUNTING, nr = BCH_RECONCILE_ACCOUNTING_NR]);
+
+// BCH_BTREE_IDS(): every btree id, and those whose keys are snapshotted - as
+// C's btree_has_snapshots_mask.
+macro_rules! btree_has_snapshots {
+    () => { false };
+    (BTREE_IS_snapshots $($rest:tt)*) => { true };
+    ($first:tt $($rest:tt)*) => { btree_has_snapshots!($($rest)*) };
+}
+macro_rules! btree_ids_known {
+    ($(($name:tt, $nr:literal, $($flag:tt)|+ $(, $($rest:tt)*)?)),* $(,)?) => { ::paste::paste! {
+        pub const BTREE_IDS_KNOWN: &[c::btree_id] = &[$(c::btree_id::[<BTREE_ID_ $name>],)*];
+
+        /// Btrees whose keys are snapshotted; mirrors the C btree_has_snapshots_mask.
+        pub const BTREE_HAS_SNAPSHOTS_MASK: u64 =
+            0 $(| if btree_has_snapshots!($($flag)*) { 1u64 << $nr } else { 0 })*;
+    } };
+}
+c::BCH_BTREE_IDS!(btree_ids_known);
 
 // Position constructors/sentinels live with bkey; re-exported here for the
 // `crate::POS_MIN` / `crate::SPOS_MAX` spelling used across the tree and the
 // tools binary.
 pub use btree::bkey::{pos, spos, POS_MAX, POS_MIN, SPOS_MAX};
-#[cfg(feature = "std")]
 pub use util::printbuf::printbuf_to_formatter;
 #[cfg(feature = "std")]
 pub use btree::bbpos::{bbpos_range_parse, BbposRange};

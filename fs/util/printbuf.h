@@ -67,49 +67,8 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 
-enum printbuf_si {
-	PRINTBUF_UNITS_2,	/* use binary powers of 2^10 */
-	PRINTBUF_UNITS_10,	/* use powers of 10^3 (standard SI) */
-};
-
-#define PRINTBUF_INLINE_TABSTOPS	8
-
-struct printbuf {
-	char			*buf;
-	unsigned		size;
-	unsigned		pos;
-	unsigned		last_newline;
-	unsigned		last_field;
-	unsigned		indent;
-	/*
-	 * If nonzero, allocations will be done with GFP_ATOMIC:
-	 */
-	u8			atomic;
-	bool			allocation_failure:1;
-	bool			heap_allocated:1;
-	bool			overflow:1;
-	bool			suppress:1; /* Ratelimited or already printed */
-	enum printbuf_si	si_units:1;
-	bool			human_readable_units:1;
-	bool			has_indent_or_tabstops:1;
-	bool			may_vmalloc:1;
-	u8			nr_tabstops;
-
-	/*
-	 * Do not modify directly: use printbuf_tabstop_add(),
-	 * printbuf_tabstop_get()
-	 */
-	u8			cur_tabstop;
-	u8			_tabstops[PRINTBUF_INLINE_TABSTOPS];
-};
-
-struct printbuf_restore {
-	unsigned		pos;
-	unsigned		last_newline;
-	unsigned		last_field;
-	unsigned		indent;
-	u8			cur_tabstop;
-};
+#include "enum_kind.h"
+#include "util/printbuf_gen.h"
 
 static inline struct printbuf_restore printbuf_state_save(struct printbuf *buf)
 {
@@ -137,30 +96,17 @@ int bch2_printbuf_make_room(struct printbuf *, unsigned);
 __printf(2, 3) void bch2_prt_printf(struct printbuf *out, const char *fmt, ...);
 __printf(2, 0) void bch2_prt_vprintf(struct printbuf *out, const char *fmt, va_list);
 const char *bch2_printbuf_str(const struct printbuf *);
-void bch2_printbuf_exit(struct printbuf *);
 
-void bch2_printbuf_tabstops_reset(struct printbuf *);
 void bch2_printbuf_tabstop_pop(struct printbuf *);
-int bch2_printbuf_tabstop_push(struct printbuf *, unsigned);
 
-void bch2_printbuf_indent_add(struct printbuf *, unsigned);
 void bch2_printbuf_indent_add_nextline(struct printbuf *, unsigned);
-void bch2_printbuf_indent_sub(struct printbuf *, unsigned);
 
-void bch2_prt_newline(struct printbuf *);
 void bch2_printbuf_ensure_trailing_newline(struct printbuf *);
 void bch2_printbuf_strip_trailing_newline(struct printbuf *);
-void bch2_prt_tab(struct printbuf *);
-void bch2_prt_tab_rjust(struct printbuf *);
-void bch2_printbuf_tabstop_align(struct printbuf *);
 
-void bch2_prt_bytes_indented(struct printbuf *, const char *, unsigned);
-void bch2_prt_human_readable_u64(struct printbuf *, u64);
 void bch2_prt_human_readable_s64(struct printbuf *, s64);
-void bch2_prt_units_u64(struct printbuf *, u64);
 void bch2_prt_units_s64(struct printbuf *, s64);
 void bch2_prt_string_option(struct printbuf *, const char * const[], size_t);
-void bch2_prt_bitflags(struct printbuf *, const char * const[], u64);
 void bch2_prt_bitflags_vector(struct printbuf *, const char * const[],
 			      unsigned long *, unsigned);
 

@@ -4,6 +4,9 @@
 
 #include <linux/bio.h>
 #include <linux/blkdev.h>
+#ifdef __KERNEL__
+#include <linux/capability.h>
+#endif
 #include <linux/errno.h>
 #include <linux/freezer.h>
 #include <linux/kernel.h>
@@ -26,7 +29,16 @@
 #include "darray.h"
 #include "time_stats.h"
 
-struct closure;
+#include "printbuf.h"
+#ifdef __KERNEL__
+#include <linux/cpumask.h>
+#include <linux/numa.h>
+#else
+#include <uuid/uuid.h>
+#endif
+#include <linux/uuid.h>
+#include <linux/sched/mm.h>
+#include "util/util_gen.h"
 
 #ifdef CONFIG_BCACHEFS_DEBUG
 #define EBUG_ON(cond)		BUG_ON(cond)
@@ -146,7 +158,6 @@ do {									\
 #define prt_bitflags_vector(...)	bch2_prt_bitflags_vector(__VA_ARGS__)
 
 void bch2_pr_time_units(struct printbuf *, u64);
-void bch2_prt_datetime(struct printbuf *, time64_t);
 
 #ifdef __KERNEL__
 static inline void uuid_unparse_lower(u8 *uuid, char *out)
@@ -168,7 +179,6 @@ static inline void pr_uuid(struct printbuf *out, u8 *uuid)
 int bch2_strtoint_h(const char *, int *);
 int bch2_strtouint_h(const char *, unsigned int *);
 int bch2_strtoll_h(const char *, long long *);
-int bch2_strtoull_h(const char *, unsigned long long *);
 int bch2_strtou64_h(const char *, u64 *);
 
 static inline int bch2_strtol_h(const char *cp, long *res)
@@ -241,14 +251,11 @@ static inline int bch2_strtoul_h(const char *cp, long *res)
 bool bch2_is_zero(const void *, size_t);
 
 u64 bch2_read_flag_list_mask(const char *, const char * const[], u64);
-u64 bch2_read_flag_list(const char *, const char * const[]);
 
 void bch2_prt_u64_base2_nbits(struct printbuf *, u64, unsigned);
 void bch2_prt_u64_base2(struct printbuf *, u64);
 
 void bch2_print_string_as_lines(const char *, const char *);
-
-DEFINE_DARRAY_NAMED(bch_stacktrace, unsigned long);
 
 int bch2_save_backtrace(bch_stacktrace *stack, struct task_struct *, unsigned, gfp_t);
 void bch2_prt_backtrace(struct printbuf *, bch_stacktrace *);
@@ -275,18 +282,6 @@ void bch2_time_stats_json_to_text(struct printbuf *, struct bch2_time_stats *,
 	(((_ewma << _weight) - _ewma) + (val)) >> _weight;		\
 })
 
-struct bch_ratelimit {
-	/* Next time we want to do some work, in nanoseconds */
-	u64			next;
-
-	/*
-	 * Rate at which we want to do work, in units per nanosecond
-	 * The units here correspond to the units passed to
-	 * bch2_ratelimit_increment()
-	 */
-	unsigned		rate;
-};
-
 static inline void bch2_ratelimit_reset(struct bch_ratelimit *d)
 {
 	d->next = local_clock();
@@ -294,30 +289,6 @@ static inline void bch2_ratelimit_reset(struct bch_ratelimit *d)
 
 u64 bch2_ratelimit_delay(struct bch_ratelimit *);
 void bch2_ratelimit_increment(struct bch_ratelimit *, u64);
-
-struct bch_pd_controller {
-	struct bch_ratelimit	rate;
-	unsigned long		last_update;
-
-	s64			last_actual;
-	s64			smoothed_derivative;
-
-	unsigned		p_term_inverse;
-	unsigned		d_smooth;
-	unsigned		d_term;
-
-	/* for exporting to sysfs (no effect on behavior) */
-	s64			last_derivative;
-	s64			last_proportional;
-	s64			last_change;
-	s64			last_target;
-
-	/*
-	 * If true, the rate will not increase if bch2_ratelimit_delay()
-	 * is not being called often enough.
-	 */
-	bool			backpressure;
-};
 
 void bch2_pd_controller_update(struct bch_pd_controller *, s64, s64, int);
 void bch2_pd_controller_init(struct bch_pd_controller *);
@@ -442,25 +413,6 @@ do {									\
 	set_current_state(TASK_RUNNING);				\
 	_ret;								\
 })
-
-u64 bch2_get_random_u64_below(u64);
-
-/*
- * Rust-facing wrappers: local_clock() is a static inline and cond_resched() is a
- * macro, so neither binds through bindgen. Wrapping them as bch2_* static
- * inlines (allowlisted, so the codegen's wrap_static_fns emits callable
- * wrappers) lets fs/ Rust call them uniformly across the kernel and userspace
- * builds, with the macro expanded at C-compile time.
- */
-static inline u64 bch2_local_clock(void)
-{
-	return local_clock();
-}
-
-static inline void bch2_cond_resched(void)
-{
-	cond_resched();
-}
 
 /*
  * All-ones mask of width @bits, defined for the full range 0..64 — unlike
@@ -862,8 +814,6 @@ do {									\
 })
 
 #include <linux/sched/mm.h>
-
-struct memalloc_flags { unsigned flags; };
 
 DEFINE_CLASS(memalloc_flags, struct memalloc_flags,
 	     memalloc_flags_restore(_T.flags),

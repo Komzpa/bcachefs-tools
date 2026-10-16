@@ -1,5 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0
 
+/* DOC(btree-node-read)
+ *
+ * A btree node read has three outcomes:
+ *
+ *   clean     - every bset parsed and validated.
+ *   degraded  - damage was worked around in memory: a bset with a bad checksum
+ *               kept, an invalid bkey dropped, the tail of a bset truncated.
+ *               The node is usable, but the copy on disk isn't fixed until the
+ *               node is rewritten: it's flagged need_rewrite and
+ *               need_rewrite_error. If the replica used lost keys - dropped
+ *               as invalid, a bset truncated or missing: its failure is
+ *               btree_node_validate_err_keys_lost - the btree lost data,
+ *               bch2_btree_lost_data().
+ *   unusable  - nothing parses, or there's no replica left to try: the caller
+ *               gets btree_node_validate_err.
+ *
+ * Degraded vs. unusable depends only on the damage - FSCK_CAN_FIX, and whether
+ * another replica is worth reading - never on fix_errors. fix_errors decides
+ * whether a repair gets written, and bch2_async_btree_op() gates that on a
+ * write ref, so a read-only mount reads degraded nodes and writes nothing.
+ * Making the read itself depend on fix_errors makes a parseable node unreadable
+ * on an ordinary mount, and topology repair then livelocks on it.
+ */
+
 #include "bcachefs.h"
 
 #include "alloc/buckets.h"
@@ -156,8 +180,10 @@ static int __btree_err(enum bch_fsck_flags flags,
 		btree_err_msg(err_msg, c, ca, b, i, k, fmt, args);
 		va_end(args);
 
-		bch2_dev_io_failures_mut(failed, ca->dev_idx)->errcode =
-			bch_err_throw(c, btree_node_validate_err);
+		/* not over keys_lost, from earlier in this replica: */
+		struct bch_dev_io_failures *f = bch2_dev_io_failures_mut(failed, ca->dev_idx);
+		if (!bch2_err_matches(f->errcode, BCH_ERR_btree_node_validate_err))
+			f->errcode = bch_err_throw(c, btree_node_validate_err);
 
 		struct extent_ptr_decoded pick;
 		bool have_retry = bch2_bkey_pick_read_device(c,
@@ -214,6 +240,20 @@ static int __btree_err(enum bch_fsck_flags flags,
 })
 
 #define btree_err_on(cond, ...)	(unlikely(cond) ? btree_err(__VA_ARGS__) : false)
+
+/*
+ * The replica being read lost keys - dropped as invalid, a bset truncated or
+ * missing: recorded against its device, as its error, so that if it's the
+ * replica the read ends up using, the btree is flagged as having lost data.
+ * No @failed when scanning for btree nodes.
+ */
+static void btree_node_read_keys_lost(struct bch_fs *c, struct bch_dev *ca,
+				      struct bch_io_failures *failed)
+{
+	if (failed)
+		bch2_dev_io_failures_mut(failed, ca->dev_idx)->errcode =
+			bch_err_throw(c, btree_node_validate_err_keys_lost);
+}
 
 /*
  * When btree topology repair changes the start or end of a node, that might
@@ -588,6 +628,7 @@ got_good_key:
 		memmove_u64s_down(k, (u64 *) k + next_good_key, (u64 *) vstruct_end(i) - (u64 *) k);
 		set_btree_node_need_rewrite(b);
 		set_btree_node_need_rewrite_error(b);
+		btree_node_read_keys_lost(c, ca, failed);
 	}
 fsck_err:
 	return ret;
@@ -665,8 +706,10 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 					 c, ca, b, i, NULL,
 					 bset_past_end_of_btree_node,
 					 "bset past end of btree node (offset %u len %u but written %zu)",
-					 b->written, sectors, ptr_written ?: btree_sectors(c)))
+					 b->written, sectors, ptr_written ?: btree_sectors(c))) {
 				i->u64s = 0;
+				btree_node_read_keys_lost(c, ca, failed);
+			}
 			if (good_csum_type) {
 				struct bch_csum csum = csum_vstruct(c, BSET_CSUM_TYPE(i), nonce, b->data);
 				bool csum_bad = bch2_crc_cmp(b->data->csum, csum);
@@ -729,8 +772,10 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 					 c, ca, b, i, NULL,
 					 bset_past_end_of_btree_node,
 					 "bset past end of btree node (offset %u len %u but written %zu)",
-					 b->written, sectors, ptr_written ?: btree_sectors(c)))
+					 b->written, sectors, ptr_written ?: btree_sectors(c))) {
 				i->u64s = 0;
+				btree_node_read_keys_lost(c, ca, failed);
+			}
 			if (good_csum_type) {
 				struct bch_csum csum = csum_vstruct(c, BSET_CSUM_TYPE(i), nonce, bne);
 				bool csum_bad = bch2_crc_cmp(bne->csum, csum);
@@ -801,24 +846,26 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 	}
 
 	if (ptr_written) {
-		btree_err_on(b->written < ptr_written,
-			     FSCK_CAN_FIX,
-			     c, ca, b, NULL, NULL,
-			     btree_node_data_missing,
-			     "btree node data missing: expected %u sectors, found %u",
-			     ptr_written, b->written);
+		if (btree_err_on(b->written < ptr_written,
+				 FSCK_CAN_FIX,
+				 c, ca, b, NULL, NULL,
+				 btree_node_data_missing,
+				 "btree node data missing: expected %u sectors, found %u",
+				 ptr_written, b->written))
+			btree_node_read_keys_lost(c, ca, failed);
 	} else {
 		for (bne = write_block(b);
 		     bset_byte_offset(b, bne) < btree_buf_bytes(b);
 		     bne = (void *) bne + block_bytes(c))
-			btree_err_on(bne->keys.seq == b->data->keys.seq &&
-				     !bch2_journal_seq_is_blacklisted(c,
-								      le64_to_cpu(bne->keys.journal_seq),
-								      true),
-				     FSCK_CAN_FIX,
-				     c, ca, b, NULL, NULL,
-				     btree_node_bset_after_end,
-				     "found bset signature after last bset");
+			if (btree_err_on(bne->keys.seq == b->data->keys.seq &&
+					 !bch2_journal_seq_is_blacklisted(c,
+									  le64_to_cpu(bne->keys.journal_seq),
+									  true),
+					 FSCK_CAN_FIX,
+					 c, ca, b, NULL, NULL,
+					 btree_node_bset_after_end,
+					 "found bset signature after last bset"))
+				btree_node_read_keys_lost(c, ca, failed);
 	}
 
 	sorted = bch2_btree_bounce_alloc(c, btree_buf_bytes(b), &used_mempool);
@@ -865,6 +912,7 @@ int bch2_btree_node_read_done(struct bch_fs *c, struct bch_dev *ca,
 			set_btree_bset_end(b, b->set);
 			set_btree_node_need_rewrite(b);
 			set_btree_node_need_rewrite_error(b);
+			btree_node_read_keys_lost(c, ca, failed);
 			ret = 0;
 			continue;
 		}
@@ -982,7 +1030,9 @@ static void btree_node_read_work(struct work_struct *work)
 		/* Separate ratelimit states for soft vs. hard errors */
 		buf.suppress = __bch2_ratelimit(c, &c->btree.read_errors_soft);
 
-		if (!bch2_dev_io_failures(&failed, rb->pick.ptr.dev))
+		struct bch_dev_io_failures *used = bch2_dev_io_failures(&failed, rb->pick.ptr.dev);
+
+		if (!used)
 			prt_printf(&buf, "retry success");
 		else
 			prt_printf(&buf, "repair success");
@@ -994,6 +1044,11 @@ static void btree_node_read_work(struct work_struct *work)
 		}
 
 		prt_newline(&buf);
+
+		/* the replica we're using lost keys: the btree lost data */
+		if (used &&
+		    bch2_err_matches(used->errcode, BCH_ERR_btree_node_validate_err_keys_lost))
+			bch2_btree_lost_data(c, &buf, b->c.btree_id);
 	} else {
 		buf.suppress = true;
 	}
@@ -1203,9 +1258,9 @@ struct btree_node_scrub {
 };
 
 static bool btree_node_scrub_check(struct bch_fs *c, struct btree_node *data, unsigned ptr_written,
-				   struct printbuf *err)
+				   __le64 seq, struct printbuf *err)
 {
-	unsigned written = 0;
+	unsigned written = 0, end = ptr_written ?: btree_sectors(c);
 
 	if (le64_to_cpu(data->magic) != bset_magic(c)) {
 		prt_printf(err, "bad magic: want %llx, got %llx",
@@ -1213,20 +1268,35 @@ static bool btree_node_scrub_check(struct bch_fs *c, struct btree_node *data, un
 		return false;
 	}
 
-	while (written < (ptr_written ?: btree_sectors(c))) {
+	if (data->keys.seq != seq) {
+		prt_printf(err, "wrong btree node: seq %llx, want %llx",
+			   le64_to_cpu(data->keys.seq), le64_to_cpu(seq));
+		return false;
+	}
+
+	while (written < end) {
 		struct btree_node_entry *bne;
 		struct bset *i;
 		bool first = !written;
+		unsigned sectors;
 
 		if (first) {
 			bne = NULL;
 			i = &data->keys;
+			sectors = vstruct_sectors(data, c->block_bits);
 		} else {
 			bne = (void *) data + (written << 9);
 			i = &bne->keys;
 
-			if (!ptr_written && i->seq != data->keys.seq)
+			if (i->seq != data->keys.seq)
 				break;
+			sectors = vstruct_sectors(bne, c->block_bits);
+		}
+
+		if (written + sectors > end) {
+			prt_printf(err, "bset past end of btree node (offset %u len %u but written %u)",
+				   written, sectors, end);
+			return false;
 		}
 
 		struct nonce nonce = btree_nonce(i, written << 9);
@@ -1240,8 +1310,6 @@ static bool btree_node_scrub_check(struct bch_fs *c, struct btree_node *data, un
 					return false;
 				}
 			}
-
-			written += vstruct_sectors(data, c->block_bits);
 		} else {
 			if (good_csum_type) {
 				struct bch_csum csum = csum_vstruct(c, BSET_CSUM_TYPE(i), nonce, bne);
@@ -1250,9 +1318,15 @@ static bool btree_node_scrub_check(struct bch_fs *c, struct btree_node *data, un
 					return false;
 				}
 			}
-
-			written += vstruct_sectors(bne, c->block_bits);
 		}
+
+		written += sectors;
+	}
+
+	if (ptr_written && written < ptr_written) {
+		prt_printf(err, "btree node data missing: expected %u sectors, found %u",
+			   ptr_written, written);
+		return false;
 	}
 
 	return true;
@@ -1269,7 +1343,7 @@ static void btree_node_scrub_work(struct work_struct *work)
 	prt_newline(&err);
 
 	bool good = !scrub->bio.bi_status &&
-		btree_node_scrub_check(c, scrub->buf, scrub->written, &err);
+		btree_node_scrub_check(c, scrub->buf, scrub->written, scrub->seq, &err);
 	btree_node_scrub_report_fn report = scrub->report;
 
 	if (report) {

@@ -3,7 +3,8 @@
 #define _BCACHEFS_SUBVOLUME_H
 
 #include "util/darray.h"
-#include "snapshots/types.h"
+#include "snapshots/types_gen.h"
+#include "snapshots/subvolume_gen.h"
 
 static inline enum bch_subvolume_state bch2_subvolume_state(const struct bch_subvolume *s)
 {
@@ -24,66 +25,11 @@ static inline enum bch_subvolume_state bch2_subvolume_state_compat(const struct 
 		: bch2_subvolume_state_from_flags(s);
 }
 
-static inline bool bch2_subvolume_state_valid(enum bch_subvolume_state state)
-{
-	switch (state) {
-#define x(n, v) case SUBVOLUME_STATE_##n:
-	BCH_SUBVOLUME_STATES()
-#undef x
-		return true;
-	default:
-		return false;
-	}
-}
-
-/* Nearest-codeword decode for a corrupted state field (see snapshot.h): */
-static inline enum bch_subvolume_state
-bch2_subvolume_state_nearest(u32 v, unsigned *dist)
-{
-	enum bch_subvolume_state best = SUBVOLUME_STATE_live;
-	unsigned best_dist = 33;
-
-#define x(n, val)						\
-	if (hweight32(v ^ (val)) < best_dist) {			\
-		best_dist = hweight32(v ^ (val));		\
-		best = SUBVOLUME_STATE_##n;			\
-	}
-	BCH_SUBVOLUME_STATES()
-#undef x
-	*dist = best_dist;
-	return best;
-}
-
-const char *bch2_subvolume_state_str(enum bch_subvolume_state);
-void bch2_subvolume_state_set(struct bch_subvolume *, enum bch_subvolume_state);
-
-int bch2_check_subvols(struct bch_fs *);
-int bch2_check_subvol_children(struct bch_fs *);
-
-int bch2_subvolume_validate(struct bch_fs *, struct bkey_s_c,
-			    const struct bkey_validate_context *);
-void bch2_subvolume_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
-int bch2_subvolume_trigger(struct btree_trans *, struct btree_trigger_op);
-
 #define bch2_bkey_ops_subvolume ((struct bkey_ops) {		\
 	.key_validate	= bch2_subvolume_validate,		\
 	.val_to_text	= bch2_subvolume_to_text,		\
 	.trigger	= bch2_subvolume_trigger,		\
-	.min_val_size	= 16,					\
 })
-
-int bch2_subvol_has_children(struct btree_trans *, u32);
-int bch2_subvolume_get(struct btree_trans *, unsigned,
-		       bool, struct bch_subvolume *);
-int bch2_subvolume_get_key(struct btree_trans *, unsigned,
-			   bool, struct bkey_i_subvolume *);
-int bch2_subvolume_is_unlinked(struct btree_trans *, u32);
-int __bch2_subvolume_get_snapshot(struct btree_trans *, u32,
-				  u32 *, bool);
-int bch2_subvolume_get_snapshot(struct btree_trans *, u32, u32 *);
-
-int bch2_subvol_is_ro_trans(struct btree_trans *, u32, u32 *);
-int bch2_subvol_is_ro(struct bch_fs *, u32);
 
 static inline struct bkey_s_c
 bch2_btree_iter_peek_in_subvolume_max_type(struct btree_iter *iter, struct bpos end,
@@ -186,14 +132,5 @@ febk_in_subvolume_in_trans_cond(struct btree_trans *trans,
 	for_each_btree_key_in_subvolume_max_continue_in_trans(_trans, _iter,		\
 					_end, _subvolid, _flags, _k, _do);	\
 })
-
-int bch2_subvolume_unlink(struct btree_trans *, u32);
-int bch2_subvolume_create(struct btree_trans *, u64, u32, u32, u32 *, u32 *,
-			  struct bch_subvolume *, bool);
-
-int bch2_initialize_subvolumes(struct bch_fs *);
-int bch2_fs_upgrade_for_subvolumes(struct bch_fs *);
-
-void bch2_fs_subvolumes_init_early(struct bch_fs *);
 
 #endif /* _BCACHEFS_SUBVOLUME_H */
