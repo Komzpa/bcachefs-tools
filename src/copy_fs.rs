@@ -9,16 +9,17 @@
 // Converted from c_src/posix_to_bcachefs.c.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use bch_bindgen::fs::FsExt;
 use bch_bindgen::c;
 use bch_bindgen::data::io::{block_on, MAX_IO_SIZE};
 use bcachefs_kernel::btree;
-use bcachefs_kernel::btree::iter::{CommitFlags, CommitOpts};
+use bcachefs_kernel::btree::iter::CommitFlags;
 use bcachefs_kernel::data::io_misc;
-use bcachefs_kernel::{dirent, inode, namei, str_hash, xattr};
+use bcachefs_kernel::{acl, dirent, inode, namei, str_hash, xattr};
 use bcachefs_kernel::errcode::{ret_to_result_void as ret_to_result, BchError, bch_errcode};
 use bcachefs_kernel::fs::Fs;
 
@@ -31,13 +32,6 @@ const BCACHEFS_ROOT_SUBVOL: u64 = 1;
 const DT_DIR: u8  = 4;
 const DT_REG: u8  = 8;
 const DT_LNK: u8  = 10;
-
-/// Xattr namespace indices matching KEY_TYPE_XATTR_INDEX_* in xattr_format.h.
-const XATTR_INDEX_USER: i32     = 0;
-const XATTR_INDEX_ACL_ACCESS: i32 = 1;
-const XATTR_INDEX_ACL_DEFAULT: i32 = 2;
-const XATTR_INDEX_TRUSTED: i32  = 3;
-const XATTR_INDEX_SECURITY: i32 = 4;
 
 fn mode_to_type(mode: u32) -> u8 {
     ((mode >> 12) & 15) as u8
@@ -151,13 +145,13 @@ fn unlink_and_rm(
     dir: &mut c::bch_inode_unpacked,
     child_name: &CStr,
 ) -> Result<(), BchError> {
-    let qstr = dirent::qstr(child_name.to_bytes());
+    let child_name = OsStr::from_bytes(child_name.to_bytes());
     let mut child: c::bch_inode_unpacked = Default::default();
 
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
             namei::unlink_trans(
                 t,
@@ -165,13 +159,13 @@ fn unlink_and_rm(
                 dir,
                 zeroed_subvol_inum(),
                 &mut child,
-                &qstr,
+                child_name,
                 false,
             )
         },
     )?;
 
-    if child.bi_flags & (c::bch_inode_flags::BCH_INODE_unlinked as u32) == 0 {
+    if child.bi_flags & c::bch_inode_flags::BCH_INODE_unlinked.bits() == 0 {
         return Ok(());
     }
 
@@ -192,9 +186,9 @@ fn create_or_update_link(
 ) -> Result<(), BchError> {
     let dir_hash = str_hash::hash_info_init(fs, dir)?;
 
-    let qstr = dirent::qstr(name.to_bytes());
+    let os_name = OsStr::from_bytes(name.to_bytes());
 
-    match dirent::lookup(fs, dir_inum, &dir_hash, &qstr) {
+    match dirent::lookup(fs, dir_inum, &dir_hash, os_name) {
         Err(e) if e.matches(bch_errcode::BCH_ERR_ENOENT_str_hash_lookup) => {
             // Fall through to create
         }
@@ -213,8 +207,8 @@ fn create_or_update_link(
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new(),
-        |t| namei::link_trans(t, dir_inum, &mut dir_u, inum, &mut inode, &qstr),
+        CommitFlags::empty(),
+        |t| namei::link_trans(t, dir_inum, &mut dir_u, inum, &mut inode, os_name),
     )
 }
 
@@ -231,11 +225,11 @@ fn create_or_update_file(
 ) -> Result<c::bch_inode_unpacked, BchError> {
     let dir_hash = str_hash::hash_info_init(fs, dir)?;
 
-    let qname = dirent::qstr(name.to_bytes());
-    let child_inum = dirent::lookup(fs, dir_inum, &dir_hash, &qname);
+    let name = OsStr::from_bytes(name.to_bytes());
+    let child_inum = dirent::lookup(fs, dir_inum, &dir_hash, name);
 
     let mut child_inode: c::bch_inode_unpacked = Default::default();
-    let mut child_subvol : c::bch_subvolume = Default::default();
+    let mut child_subvol : c::Subvolume = Default::default();
 
     if let Ok(child_inum) = child_inum {
         // Already exists — update
@@ -249,7 +243,7 @@ fn create_or_update_file(
         // bch2_fsck_write_inode has its own commit_do loop internally —
         // don't wrap it in trans_commit_do or it double-nests.
         {
-            let trans = btree::BtreeTrans::new(fs);
+            let trans = bcachefs_kernel::btree_trans!(fs);
             inode::fsck_write_inode(&trans, &mut child_inode)?;
         }
     } else {
@@ -258,7 +252,7 @@ fn create_or_update_file(
         btree::iter::trans_commit_do(
             fs,
             None,
-            CommitOpts::new(),
+            CommitFlags::empty(),
             |t| {
                 namei::create_trans(
                     t,
@@ -266,11 +260,13 @@ fn create_or_update_file(
                     dir,
                     &mut child_inode,
                     &mut child_subvol,
-                    &qname,
+                    Some(name),
                     uid,
                     gid,
                     mode as _,
                     rdev as _,
+                    None,
+                    None,
                     zeroed_subvol_inum(),
                     0,
                 )
@@ -281,24 +277,9 @@ fn create_or_update_file(
     Ok(child_inode)
 }
 
-/// Resolve xattr name prefix to bcachefs xattr index.
-/// Returns (index, stripped_name) or None if unsupported.
-fn xattr_resolve_name(name: &[u8]) -> Option<(i32, &[u8])> {
-    if let Some(rest) = name.strip_prefix(b"user.") {
-        Some((XATTR_INDEX_USER, rest))
-    } else if let Some(rest) = name.strip_prefix(b"trusted.") {
-        Some((XATTR_INDEX_TRUSTED, rest))
-    } else if let Some(rest) = name.strip_prefix(b"security.") {
-        Some((XATTR_INDEX_SECURITY, rest))
-    } else if let Some(rest) = name.strip_prefix(b"system.posix_acl_access") {
-        Some((XATTR_INDEX_ACL_ACCESS, rest))
-    } else if let Some(rest) = name.strip_prefix(b"system.posix_acl_default") {
-        Some((XATTR_INDEX_ACL_DEFAULT, rest))
-    } else {
-        None
-    }
-}
-
+// st_*time is a time_t: 32 bits on some targets - where a timespec may also
+// have padding fields, which the struct update zeroes
+#[allow(clippy::unnecessary_cast, clippy::needless_update)]
 fn copy_times(fs: &Fs, dst: &mut c::bch_inode_unpacked, src: &rustix::fs::Stat) {
     let to_bch_time = |sec: i64, nsec: i64| {
         let ts = c::timespec64 {
@@ -331,13 +312,15 @@ fn copy_xattrs(
         return Ok(()); // silently skip if xattrs not supported
     }
 
+    let mut acl_flags = Vec::new();
+
     let mut pos = 0usize;
     while pos < attrs_size {
         let end = attrs_buf[pos..attrs_size].iter().position(|&b| b == 0).unwrap() + pos;
         let attr_name = &attrs_buf[pos..end];
         pos = end + 1;
 
-        let (xattr_type, stripped) = match xattr_resolve_name(attr_name) {
+        let (xattr_type, stripped) = match c::bch_xattr_type::from_name(attr_name) {
             Some(v) => v,
             None => continue,
         };
@@ -349,19 +332,39 @@ fn copy_xattrs(
             Err(_) => continue,
         };
 
-        let stripped_cstr = CString::new(stripped).unwrap();
+        // POSIX ACLs come in the xattr API's format; bcachefs stores its
+        // own. bch2_get_acl() goes by the inode's flags, not the xattrs:
+        // without them the ACLs are there and ignored.
+        let acl;
+        let value = if xattr_type.is_acl() {
+            let Some(v) = acl_from_xattr(&val_buf[..val_size]) else {
+                eprintln!("{}: {} isn't a POSIX ACL, not copied",
+                          src.to_string_lossy(), String::from_utf8_lossy(attr_name));
+                continue;
+            };
+            acl = v;
+            acl_flags.push(
+                if xattr_type == c::bch_xattr_type::KEY_TYPE_XATTR_INDEX_POSIX_ACL_ACCESS {
+                    c::bch_inode_flags::BCH_INODE_has_access_acl
+                } else {
+                    c::bch_inode_flags::BCH_INODE_has_default_acl
+                });
+            &acl[..]
+        } else {
+            &val_buf[..val_size]
+        };
 
         btree::iter::trans_commit_do(
             fs,
             None,
-            CommitOpts::new(),
+            CommitFlags::empty(),
             |t| {
                 xattr::set(
                     t,
                     subvol_inum(dst.bi_inum),
                     dst,
-                    &stripped_cstr,
-                    &val_buf[..val_size],
+                    OsStr::from_bytes(stripped),
+                    value,
                     xattr_type,
                     0,
                 )
@@ -369,7 +372,37 @@ fn copy_xattrs(
         )?;
     }
 
+    // Each set above reads the inode back into @dst, so a flag set before
+    // the last would be lost: set them now. Written with the rest of the
+    // inode by the caller.
+    for flag in acl_flags {
+        dst.set_flag(flag, true);
+    }
+
     Ok(())
+}
+
+/// A POSIX ACL as the xattr API gives it - <linux/posix_acl_xattr.h>: a
+/// version 2 header, then 8 byte entries - as bcachefs stores it. None if
+/// it isn't one.
+fn acl_from_xattr(value: &[u8]) -> Option<Vec<u8>> {
+    const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
+
+    let (header, entries) = value.split_at_checked(4)?;
+    if u32::from_le_bytes(header.try_into().ok()?) != POSIX_ACL_XATTR_VERSION ||
+       entries.len() % 8 != 0 {
+        return None;
+    }
+
+    let entries: Vec<c::AclEntry> = entries.chunks_exact(8)
+        .map(|e| c::AclEntry::new(u16::from_le_bytes([e[0], e[1]]),
+                                  u16::from_le_bytes([e[2], e[3]]),
+                                  u32::from_le_bytes([e[4], e[5], e[6], e[7]])).ok())
+        .collect::<Option<_>>()?;
+
+    let mut out = vec![0u8; acl::encoded_len(entries.iter().copied())];
+    acl::encode(entries.iter().copied(), &mut out);
+    Some(out)
 }
 
 fn write_data(
@@ -887,7 +920,11 @@ fn copy_dir(
             continue;
         }
 
-        if s.migrate_type == MigrateType::Migrate && d.stat.st_ino as u64 == s.bcachefs_inum {
+        // an ino_t: 32 bits on some targets
+        #[allow(clippy::unnecessary_cast)]
+        let src_ino = d.stat.st_ino as u64;
+
+        if s.migrate_type == MigrateType::Migrate && src_ino == s.bcachefs_inum {
             continue;
         }
 
@@ -906,7 +943,6 @@ fn copy_dir(
 
         // Hardlink handling
         if (d.stat.st_mode & libc::S_IFMT) == libc::S_IFREG && d.stat.st_nlink > 1 {
-            let src_ino = d.stat.st_ino as u64;
             if let Some(&dst_ino) = s.hardlinks.get(&src_ino) {
                 create_or_update_link(
                     fs, dir_inum, dst, &d.name,
@@ -926,7 +962,7 @@ fn copy_dir(
 
         // Record hardlink destination
         if (d.stat.st_mode & libc::S_IFMT) == libc::S_IFREG && d.stat.st_nlink > 1 {
-            s.hardlinks.insert(d.stat.st_ino as u64, inode.bi_inum);
+            s.hardlinks.insert(src_ino, inode.bi_inum);
         }
 
         let name_cstr = &d.name;
@@ -1024,10 +1060,11 @@ pub fn copy_fs(
 
     rustix::process::fchdir(src_fd).map_err(rustix_err)?;
 
-    copy_times(fs, &mut root_inode, &stat);
-
+    // Xattrs first: setting each reads the inode back, over the times.
     let dot = CString::new(".").unwrap();
     copy_xattrs(fs, &mut root_inode, &dot)?;
+
+    copy_times(fs, &mut root_inode, &stat);
 
     let dup_fd = rustix::io::dup(src_fd).map_err(rustix_err)?;
     copy_dir(fs, s, &mut root_inode, dup_fd, src_path)?;

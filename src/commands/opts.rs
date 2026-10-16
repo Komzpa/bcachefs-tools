@@ -15,8 +15,8 @@ fn leak(s: String) -> &'static str {
 /// Iterate bch2_opt_table entries matching flag_filter, calling f for each.
 fn for_each_opt(flag_filter: u32, mut f: impl FnMut(&'static str, &c::bch_option)) {
     for opt in bcachefs_kernel::opts::opt_table() {
-        if opt.flags as u32 & flag_filter == 0 { continue }
-        if opt.flags as u32 & c::opt_flags::OPT_HIDDEN as u32 != 0 { continue }
+        if opt.flags.bits() & flag_filter == 0 { continue }
+        if opt.flags.bits() & c::opt_flags::OPT_HIDDEN.bits() != 0 { continue }
         let Some(name) = opt.name() else { continue };
         f(name, opt);
     }
@@ -31,8 +31,8 @@ pub fn opts_usage_str(flags_all: u32, flags_none: u32) -> String {
     let mut out = String::new();
 
     for opt in bcachefs_kernel::opts::opt_table() {
-        if opt.flags as u32 & flags_all != flags_all { continue }
-        if opt.flags as u32 & flags_none != 0 { continue }
+        if opt.flags.bits() & flags_all != flags_all { continue }
+        if opt.flags.bits() & flags_none != 0 { continue }
         let Some(name) = opt.name() else { continue };
 
         let mut col = 0;
@@ -216,7 +216,7 @@ pub(crate) fn parse_opt_val(
     let mut err = Printbuf::new();
     match bcachefs_kernel::opts::opt_parse(None, opt, &c_val, Some(&mut err)) {
         Ok(v) => Ok(Some(v)),
-        Err(e) if e == -(c::bch_errcode::BCH_ERR_option_needs_open_fs as i32) => Ok(None),
+        Err(e) if e == -(c::bch_errcode::BCH_ERR_option_needs_open_fs.0 as i32) => Ok(None),
         Err(_) => {
             let msg = err.as_str();
             if msg.is_empty() {

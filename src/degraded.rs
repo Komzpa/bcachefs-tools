@@ -44,14 +44,14 @@ fn sb_opts(sb: &bch_sb_handle) -> Option<bch_opts> {
 /// What the filesystem says to do about a missing device, unless the caller
 /// said otherwise on the command line.
 fn degraded_action(sbs: &[(PathBuf, bch_sb_handle)], cli_opts: &bch_opts) -> u8 {
-    if opt_defined!(cli_opts, degraded) != 0 {
+    if opt_defined!(cli_opts, degraded) {
         return opt_get!(cli_opts, degraded);
     }
 
     sbs.first()
         .and_then(|(_, sb)| sb_opts(sb))
         .map(|o| opt_get!(o, degraded))
-        .unwrap_or(c::bch_degraded_actions::BCH_DEGRADED_ask as u8)
+        .unwrap_or(c::bch_degraded_actions::BCH_DEGRADED_ask.0 as u8)
 }
 
 /// Which refusal we are answering, and so what is at stake.
@@ -169,7 +169,7 @@ impl Ask {
         let present  = device_scan::present_devices(sbs).len();
 
         if present >= expected
-            || degraded_action(sbs, cli_opts) != c::bch_degraded_actions::BCH_DEGRADED_ask as u8
+            || degraded_action(sbs, cli_opts) != c::bch_degraded_actions::BCH_DEGRADED_ask.0 as u8
         {
             return None;
         }
@@ -344,8 +344,8 @@ mod tests {
     /// that, before anything touches a terminal.
     #[test]
     fn only_the_two_refusals_we_know_about_are_ours_to_ask_about() {
-        let lost   = BchError::from_errcode(errcode::insufficient_devices_data_lost);
-        let intact = BchError::from_errcode(errcode::insufficient_devices_data_intact);
+        let lost   = BchError::from(errcode::insufficient_devices_data_lost);
+        let intact = BchError::from(errcode::insufficient_devices_data_intact);
 
         assert_eq!(Situation::of(&lost),   Some(Situation::DataLost));
         assert_eq!(Situation::of(&intact), Some(Situation::DataIntact));
@@ -353,18 +353,18 @@ mod tests {
         for e in [
             // The parent, which a kernel that hasn't got the split still
             // throws: we cannot tell which situation it is, so we don't ask.
-            BchError::from_errcode(errcode::insufficient_devices_to_start),
-            BchError::from_errcode(errcode::EINVAL_opt_parse_str_required),
+            BchError::from(errcode::insufficient_devices_to_start),
+            BchError::from(errcode::EINVAL_opt_parse_str_required),
             // A flattened errno, which is what the mount(2) fallback gives us:
             // the same EINVAL a typo'd option produces.
-            BchError::from_raw(libc::EINVAL),
+            BchError::from(libc::EINVAL),
             BchError::from_raw(0),
             // A code from a kernel module newer than this binary - the normal
             // state of affairs for a filesystem that ships DKMS-only. The
             // errcode parent-chain walk BUG_ON()s rather than bounds-checking,
             // so what's being asserted here is as much "doesn't abort" as
             // "doesn't match".
-            BchError::from_raw(c::bch_errcode::BCH_ERR_MAX as i32 + 1),
+            BchError::from_raw(c::bch_errcode::BCH_ERR_MAX.0 as i32 + 1),
         ] {
             assert_eq!(Situation::of(&e), None, "{e:?}");
         }

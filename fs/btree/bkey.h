@@ -5,8 +5,8 @@
 #include <linux/bug.h>
 #include <linux/static_key.h>
 #include "bcachefs_format.h"
-#include "btree/bkey_types.h"
-#include "btree/types.h"
+#include "btree/bkey_gen.h"
+#include "btree/types_gen.h"
 #include "util/util.h"
 #include "util/vstructs.h"
 
@@ -26,38 +26,10 @@ void bch2_bkey_packed_to_binary_text(struct printbuf *,
 				     const struct bkey_format *,
 				     const struct bkey_packed *);
 
-enum bkey_lr_packed {
-	BKEY_PACKED_BOTH,
-	BKEY_PACKED_RIGHT,
-	BKEY_PACKED_LEFT,
-	BKEY_PACKED_NONE,
-};
+#include "btree/bkey_defs_gen.h"
 
 #define bkey_lr_packed(_l, _r)						\
 	((_l)->format + ((_r)->format << 1))
-
-/*
- * Wrapper for stack-allocated struct bkey_packed.
- *
- * The byte-aligned fast-path unpackers (__bch2_bkey_unpack_key_b,
- * __bkey_unpack_pos_b) issue an 8-byte unaligned load at @bytes +
- * uf->byte_offset, where byte_offset is signed and can be as low as -7
- * (and __bch2_bkey_unpack_key_b's header trick reads @bytes - 1). This
- * is safe for bkeys inside a bset (preceded by the bset header or by
- * another bkey), but reads into the stack redzone for a bare stack-local
- * struct bkey_packed. Wrap stack copies in this to provide the leading
- * padding.
- */
-struct bkey_packed_padded {
-	u8			_pad[8];
-	struct bkey_packed	k;
-};
-
-/* Same trick for stack-local struct bkey_i (when used as pack target). */
-struct bkey_i_padded {
-	u8			_pad[8];
-	struct bkey_i		k;
-};
 
 static inline void bkey_p_copy(struct bkey_packed *dst, const struct bkey_packed *src)
 {
@@ -75,8 +47,6 @@ static inline void bkey_val_copy(struct bkey_i *dst, const struct bkey_i *src)
 	dst->k.type	= src->k.type;
 	dst->k.u64s	= src->k.u64s;
 }
-
-struct btree;
 
 extern struct static_key_false bch2_debug_check_bkey_unpack;
 
@@ -221,7 +191,6 @@ static inline struct bpos bkey_max(struct bpos l, struct bpos r)
 	return bkey_gt(l, r) ? l : r;
 }
 
-void bch2_bpos_swab(struct bpos *);
 void bch2_bkey_swab_key(const struct bkey_format *, struct bkey_packed *);
 
 static __always_inline int bversion_cmp(struct bversion l, struct bversion r)
@@ -408,8 +377,6 @@ bool bch2_bkey_transform(const struct bkey_format *,
 			 const struct bkey_format *,
 			 const struct bkey_packed *);
 
-void __bch2_bkey_unpack_key(const struct bkey_format *, struct bkey *,
-			    const struct bkey_packed *);
 void __bch2_bkey_unpack_key_b(const struct btree *, struct bkey *,
 			      const struct bkey_packed *);
 void bch2_compute_bkey_unpack_consts(struct btree *);
@@ -424,12 +391,6 @@ struct bpos __bkey_unpack_pos_b(const struct btree *,
 bool bch2_bkey_pack_key(struct bkey_packed *, const struct bkey *,
 		   const struct bkey_format *);
 
-enum bkey_pack_pos_ret {
-	BKEY_PACK_POS_EXACT,
-	BKEY_PACK_POS_SMALLER,
-	BKEY_PACK_POS_FAIL,
-};
-
 enum bkey_pack_pos_ret bch2_bkey_pack_pos_lossy(struct bkey_packed *, const struct bpos *,
 					   const struct btree *);
 
@@ -437,8 +398,6 @@ bool bch2_bkey_pack_pos(struct bkey_packed *, struct bpos, const struct btree *)
 
 void bch2_bkey_unpack(const struct btree *, struct bkey_i *,
 		 const struct bkey_packed *);
-
-typedef void (*compiled_unpack_fn)(struct bkey *, const struct bkey_packed *);
 
 static inline void
 __bkey_unpack_key_format_checked(const struct btree *b,
@@ -608,19 +567,6 @@ void bch2_bkey_pack_test(void);
 #else
 static inline void bch2_bkey_pack_test(void) {}
 #endif
-
-#define bkey_fields()							\
-	x(BKEY_FIELD_INODE,		p.inode)			\
-	x(BKEY_FIELD_OFFSET,		p.offset)			\
-	x(BKEY_FIELD_SNAPSHOT,		p.snapshot)			\
-	x(BKEY_FIELD_SIZE,		size)				\
-	x(BKEY_FIELD_VERSION_HI,	bversion.hi)			\
-	x(BKEY_FIELD_VERSION_LO,	bversion.lo)
-
-struct bkey_format_state {
-	u64 field_min[BKEY_NR_FIELDS];
-	u64 field_max[BKEY_NR_FIELDS];
-};
 
 void bch2_bkey_format_init(struct bkey_format_state *);
 

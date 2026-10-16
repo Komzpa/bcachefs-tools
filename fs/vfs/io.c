@@ -19,6 +19,8 @@
 
 #include "journal/journal.h"
 
+#include "snapshots/subvolume.h"
+
 #include "vfs/fs.h"
 #include "vfs/io.h"
 #include "vfs/buffered.h"
@@ -171,9 +173,10 @@ void __bch2_i_sectors_acct(struct bch_fs *c, struct bch_inode_info *inode,
 	inode->v.i_blocks += sectors;
 
 #ifdef CONFIG_BCACHEFS_QUOTA
-	if (quota_res &&
-	    !test_bit(EI_INODE_SNAPSHOT, &inode->ei_flags) &&
-	    sectors > 0) {
+	if (test_bit(EI_INODE_SNAPSHOT, &inode->ei_flags))
+		return;
+
+	if (quota_res && sectors > 0) {
 		BUG_ON(sectors > quota_res->sectors);
 		BUG_ON(sectors > inode->ei_quota_reserved);
 
@@ -931,6 +934,13 @@ static loff_t bch2_remap_file_range_errcode(struct file *file_src, loff_t pos_sr
 	if (src == dst &&
 	    abs(pos_src - pos_dst) < len)
 		return bch_err_throw(c, EINVAL_remap_overlapping);
+
+	/*
+	 * bch2_open() refuses to open a file in a read-only subvolume for
+	 * writing, but that doesn't cover dedupe: may_dedupe_file() admits a
+	 * destination opened read-only, for its owner or CAP_SYS_ADMIN.
+	 */
+	try(bch2_subvol_is_ro(c, inode_inum(dst).subvol));
 
 	lock_two_nondirectories(&src->v, &dst->v);
 	bch2_lock_inodes(INODE_PAGECACHE_BLOCK, src, dst);

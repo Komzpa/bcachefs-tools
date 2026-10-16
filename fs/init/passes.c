@@ -12,7 +12,6 @@
 #include "btree/check.h"
 #include "btree/node_scan.h"
 
-#include "data/copygc.h"
 #include "data/ec/init.h"
 #include "data/reconcile/check.h"
 #include "data/reconcile/work.h"
@@ -179,7 +178,7 @@ void bch2_recovery_pass_set_no_ratelimit(struct bch_fs *c,
 
 	struct recovery_pass_entry *e = bch2_sb_recovery_pass_entry(c, pass);
 	if (e && !BCH_RECOVERY_PASS_NO_RATELIMIT(e)) {
-		SET_BCH_RECOVERY_PASS_NO_RATELIMIT(e, false);
+		SET_BCH_RECOVERY_PASS_NO_RATELIMIT(e, true);
 		bch2_write_super(c);
 	}
 }
@@ -766,12 +765,10 @@ int bch2_run_recovery_passes(struct bch_fs *c, u64 orig_passes_to_run, bool fail
 		if (ret && failfast)
 			break;
 
-		/* the point they wait for - see bch2_copygc_thread() */
+		/* the point it waits for - see bch2_reconcile_thread() */
 		if (prev <= BCH_RECOVERY_PASS_resume_logged_ops_early &&
-		    pass > BCH_RECOVERY_PASS_resume_logged_ops_early) {
-			bch2_copygc_wakeup(c);
+		    pass > BCH_RECOVERY_PASS_resume_logged_ops_early)
 			bch2_reconcile_wakeup(c);
-		}
 
 		prev = pass;
 	}
@@ -862,7 +859,7 @@ int bch2_run_recovery_passes_startup(struct bch_fs *c, enum bch_recovery_pass fr
 	 * We can't allow set_may_go_rw to be excluded; that would cause us to
 	 * use the journal replay keys for updates where it's not expected.
 	 */
-	c->opts.recovery_passes_exclude &= ~BCH_RECOVERY_PASS_set_may_go_rw;
+	c->opts.recovery_passes_exclude &= ~BIT_ULL(BCH_RECOVERY_PASS_set_may_go_rw);
 	passes &= ~c->opts.recovery_passes_exclude;
 
 	passes &= ~(BIT_ULL(from) - 1);

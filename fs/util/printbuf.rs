@@ -1,18 +1,17 @@
 use core::ffi::CStr;
-use core::fmt;
+use core::fmt::{self, Write as _};
 use core::ops::{Deref, DerefMut};
 
 use crate::c;
-#[cfg(feature = "std")]
 use crate::c::bpos as Bpos;
+use crate::util::os_str::{OsStr, OsStrExt};
 
-/// Rust wrapper around `c::printbuf` providing `fmt::Write` via
-/// `bch2_prt_bytes_indented`, which processes `\t`, `\r`, `\n` for
-/// tabstop and indent handling.
+/// fmt::Write goes through bch2_prt_bytes_indented(): `\t`, `\r` and `\n` are
+/// tabstops and indent.
+#[repr(transparent)]
 pub struct Printbuf(c::printbuf);
 
-/// RAII guard for printbuf indentation — calls `indent_sub` on drop.
-/// Use through `Printbuf::indent()`.
+/// Undoes Printbuf::indent() on drop.
 pub struct PrintbufIndent<'a> {
     buf: &'a mut Printbuf,
     spaces: u32,
@@ -38,14 +37,38 @@ impl Printbuf {
         Printbuf(c::printbuf::new())
     }
 
+    /// A C caller's printbuf, to write to - for a to_text C calls. Borrowed:
+    /// it's the caller's to free.
+    ///
+    /// # Safety
+    /// @raw is a valid printbuf nothing else touches for 'a.
+    pub unsafe fn borrow_raw<'a>(raw: *mut c::printbuf) -> &'a mut Printbuf {
+        unsafe { &mut *(raw as *mut Printbuf) }
+    }
+
     pub fn as_str(&self) -> &str {
         if self.0.buf.is_null() {
             ""
         } else {
-            unsafe { CStr::from_ptr(self.0.buf) }
+            unsafe { CStr::from_ptr(self.0.buf.cast()) }
                 .to_str()
                 .unwrap_or("")
         }
+    }
+
+    /// What's been written, as bytes - which needn't be UTF-8, after
+    /// write_bytes().
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.0.buf.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.0.buf as *const u8, self.0.pos as usize) }
+        }
+    }
+
+    /// What's been written, as a name: for building one.
+    pub fn as_os_str(&self) -> &OsStr {
+        OsStr::from_bytes(self.as_bytes())
     }
 
     /// Add a tabstop at `spaces` columns from the previous tabstop.
@@ -57,7 +80,6 @@ impl Printbuf {
         unsafe { c::bch2_printbuf_tabstops_reset(&mut self.0) };
     }
 
-    /// Reset tabstops and set new ones from a slice of column widths.
     pub fn tabstops(&mut self, widths: &[u32]) {
         self.tabstops_reset();
         for &w in widths {
@@ -73,21 +95,18 @@ impl Printbuf {
         unsafe { c::bch2_printbuf_indent_sub(&mut self.0, spaces) };
     }
 
-    /// Add indentation, returning a guard that removes it on drop.
-    /// Use the guard (which derefs to `&mut Printbuf`) for all
-    /// operations within the indented scope.
+    /// Indented until the guard drops.
     pub fn indent(&mut self, spaces: u32) -> PrintbufIndent<'_> {
         self.indent_add(spaces);
         PrintbufIndent { buf: self, spaces }
     }
 
-    /// Advance to next tabstop (equivalent to `\t` in format string).
+    /// `\t` in a format string.
     pub fn tab(&mut self) {
         unsafe { c::bch2_prt_tab(&mut self.0) };
     }
 
-    /// Right-justify previous text in current tabstop column
-    /// (equivalent to `\r` in format string).
+    /// `\r` in a format string: right-justify the text since the last tabstop.
     pub fn tab_rjust(&mut self) {
         unsafe { c::bch2_prt_tab_rjust(&mut self.0) };
     }
@@ -99,9 +118,7 @@ impl Printbuf {
         unsafe { c::bch2_printbuf_tabstop_align(&mut self.0) };
     }
 
-    /// Write a section of tabular data using automatic column alignment.
-    /// Creates a sub-buffer with the same human_readable setting, passes
-    /// it to `f`, calls `tabstop_align()`, then appends the result.
+    /// Tabular data written by @f, aligned by tabstop_align().
     pub fn aligned(&mut self, f: impl FnOnce(&mut Printbuf)) {
         let mut sub = Printbuf::new();
         sub.set_human_readable(self.is_human_readable());
@@ -110,19 +127,16 @@ impl Printbuf {
         fmt::Write::write_fmt(self, format_args!("{}", sub)).unwrap();
     }
 
-    /// Emit newline with indent handling
-    /// (equivalent to `\n` in format string).
+    /// `\n` in a format string.
     pub fn newline(&mut self) {
         unsafe { c::bch2_prt_newline(&mut self.0) };
     }
 
-    /// Print a u64 value using `bch2_prt_units_u64`, which respects
-    /// the `human_readable_units` flag on the printbuf.
+    /// Human-readable units if is_human_readable(), else raw.
     pub fn units_u64(&mut self, v: u64) {
         unsafe { c::bch2_prt_units_u64(&mut self.0, v) };
     }
 
-    /// Print a sector count as bytes (sectors << 9).
     pub fn units_sectors(&mut self, sectors: u64) {
         self.units_u64(sectors << 9);
     }
@@ -135,18 +149,21 @@ impl Printbuf {
         self.0.set_human_readable_units(v);
     }
 
-    /// Print a human-readable representation of a u64 value.
+    /// Whether this message is not to be printed: C's printbuf.suppress, for
+    /// a message that's printed only if what it reports turns out to need
+    /// it - scheduling a recovery pass, for one, clears it.
+    pub fn is_suppressed(&self) -> bool {
+        self.0.suppress()
+    }
+
+    pub fn set_suppressed(&mut self, v: bool) {
+        self.0.set_suppress(v);
+    }
+
     pub fn human_readable_u64(&mut self, v: u64) {
         unsafe { c::bch2_prt_human_readable_u64(&mut self.0, v) };
     }
 
-    /// Print a bcachefs metadata version number.
-    pub fn version(&mut self, v: u32) {
-        unsafe { c::bch2_version_to_text(&mut self.0, c::bcachefs_metadata_version(v)) };
-    }
-
-    /// Print superblock contents.
-    ///
     /// # Safety
     /// `fs` must be a valid pointer to a `bch_fs` or null.
     pub unsafe fn sb_to_text(&mut self, fs: *mut c::bch_fs, sb: &c::bch_sb,
@@ -154,17 +171,33 @@ impl Printbuf {
         c::bch2_sb_to_text(&mut self.0, fs, sb as *const _ as *mut _, layout, fields);
     }
 
-    /// Print a set of bitflags as comma-separated names.
+    /// As comma-separated names.
     ///
     /// # Safety
     /// `list` must be a valid null-terminated array of C string pointers.
-    pub unsafe fn prt_bitflags(&mut self, list: *const *const core::ffi::c_char, flags: u64) {
+    pub unsafe fn prt_bitflags(&mut self, list: *const *const crate::util::ffi::c_char, flags: u64) {
         c::bch2_prt_bitflags(&mut self.0, list, flags);
     }
 
-    /// Access the underlying `c::printbuf` for calling C prt_* functions.
+    /// For the C prt_*() functions.
     pub fn as_raw(&mut self) -> &mut c::printbuf {
         &mut self.0
+    }
+
+    /// Shadows fmt::Write's - an inherent method wins - so write!() has no
+    /// Result to discard: allocation failure is recorded in the printbuf, as
+    /// prt_printf() does.
+    pub fn write_fmt(&mut self, args: fmt::Arguments<'_>) {
+        let _ = fmt::Write::write_fmt(self, args);
+    }
+
+    /// Write @bytes as they are - a name, which needn't be UTF-8, and whose
+    /// newlines and tabs aren't indent or tabstops: as prt_bytes().
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        unsafe {
+            c::rust_prt_bytes(&mut self.0, bytes.as_ptr() as *const core::ffi::c_void,
+                              bytes.len() as core::ffi::c_uint);
+        }
     }
 }
 
@@ -173,7 +206,7 @@ impl fmt::Write for Printbuf {
         unsafe {
             c::bch2_prt_bytes_indented(
                 &mut self.0,
-                s.as_ptr() as *const core::ffi::c_char,
+                s.as_ptr() as *const crate::util::ffi::c_char,
                 s.len() as core::ffi::c_uint,
             );
         }
@@ -206,17 +239,21 @@ impl Drop for c::printbuf {
     }
 }
 
-#[cfg(feature = "std")]
 impl fmt::Display for Bpos {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         printbuf_to_formatter(f, |buf| unsafe { c::bch2_bpos_to_text(buf, *self) })
     }
 }
 
-#[cfg(feature = "std")]
+/// Display through a C *_to_text(), via a printbuf that lives only for the
+/// call. Its indent and tabstops start from scratch; the `\n`, `\t` and `\r`
+/// it leaves raw are interpreted by the destination, if that's a Printbuf.
+///
+/// Invalid UTF-8 comes out as U+FFFD without allocating, so this works
+/// in-kernel too.
 pub fn printbuf_to_formatter<F>(f: &mut fmt::Formatter<'_>, func: F) -> fmt::Result
 where
-    F: Fn(*mut c::printbuf),
+    F: FnOnce(*mut c::printbuf),
 {
     let mut buf = c::printbuf::new();
 
@@ -226,6 +263,12 @@ where
         return Ok(());
     }
 
-    let s = unsafe { CStr::from_ptr(buf.buf) };
-    f.write_str(&s.to_string_lossy())
+    let bytes = unsafe { CStr::from_ptr(buf.buf.cast()) }.to_bytes();
+    for chunk in bytes.utf8_chunks() {
+        f.write_str(chunk.valid())?;
+        if !chunk.invalid().is_empty() {
+            f.write_char(char::REPLACEMENT_CHARACTER)?;
+        }
+    }
+    Ok(())
 }

@@ -2,6 +2,9 @@
 
 #include "include/linux/bio.h"
 #include "include/linux/blkdev.h"
+#include "include/linux/crc32c.h"
+#include "include/linux/crc64.h"
+#include "include/linux/device.h"
 #include "include/linux/generic-radix-tree.h"
 #include "include/linux/idr.h"
 #include "include/linux/kernel.h"
@@ -9,6 +12,7 @@
 #include "include/linux/local_lock.h"
 #include "include/linux/percpu-refcount.h"
 #include "include/linux/percpu-rwsem.h"
+#include "include/linux/posix_acl.h"
 #include "include/linux/ratelimit.h"
 #include "include/linux/refcount.h"
 #include "include/linux/rcupdate.h"
@@ -16,7 +20,12 @@
 #include "include/linux/sched.h"
 #include "include/linux/semaphore.h"
 #include "include/linux/seqlock.h"
+#include "include/linux/srcu.h"
 #include "include/linux/string.h"
 #include "include/linux/uuid.h"
 #include "include/linux/unicode.h"
 #include "include/linux/wait_bit.h"
+#include "include/linux/xattr.h"
+#include "fs/vendor/closure.h"
+
+#include <errno.h>

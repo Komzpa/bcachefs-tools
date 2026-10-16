@@ -38,7 +38,7 @@ static const unsigned long BCH_BLKROTATIONAL	= BLKROTATIONAL;
 
 /*
  * FS_IOC_GETFSSYSFSPATH is a generic VFS ioctl, so it's in neither the block
- * list above nor the bcachefs inventory below - and it was open-coded in Rust
+ * list above nor bcachefs's own (bcachefs_ioctl.rs) - and it was open-coded in Rust
  * as (2 << 30) | (size << 16) | (0x15 << 8) | 1, which is the same asm-generic
  * restatement #904 was about, still wrong on ppc64le, three files from the fix.
  * Reported by logan2611.
@@ -72,61 +72,6 @@ static const size_t BCH_SIZEOF_FS_SYSFS_PATH = sizeof(struct fs_sysfs_path);
 #include <linux/fiemap.h>
 static const unsigned long BCH_FS_IOC_FIEMAP = FS_IOC_FIEMAP;
 
-/*
- * bcachefs's own ioctl numbers, for the same reason: the generated Rust
- * inventory used to compute these with a hand-written opcode(), which baked in
- * asm-generic's layout - dir at bit 30, 14 size bits - and so was wrong on
- * every architecture that doesn't use it. ppc64le got opcodes it answered with
- * ENOTTY, and only the ones whose fields happened to line up worked (#904).
- */
-#define BCH_IOCTL_BIND(_name)						\
-	static const unsigned bch_ioctl_op_##_name = _name
-
-BCH_IOCTL_BIND(BCH_IOCTL_QUERY_UUID);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_ADD);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_ADD_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_REMOVE);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_REMOVE_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_ONLINE);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_ONLINE_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_OFFLINE);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_OFFLINE_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_SET_STATE);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_SET_STATE_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_DATA);
-BCH_IOCTL_BIND(BCH_IOCTL_FS_USAGE);
-BCH_IOCTL_BIND(BCH_IOCTL_DEV_USAGE);
-BCH_IOCTL_BIND(BCH_IOCTL_READ_SUPER);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_GET_IDX);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_RESIZE);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_RESIZE_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_RESIZE_JOURNAL);
-BCH_IOCTL_BIND(BCH_IOCTL_DISK_RESIZE_JOURNAL_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_CREATE);
-BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_CREATE_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_DESTROY);
-BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_DESTROY_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_DEV_USAGE_V2);
-BCH_IOCTL_BIND(BCH_IOCTL_FSCK_OFFLINE);
-BCH_IOCTL_BIND(BCH_IOCTL_FSCK_ONLINE);
-BCH_IOCTL_BIND(BCH_IOCTL_QUERY_ACCOUNTING);
-BCH_IOCTL_BIND(BCH_IOCTL_QUERY_ACCOUNTING_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_QUERY_COUNTERS);
-BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_LIST);
-BCH_IOCTL_BIND(BCH_IOCTL_SUBVOLUME_TO_PATH);
-BCH_IOCTL_BIND(BCH_IOCTL_SNAPSHOT_TREE);
-BCH_IOCTL_BIND(BCH_IOCTL_QUERY_BTREE_KEYS);
-BCH_IOCTL_BIND(BCH_IOCTL_SNAPSHOT_TREE_v2);
-BCH_IOCTL_BIND(BCH_IOCTL_RECOVERY_STATUS);
-BCH_IOCTL_BIND(BCHFS_IOC_REINHERIT_ATTRS);
-BCH_IOCTL_BIND(BCHFS_IOC_SET_REFLINK_P_MAY_UPDATE_OPTS);
-BCH_IOCTL_BIND(BCHFS_IOC_PROPAGATE_REFLINK_P_OPTS);
-BCH_IOCTL_BIND(BCHFS_IOC_PREAD_RAW);
-BCH_IOCTL_BIND(BCHFS_IOC_UNPOISON);
-BCH_IOCTL_BIND(BCHFS_IOC_GET_DAMAGE);
-BCH_IOCTL_BIND(BCHFS_IOC_READDIR_FLAGS);
-BCH_IOCTL_BIND(BCHFS_IOC_CLEAR_DAMAGE);
-
 struct bch_fs;
 struct bch_sb;
 struct bch_csum;
@@ -151,7 +96,9 @@ void rust_strip_alloc_do(struct bch_fs *c);
 
 /*
  * Collect all non-NULL journal_replay entries from c->journal_entries
- * (genradix) into a flat array. Caller must free entries.
+ * (genradix) into a flat array, pinned by a journal_keys ref - whose last
+ * put frees them - until rust_journal_entries_put(). Empty, holding no ref,
+ * if they're gone already.
  */
 struct journal_replay;
 
@@ -161,6 +108,7 @@ struct rust_journal_entries {
 };
 
 struct rust_journal_entries rust_collect_journal_entries(struct bch_fs *c);
+void rust_journal_entries_put(struct bch_fs *c, struct rust_journal_entries *e);
 
 /*
  * Bitmap shim — set_bit() is atomic (locked bitops in the kernel),

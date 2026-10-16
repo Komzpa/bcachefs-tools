@@ -3,8 +3,9 @@
 #define _BCACHEFS_ALLOC_BACKGROUND_H
 
 #include "bcachefs.h"
-#include "alloc/types.h"
+#include "alloc/types_gen.h"
 #include "alloc/buckets.h"
+#include "alloc/background_gen.h"
 
 /* Bucket position helpers */
 
@@ -189,30 +190,6 @@ static inline unsigned alloc_v4_u64s_noerror(const struct bch_alloc_v4 *a)
 		(sizeof(struct bch_backpointer) / sizeof(u64));
 }
 
-static inline unsigned alloc_v4_u64s(const struct bch_alloc_v4 *a)
-{
-	unsigned ret = alloc_v4_u64s_noerror(a);
-	BUG_ON(ret > U8_MAX - BKEY_U64s);
-	return ret;
-}
-
-static inline void set_alloc_v4_u64s(struct bkey_i_alloc_v4 *a)
-{
-	set_bkey_val_u64s(&a->k, alloc_v4_u64s(&a->v));
-}
-
-static inline struct bch_backpointer *alloc_v4_backpointers(struct bch_alloc_v4 *a)
-{
-	return (void *) ((u64 *) &a->v +
-			 (BCH_ALLOC_V4_BACKPOINTERS_START(a) ?:
-			  BCH_ALLOC_V4_U64s_V0));
-}
-
-static inline const struct bch_backpointer *alloc_v4_backpointers_c(const struct bch_alloc_v4 *a)
-{
-	return (void *) ((u64 *) &a->v + BCH_ALLOC_V4_BACKPOINTERS_START(a));
-}
-
 static inline bool bkey_is_alloc(const struct bkey *k)
 {
 	return  k->type == KEY_TYPE_alloc ||
@@ -262,21 +239,18 @@ void bch2_alloc_v4_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 	.key_validate	= bch2_alloc_v1_validate,	\
 	.val_to_text	= bch2_alloc_to_text,		\
 	.trigger	= bch2_trigger_alloc,		\
-	.min_val_size	= 8,				\
 })
 
 #define bch2_bkey_ops_alloc_v2 ((struct bkey_ops) {	\
 	.key_validate	= bch2_alloc_v2_validate,	\
 	.val_to_text	= bch2_alloc_to_text,		\
 	.trigger	= bch2_trigger_alloc,		\
-	.min_val_size	= 8,				\
 })
 
 #define bch2_bkey_ops_alloc_v3 ((struct bkey_ops) {	\
 	.key_validate	= bch2_alloc_v3_validate,	\
 	.val_to_text	= bch2_alloc_to_text,		\
 	.trigger	= bch2_trigger_alloc,		\
-	.min_val_size	= 16,				\
 })
 
 #define bch2_bkey_ops_alloc_v4 ((struct bkey_ops) {	\
@@ -284,7 +258,6 @@ void bch2_alloc_v4_to_text(struct printbuf *, struct bch_fs *, struct bkey_s_c);
 	.val_to_text	= bch2_alloc_v4_to_text,	\
 	.swab		= bch2_alloc_v4_swab,		\
 	.trigger	= bch2_trigger_alloc,		\
-	.min_val_size	= 48,				\
 })
 
 int bch2_bucket_gens_validate(struct bch_fs *, struct bkey_s_c,
@@ -314,7 +287,6 @@ void bch2_recalc_capacity(struct bch_fs *);
 unsigned long bch2_fs_ra_pages(struct bch_fs *);
 u64 bch2_min_rw_member_capacity(struct bch_fs *);
 
-void bch2_dev_allocator_set_rw(struct bch_fs *, struct bch_dev *, bool);
 void bch2_dev_allocator_remove(struct bch_fs *, struct bch_dev *);
 void bch2_dev_allocator_add(struct bch_fs *, struct bch_dev *);
 

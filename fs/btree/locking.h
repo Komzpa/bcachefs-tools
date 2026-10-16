@@ -12,7 +12,7 @@
 
 #include "btree/cache.h"
 #include "btree/iter.h"
-#include "btree/locking_types.h"
+#include "btree/locking_gen.h"
 #include "util/six.h"
 
 void bch2_btree_lock_init(struct btree_bkey_cached_common *, enum six_lock_init_flags, gfp_t gfp);
@@ -115,15 +115,7 @@ static inline unsigned bch2_inode_shard_cpu(struct bch_fs *c)
 	return c->inode_shard_cpu[bch2_inode_shard_idx(c)];
 }
 
-/* path lock state */
-
-/* matches six lock types */
-enum btree_node_locked_type {
-	BTREE_NODE_UNLOCKED		= -1,
-	BTREE_NODE_READ_LOCKED		= SIX_LOCK_read,
-	BTREE_NODE_INTENT_LOCKED	= SIX_LOCK_intent,
-	BTREE_NODE_WRITE_LOCKED		= SIX_LOCK_write,
-};
+#include "btree/locking_defs_gen.h"
 
 static inline int btree_node_locked_type(struct btree_path *path,
 					 unsigned level)

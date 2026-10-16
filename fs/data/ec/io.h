@@ -2,39 +2,7 @@
 #ifndef _BCACHEFS_DATA_EC_IO_H
 #define _BCACHEFS_DATA_EC_IO_H
 
-struct ec_bio {
-	struct bch_dev		*ca;
-	struct ec_stripe_buf	*buf;
-	size_t			idx;
-	int			rw;
-	u64			submit_time;
-	struct bio		bio;
-};
-
-enum bch_stripe_buf_err {
-	STRIPE_BUF_PRE_RECOV,
-	STRIPE_BUF_POST_RECOV,
-};
-
-struct ec_stripe_buf {
-	struct closure		io;
-	struct bch_fs		*c;
-
-	/* might not be buffering the entire stripe: */
-	unsigned		offset;
-	unsigned		size;
-	s16			err[2][BCH_BKEY_PTRS_MAX];
-	void			*data[BCH_BKEY_PTRS_MAX];
-
-	/* Stale when we read the stripe key, i.e. alloc inconsistency */
-	unsigned long		stale[BITS_TO_LONGS(BCH_BKEY_PTRS_MAX)];
-
-	struct bch_csum		csum_good[BCH_BKEY_PTRS_MAX];
-	struct bch_csum		csum_bad[BCH_BKEY_PTRS_MAX];
-
-	struct bkey_i_stripe	key;
-	u64			pad[255];
-};
+#include "data/ec/io_gen.h"
 
 static inline unsigned ec_nr_failed(struct ec_stripe_buf *buf,
 				    enum bch_stripe_buf_err e)
@@ -72,10 +40,11 @@ static inline u32 ec_failed_mask(struct ec_stripe_buf *buf,
 
 void __bch2_ec_stripe_buf_exit(struct ec_stripe_buf *);
 void bch2_ec_stripe_buf_exit(struct ec_stripe_buf *);
+void bch2_ec_stripe_buf_move(struct ec_stripe_buf *, struct ec_stripe_buf *);
 int bch2_ec_stripe_buf_init(struct bch_fs *, struct ec_stripe_buf *, unsigned, unsigned,
 			    struct closure *);
 
-DEFINE_FREE(ec_stripe_buf_free, struct ec_stripe_buf *, bch2_ec_stripe_buf_exit(_T); kfree(_T));
+DEFINE_FREE(ec_stripe_buf_free, struct ec_stripe_buf *, if (_T) { bch2_ec_stripe_buf_exit(_T); kfree(_T); });
 
 s64 bch2_ec_scrub_block(struct bch_fs *, struct ec_stripe_buf *, unsigned);
 void bch2_ec_generate_ec(struct ec_stripe_buf *);
