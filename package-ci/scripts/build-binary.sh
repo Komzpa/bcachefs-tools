@@ -167,7 +167,7 @@ EOF
     fi
     rm -f "$SHIM"
 
-    # fs/codegen.rs shells out to the bindgen CLI (since the nix-bindgen-cli
+    # os/linux_kernel/codegen.rs shells out to the bindgen CLI (since the nix-bindgen-cli
     # switch); the build env must provide it on PATH. Pin to the bindgen library
     # version used in-tree (bch_bindgen/Cargo.toml) so codegen's flags match.
     # Installed into the cached image, so it's compiled once per distro×arch.
@@ -187,6 +187,9 @@ fi
 # Build
 # ---------------------------------------------------------------------------
 
+# RUSTUP_HOME: where rustup is installed (plucky, whose rustc is too old),
+# /usr/bin/rustc is its proxy, which finds the toolchain by RUSTUP_HOME or
+# else $HOME/.rustup - and debhelper points HOME at a scratch directory.
 podman run --name "$CONTAINER" \
     --detach --init \
     --security-opt seccomp=unconfined \
@@ -196,6 +199,7 @@ podman run --name "$CONTAINER" \
     --volume "$SOURCE_DIR:/source:ro" \
     --volume "$RESULT_DIR:/result:rw" \
     --tmpfs /tmp:exec \
+    --env RUSTUP_HOME=/root/.rustup \
     "$CACHE_IMAGE" sleep infinity
 
 run() {

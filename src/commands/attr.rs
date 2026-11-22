@@ -1,12 +1,13 @@
-use std::ffi::CString;
+use std::ffi::{CStr, OsStr};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
-use bch_bindgen::c;
+use anyhow::{anyhow, bail, Context, Result};
+use bcachefs_kernel::c;
 use clap::{Arg, ArgAction, Command};
-use rustix::fs::{XattrFlags, setxattr, removexattr};
+use rustix::fs::{openat, removexattr, setxattr, statx, AtFlags, Dir, FileType, Mode, OFlags, StatxFlags,
+                 XattrFlags};
 
 use super::opts;
 
@@ -14,32 +15,66 @@ use crate::wrappers::ioctl::{ioctl_none, Ioctl,
     BCHFS_IOC_PROPAGATE_REFLINK_P_OPTS, BCHFS_IOC_REINHERIT_ATTRS,
     BCHFS_IOC_SET_REFLINK_P_MAY_UPDATE_OPTS};
 
-fn propagate_recurse(dir_path: &Path) {
-    let inner = || -> std::io::Result<()> {
-        let dir = std::fs::File::open(dir_path)?;
-        for entry in std::fs::read_dir(dir_path)?.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_symlink() { continue }
-            let Ok(name) = CString::new(entry.file_name().as_bytes().to_vec()) else { continue };
+/// BCHFS_IOC_REINHERIT_ATTRS, whose argument is a name's address.
+type ReinheritAttrs =
+    rustix::ioctl::IntegerSetter<{ BCHFS_IOC_REINHERIT_ATTRS::OPCODE as rustix::ioctl::Opcode }>;
 
-            /* the argument is the name pointer itself, not a pointer to a struct */
-            let ret = unsafe {
-                libc::ioctl(dir.as_raw_fd(),
-                            BCHFS_IOC_REINHERIT_ATTRS::OPCODE as libc::Ioctl,
-                            name.as_ptr())
-            };
-            if ret < 0 {
-                eprintln!("{}: {}", entry.path().display(), std::io::Error::last_os_error());
+/// Each child of @dir, at @path, takes on again what it inherits from @dir,
+/// and each subdirectory's children from it, down the tree: how many failed,
+/// each reported. Walked by fd - children named relative to their parent - so
+/// the directory reinherited is the one descended into. Not into a mount
+/// below: BCHFS_IOC_REINHERIT_ATTRS resolves a name in the dirent btree, so
+/// it saw the directory the mount covers.
+fn propagate_recurse(dir: &OwnedFd, path: &Path) -> usize {
+    let walk = || -> rustix::io::Result<usize> {
+        let mnt_id = statx(dir, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?.stx_mnt_id;
+        let mut failed = 0;
+        let report = |name: &CStr, e: &dyn std::fmt::Display| {
+            eprintln!("{}: {e}", path.join(OsStr::from_bytes(name.to_bytes())).display());
+            1
+        };
+
+        let mut entries = Dir::read_from(dir)?;
+        while let Some(entry) = entries.read() {
+            let entry = entry?;
+            let (name, ty) = (entry.file_name(), entry.file_type());
+            if matches!(name.to_bytes(), b"." | b"..") || ty == FileType::Symlink {
                 continue;
             }
-            if ret == 0 || !ft.is_dir() { continue }
-            propagate_recurse(&entry.path());
+
+            // The argument is the name's address itself, not a pointer to it
+            let ret = unsafe { rustix::ioctl::ioctl(dir, ReinheritAttrs::new_pointer(name.as_ptr().cast_mut().cast())) };
+            if let Err(e) = ret {
+                failed += report(name, &e);
+                continue;
+            }
+            if ty != FileType::Directory {
+                continue;
+            }
+
+            match statx(dir, name, AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT, StatxFlags::MNT_ID) {
+                Ok(stx) if stx.stx_mnt_id != mnt_id => continue,
+                Ok(_) => {}
+                Err(e) => {
+                    failed += report(name, &e);
+                    continue;
+                }
+            }
+            match openat(dir, name, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                         Mode::empty()) {
+                Ok(child) => {
+                    let child_path = path.join(OsStr::from_bytes(name.to_bytes()));
+                    failed += propagate_recurse(&child, &child_path);
+                }
+                Err(e) => failed += report(name, &e),
+            }
         }
-        Ok(())
+        Ok(failed)
     };
-    if let Err(e) = inner() {
-        eprintln!("{}: {e}", dir_path.display());
-    }
+    walk().unwrap_or_else(|e| {
+        eprintln!("{}: {e}", path.display());
+        1
+    })
 }
 
 fn remove_bcachefs_attr(path: &Path, attr_name: &str) {
@@ -51,11 +86,25 @@ fn remove_bcachefs_attr(path: &Path, attr_name: &str) {
     }
 }
 
-fn do_setattr(path: &Path, opts: &[(String, String)], remove_all: bool) -> Result<()> {
+/// @opts set on @path, and if it's a directory, reinherited down it: how
+/// many of its descendants failed to.
+fn do_setattr(path: &Path, opts: &[(String, String)], remove_all: bool) -> Result<usize> {
+    let is_dir = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .is_dir();
+
     if remove_all {
-        for name in opts::bch_option_names(c::opt_flags::OPT_INODE as u32) {
-            // casefold only works on empty directories
-            if name == "casefold" { continue }
+        let nonempty_dir = is_dir &&
+            std::fs::read_dir(path)
+                .with_context(|| format!("reading directory {}", path.display()))?
+                .next().is_some();
+
+        for name in opts::bch_option_names(c::OptFlags::inode.bits()) {
+            // These change how a directory's names hash: the kernel refuses
+            // to change them on a nonempty directory, and casefold is
+            // directory-only
+            if nonempty_dir && (name == "casefold" || name == "inodes_32bit") { continue }
+            if !is_dir && name == "casefold" { continue }
             remove_bcachefs_attr(path, &format!("bcachefs.{}", name));
         }
     }
@@ -71,13 +120,11 @@ fn do_setattr(path: &Path, opts: &[(String, String)], remove_all: bool) -> Resul
         }
     }
 
-    if std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .is_dir()
-    {
-        propagate_recurse(path);
+    if !is_dir {
+        return Ok(0);
     }
-    Ok(())
+    let dir = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    Ok(propagate_recurse(&dir.into(), path))
 }
 
 fn read_bcachefs_attr(path: &Path, attr: &str) -> Result<Option<String>> {
@@ -118,7 +165,7 @@ setting a new compression algorithm will cause existing data to be \
 rewritten with the new algorithm. Use --option=- to remove a specific \
 option, or --remove-all to clear all per-file options.")
         .after_help("To remove a specific option, use: --option=-")
-        .args(opts::bch_option_args(c::opt_flags::OPT_INODE as u32, true))
+        .args(opts::bch_option_args(c::OptFlags::inode.bits(), true))
         .arg(Arg::new("remove-all")
             .long("remove-all")
             .action(ArgAction::SetTrue)
@@ -132,11 +179,13 @@ fn cmd_setattr(argv: Vec<String>) -> Result<()> {
     let matches = setattr_cmd().get_matches_from(argv);
 
     let remove_all = matches.get_flag("remove-all");
-    let opts = opts::bch_options_from_matches(&matches, c::opt_flags::OPT_INODE as u32);
-    let files: Vec<&String> = matches.get_many("files").unwrap().collect();
-
-    for path in files {
-        do_setattr(Path::new(path), &opts, remove_all)?;
+    let opts = opts::bch_options_from_matches(&matches, c::OptFlags::inode.bits());
+    let mut failed = 0;
+    for path in matches.get_many::<String>("files").unwrap() {
+        failed += do_setattr(Path::new(path), &opts, remove_all)?;
+    }
+    if failed != 0 {
+        bail!("{failed} files failed to inherit the new options");
     }
     Ok(())
 }
@@ -170,7 +219,7 @@ fn cmd_getattr(argv: Vec<String>) -> Result<()> {
     let all = matches.get_flag("all");
     let prefix = if effective { "bcachefs_effective" } else { "bcachefs" };
     let files: Vec<&String> = matches.get_many("files").unwrap().collect();
-    let names = opts::bch_option_names(c::opt_flags::OPT_INODE as u32);
+    let names = opts::bch_option_names(c::OptFlags::inode.bits());
     let multi_file = files.len() > 1;
 
     for file in files {

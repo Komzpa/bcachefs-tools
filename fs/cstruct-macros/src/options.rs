@@ -1,0 +1,444 @@
+// SPDX-License-Identifier: GPL-2.0
+//! `#[derive(Options)]`: bch_opts, the options - a field each, described by
+//! its `#[opt(...)]` and its doc comment, the option's help:
+//!
+//! ```text
+//! /// Filesystem block size
+//! #[opt(uint(512, 1 << 15), flags = fs | format | human_readable, sb = bch_sb.block_size,
+//!       default = 4 << 10, hint = "size")]
+//! pub block_size: u16,
+//! ```
+//!
+//! The type first: `bool`, `uint(min, max)`, `str(Enum)`, `str_nolimit(Enum)`,
+//! `bitfield(Enum[, allowed])`, `with(OPT_FN)`, `str_member(member_field)` -
+//! a string or bitfield option's choices are its enum's Names. Then, each
+//! optional: `flags`, its OptFlags; `sb`, its
+//! superblock field - `struct.field`, a little-endian integer, or by its
+//! getter, `struct::getter`, its setter set_getter, or `struct::getter /
+//! setter`; `default`; `hint`.
+//!
+//! It makes, from the fields in order - each one's id, OptId::name:
+//!
+//! ```text
+//! OptId               the ids, and NR - a #[bch_enum(open)]
+//! bch_opts::TABLE          each option's Opt (opts.rs), by id
+//! bch_opts::DEFAULTS       each one's default, all defined
+//! get(), set(), defined(), apply()   by id; set() sets it defined, in the
+//!                          field `defined`, a bch_opts_mask
+//! name(), set_name()       each option's value - a bool option's as bool, a
+//!                          string option's as its enum - and setting it,
+//!                          defined
+//! name_or_default()        its value, or its default if it isn't defined
+//! PublishedOpts            bch_opts laid out the same, each option a Volatile:
+//!                          the filesystem's, c->opts, which anyone reads an
+//!                          option at a time and its lock's holder writes -
+//!                          the readers above, and load(), a bch_opts copy
+//! PublishedOptsWriter      it, as its writer has it: the writers above
+//! ```
+//!
+//! A field without #[opt] isn't an option: `defined`.
+
+use proc_macro2::{Literal, TokenStream};
+use quote::{format_ident, quote};
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
+use syn::{parenthesized, token, Data, DataStruct, DeriveInput, Error, Expr, Fields, Ident, Token, Type};
+
+use crate::cstruct::doc_of;
+
+/// An #[opt(...)]: its type, `kind(args)`, then its `key = value`s.
+struct OptAttr {
+    kind:    Ident,
+    args:    Vec<Expr>,
+    flags:   Vec<Ident>,
+    sb:      Option<SbField>,
+    default: Option<Expr>,
+    hint:    Option<Expr>,
+}
+
+/// An option's superblock field, on @host: an Le* integer, or what its
+/// accessors read and write.
+enum SbField {
+    /// host.field
+    Field { host: Ident, field: Ident },
+    /// host::getter
+    Accessors { host: Ident, getter: Ident },
+}
+
+impl Parse for OptAttr {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let kind: Ident = input.parse()
+            .map_err(|e| Error::new(e.span(), "the type first: bool, uint(min, max), str(Enum), ..."))?;
+        let args = match input.peek(token::Paren) {
+            true => {
+                let inner;
+                parenthesized!(inner in input);
+                Punctuated::<Expr, Token![,]>::parse_terminated(&inner)?.into_iter().collect()
+            }
+            false => Vec::new(),
+        };
+        let mut a = OptAttr { kind, args, flags: Vec::new(), sb: None, default: None, hint: None };
+        while input.parse::<Option<Token![,]>>()?.is_some() && !input.is_empty() {
+            let k: Ident = input.parse()?;
+            input.parse::<Token![=]>().map_err(|e| Error::new(e.span(), format!("{k}: expected key = value")))?;
+            match k.to_string().as_str() {
+                "flags" => a.flags = Punctuated::<Ident, Token![|]>::parse_separated_nonempty(input)?
+                    .into_iter().collect(),
+                "sb" => {
+                    let host = input.parse()?;
+                    a.sb = Some(match input.parse::<Option<Token![.]>>()? {
+                        Some(_) => SbField::Field { host, field: input.parse()? },
+                        None => {
+                            input.parse::<Token![::]>()?;
+                            SbField::Accessors { host, getter: input.parse()? }
+                        }
+                    });
+                }
+                "default" => a.default = Some(input.parse()?),
+                "hint" => a.hint = Some(input.parse()?),
+                _ => return Err(Error::new_spanned(&k, format!("{k}: not an #[opt] key"))),
+            }
+        }
+        if !input.is_empty() {
+            return Err(input.error("expected `, key = value`"));
+        }
+        Ok(a)
+    }
+}
+
+/// A field with an #[opt]: an option.
+struct Opt<'a> {
+    name: &'a Ident,
+    ty:   &'a Type,
+    attr: OptAttr,
+    doc:  Vec<String>,
+}
+
+/// An option's Opt, and what its set and get are.
+fn option(f: &Opt<'_>) -> syn::Result<TokenStream> {
+    let name = f.name;
+    let a = &f.attr;
+    let o = quote!(crate::opts);
+    let names = |t: &Expr| quote!(crate::names_by_value!(c::#t));
+
+    let (ty, min, max) = match (a.kind.to_string().as_str(), a.args.as_slice()) {
+        ("bool", []) => (quote!(#o::OptType::Bool), quote!(0), quote!(1)),
+        ("uint", [min, max]) => (quote!(#o::OptType::Uint), quote!((#min) as u64), quote!((#max) as u64)),
+        ("str", [t]) => {
+            let n = names(t);
+            (quote!(#o::OptType::Str(#n)), quote!(0), quote!((#n.len() - 1) as u64))
+        }
+        ("str_nolimit", [t]) => {
+            let n = names(t);
+            (quote!(#o::OptType::Str(#n)), quote!(0), quote!(u64::MAX))
+        }
+        ("bitfield", [t]) => {
+            let n = names(t);
+            (quote!(#o::OptType::Bitfield { choices: #n, allowed: u64::MAX }), quote!(0), quote!(0))
+        }
+        ("bitfield", [t, allowed]) => {
+            let n = names(t);
+            (quote!(#o::OptType::Bitfield { choices: #n, allowed: (#allowed) as u64 }), quote!(0), quote!(0))
+        }
+        ("with", [f]) => (quote!(#o::OptType::Fn(&#f)), quote!(0), quote!(0)),
+        ("str_member", [m]) => (quote!(#o::OptType::StrMember {
+            get: |m| &m.#m,
+            get_mut: |m| &mut m.#m,
+            size: #o::size_of_field::<c::bch_member, _>(|m| &m.#m),
+        }), quote!(0), quote!(0)),
+        (kind, _) => return Err(Error::new_spanned(&a.kind, format!("{name}: #[opt]: {kind}: not an option type"))),
+    };
+
+    let flags = &a.flags;
+    let flags = quote!(0 #(| c::OptFlags::#flags.bits())*);
+    // the head: what either state of a superblock has its fields on
+    let head = |host: &Ident| match host == "bch_sb" {
+        true => crate::tokens::derived(host, "head"),
+        false => host.clone(),
+    };
+    let sb = match &a.sb {
+        None => quote!(None),
+        Some(SbField::Field { host, field }) => {
+            let host = head(host);
+            quote!(Some(&#o::Field::<c::#host> {
+                get: |t| u64::from(t.#field.get()),
+                set: |t, v| Ok(t.#field.set(v.try_into().map_err(|_| ())?)),
+            } as &dyn #o::SbOpt))
+        }
+        Some(SbField::Accessors { host, getter }) => {
+            let host = head(host);
+            let setter = format_ident!("set_{getter}_checked");
+            // a bool option's field takes a bool if it's one bit, else a u64 -
+            // erasure_code's is 16
+            let v = match a.kind == "bool" {
+                true  => quote!(match v { 0 => false, 1 => true, _ => return Err(()) }.into()),
+                false => quote!(v.try_into().map_err(|_| ())?),
+            };
+            quote!(Some(&#o::Field::<c::#host> {
+                get: |t| u64::from(t.#getter()),
+                set: |t, v| t.#setter(#v),
+            } as &dyn #o::SbOpt))
+        }
+    };
+    let hint = match &a.hint {
+        Some(h) => quote!(Some(#h)),
+        None => quote!(None),
+    };
+    let help = match f.doc.is_empty() {
+        true  => quote!(None),
+        false => {
+            let lines: Vec<&str> = f.doc.iter().map(|l| l.strip_prefix(' ').unwrap_or(l)).collect();
+            let help = lines.join("\n");
+            quote!(Some(#help))
+        }
+    };
+
+    let label = name.to_string();
+    Ok(quote! {
+        #o::Opt {
+            id:    OptId::#name,
+            name:  #label,
+            flags: c::OptFlags::from_bits_retain(#flags),
+            ty:    #ty,
+            min:   #min,
+            max:   #max,
+            sb:    #sb,
+            hint:  #hint,
+            help:  #help,
+        }
+    })
+}
+
+type Conv = Box<dyn Fn(TokenStream) -> TokenStream>;
+
+/// What option @f's accessors take and give - a bool option's a bool, a
+/// string option's its enum, the rest the field's own type; that from the
+/// field's value, an expression; and the field's value from one of it, `v`.
+fn accessor(f: &Opt<'_>) -> (TokenStream, Conv, TokenStream) {
+    let ty = f.ty;
+    match (f.attr.kind.to_string().as_str(), f.attr.args.as_slice()) {
+        ("bool", []) => (quote!(bool), Box::new(|x| quote!(#x != 0)), quote!(v as #ty)),
+        // through #[bch_enum]'s from_bits() and into_bits(): a closed enum's
+        // from_bits() panics on a value that isn't one, and a string option's
+        // value is an index into its choices - so one, unless something set
+        // it around the parser
+        ("str" | "str_nolimit", [e]) => {
+            let e = e.clone();
+            (quote!(c::#e), Box::new(move |x| quote!(c::#e::from_bits(#x as _))), quote!(v.into_bits() as #ty))
+        }
+        _ => (quote!(#ty), Box::new(|x| x), quote!(v)),
+    }
+}
+
+pub(crate) fn derive(input: DeriveInput) -> syn::Result<TokenStream> {
+    let name = &input.ident;
+    let Data::Struct(DataStruct { fields: Fields::Named(fields), .. }) = &input.data else {
+        return Err(Error::new_spanned(&input, "for a struct with named fields"));
+    };
+    let mut opts = Vec::new();
+    for f in &fields.named {
+        let Some(a) = f.attrs.iter().rev().find(|a| a.path().is_ident("opt")) else { continue };
+        let ident = f.ident.as_ref().expect("named fields");
+        let attr = a.parse_args().map_err(|e| Error::new(e.span(), format!("{ident}: #[opt]: {e}")))?;
+        opts.push(Opt { name: ident, ty: &f.ty, attr, doc: f.attrs.iter().filter_map(doc_of).collect() });
+    }
+
+    let ids = opts.iter().map(|f| f.name);
+    let table = opts.iter().map(option).collect::<syn::Result<Vec<_>>>()?;
+    // DEFAULTS starts zeroed: an option without a default is 0
+    let defaults = opts.iter().filter_map(|f| {
+        let (n, ty, d) = (f.name, f.ty, f.attr.default.as_ref()?);
+        Some(quote!(opts.#n = (#d) as #ty;))
+    });
+
+    // What reads and writes a value of each option, generic over how a
+    // field's loaded and stored: the plain struct's fields, or its published
+    // mirror's Volatiles. @load(n) is field n's value; @store(n, v) sets it;
+    // @defined(id) and @define(id) test and set the defined bit of option id,
+    // an expression.
+    struct Place<'a> {
+        load:    &'a dyn Fn(&Ident) -> TokenStream,
+        store:   &'a dyn Fn(&Ident, TokenStream) -> TokenStream,
+        defined: &'a dyn Fn(TokenStream) -> TokenStream,
+        define:  &'a dyn Fn(TokenStream) -> TokenStream,
+        recv:    TokenStream,
+    }
+
+    let readers = |p: &Place<'_>| -> TokenStream {
+        let get = opts.iter().map(|f| {
+            let (n, v) = (f.name, (p.load)(f.name));
+            quote!(OptId::#n => #v as u64,)
+        });
+        let accessors = opts.iter().map(|f| {
+            let (ty, conv, _) = accessor(f);
+            let n = f.name;
+            let or_default = format_ident!("{n}_or_default");
+            let (value, dflt) = (conv((p.load)(n)), conv(quote!(#name::DEFAULTS.#n)));
+            quote! {
+                pub fn #n(&self) -> #ty { #value }
+                pub fn #or_default(&self) -> #ty {
+                    if self.defined(OptId::#n) { self.#n() } else { #dflt }
+                }
+            }
+        });
+        let defined = (p.defined)(quote!(id));
+        quote! {
+            /// Its value for @id - defined or not.
+            pub fn get(&self, id: OptId) -> u64 {
+                match id {
+                    #(#get)*
+                    _ => panic!("not an option: {}", id.0),
+                }
+            }
+
+            pub fn defined(&self, id: OptId) -> bool {
+                #defined
+            }
+
+            #(#accessors)*
+        }
+    };
+
+    let writers = |p: &Place<'_>| -> TokenStream {
+        let recv = &p.recv;
+        let set = opts.iter().map(|f| {
+            let (n, ty) = (f.name, f.ty);
+            let s = (p.store)(n, quote!(v as #ty));
+            quote!(OptId::#n => #s,)
+        });
+        let apply = opts.iter().map(|f| {
+            let n = f.name;
+            let (s, d) = ((p.store)(n, quote!(src.#n)), (p.define)(quote!(OptId::#n)));
+            quote! {
+                if src.defined.test(OptId::#n) {
+                    #s;
+                    #d;
+                }
+            }
+        });
+        let setters = opts.iter().map(|f| {
+            let (ty, _, back) = accessor(f);
+            let n = f.name;
+            let set_n = format_ident!("set_{n}");
+            let (s, d) = ((p.store)(n, back), (p.define)(quote!(OptId::#n)));
+            quote! {
+                pub fn #set_n(#recv, v: #ty) {
+                    #s;
+                    #d;
+                }
+            }
+        });
+        let define = (p.define)(quote!(id));
+        quote! {
+            /// Set, and defined.
+            pub fn set(#recv, id: OptId, v: u64) {
+                match id {
+                    #(#set)*
+                    _ => panic!("not an option: {}", id.0),
+                }
+                #define;
+            }
+
+            /// Those @src defines, set: bch2_opts_apply().
+            pub fn apply(#recv, src: &#name) {
+                #(#apply)*
+            }
+
+            #(#setters)*
+        }
+    };
+
+    let plain = Place {
+        load:    &|n| quote!(self.#n),
+        store:   &|n, v| quote!(self.#n = #v),
+        defined: &|id| quote!(self.defined.test(#id)),
+        define:  &|id| quote!(self.defined.set(#id)),
+        recv:    quote!(&mut self),
+    };
+    let published = Place {
+        load:    &|n| quote!(self.#n.get()),
+        store:   &|n, v| quote!(self.#n.set(#v)),
+        defined: &|id| quote!(self.defined.test(#id.0 as usize)),
+        define:  &|id| quote!(self.defined.set(#id.0 as usize)),
+        recv:    quote!(&self),
+    };
+    let (plain_readers, plain_writers) = (readers(&plain), writers(&plain));
+    let (pub_readers, pub_writers) = (readers(&published), writers(&published));
+
+    let (names, tys): (Vec<_>, Vec<_>) = opts.iter().map(|f| (f.name, f.ty)).unzip();
+    let nr = Literal::usize_unsuffixed(opts.len());
+    let pub_doc = [format!(" {name}, read an option at a time while its lock's holder writes it,"),
+                   format!(" through PublishedOptsWriter. Laid out as {name} is.")];
+
+    Ok(quote! {
+        #[cstruct_macros::bch_enum(open)]
+        #[nr]
+        #[repr(u32)]
+        pub enum OptId {
+            #(#ids,)*
+        }
+
+        const _: () = assert!(#nr <= BCH_OPTS_MAX as usize, "more options than BCH_OPTS_MAX");
+
+        impl #name {
+            /// Each option, by OptId.
+            pub const TABLE: [crate::opts::Opt; #nr] = [#(#table),*];
+
+            /// Each option's default, all defined.
+            pub const DEFAULTS: Self = {
+                let mut opts: Self = ::pin_init::zeroed();
+                #(#defaults)*
+                let mut i = 0;
+                while i < #nr {
+                    opts.defined.set(OptId(i as u32));
+                    i += 1;
+                }
+                opts
+            };
+
+            #plain_readers
+            #plain_writers
+        }
+
+        crate::published! {
+            #(#[doc = #pub_doc])*
+            pub struct PublishedOpts {
+                #(pub #names: crate::util::projections::Volatile<#tys>,)*
+                pub defined: AtomicOptsMask,
+            }
+        }
+
+        // SAFETY: Volatile words: zeroes are options, none defined
+        unsafe impl ::pin_init::Zeroable for PublishedOpts {}
+
+        // Field for field as the options struct, each Volatile its type's
+        // size: checked
+        const _: () = {
+            assert!(core::mem::size_of::<#name>() == core::mem::size_of::<PublishedOpts>());
+            assert!(core::mem::align_of::<#name>() == core::mem::align_of::<PublishedOpts>());
+        };
+
+        impl From<#name> for PublishedOpts {
+            fn from(o: #name) -> Self {
+                unsafe { core::mem::transmute(o) }
+            }
+        }
+
+        impl PublishedOpts {
+            /// A copy: each option as it was when it was read, not all as of one
+            /// moment.
+            pub fn load(&self) -> #name {
+                #name {
+                    #(#names: self.#names.get(),)*
+                    defined: bch_opts_mask::load(&self.defined),
+                }
+            }
+
+            #pub_readers
+        }
+
+        impl PublishedOptsWriter {
+            #pub_writers
+        }
+    })
+}

@@ -5,18 +5,21 @@
 // damaged finds the files - cost proportional to recorded damage,
 // not tree size - and BCHFS_IOC_GET_DAMAGE per file returns its
 // accumulated error list (unioned across ancestor snapshots) as
-// bch_sb_error_id, printed with the same names fsck and the superblock
+// SbErrorId, printed with the same names fsck and the superblock
 // error counters use.
 
+use std::ffi::CStr;
 use std::mem;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
-use bch_bindgen::c;
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use bcachefs_kernel::c;
+use bcachefs_kernel::sb::errors::SbErrorId;
+use bcachefs_kernel::util::vstructs::{plain_bytes, Head, VstructRefEntries};
 use clap::{Parser, Subcommand};
 
-use crate::util::{open_dir, sb_error_name};
+use crate::util::open_dir;
 use crate::wrappers::ioctl::{ioctl_none, ioctl_ptr, ioctl_rw, IoctlBuf,
     BCHFS_IOC_CLEAR_DAMAGE, BCHFS_IOC_GET_DAMAGE, BCHFS_IOC_READDIR_FLAGS};
 
@@ -64,7 +67,7 @@ enum Subcommands {
 /// section keeps: error id, a saturating occurrence count, and first and
 /// last occurrence times.
 struct DamageEntry {
-    id:    u32,
+    id:    SbErrorId,
     nr:    u64,
     first: i64,
     last:  i64,
@@ -90,7 +93,7 @@ impl DamageEntry {
 fn get_damage(fd: &OwnedFd) -> std::io::Result<Vec<DamageEntry>> {
     let mut cap = 16u32;
     loop {
-        let mut buf = IoctlBuf::<c::bch_ioctl_get_damage>::new::<c::bch_sb_field_error_entry_v2>(cap as usize);
+        let mut buf = IoctlBuf::<Head<c::bch_ioctl_get_damage>>::new(cap as usize);
         buf.hdr_mut().nr_entries = cap;
         unsafe { ioctl_ptr::<BCHFS_IOC_GET_DAMAGE>(fd, buf.as_mut_ptr())? };
 
@@ -100,12 +103,12 @@ fn get_damage(fd: &OwnedFd) -> std::io::Result<Vec<DamageEntry>> {
             continue;
         }
 
-        return Ok(unsafe { buf.hdr().entries.as_slice(nr as usize) }.iter()
+        return Ok(buf.get().map_err(std::io::Error::other)?.entries.iter()
             .map(|e| DamageEntry {
-                id:    e.id() as u32,
-                nr:    e.nr(),
-                first: e.first_error_time() as i64,
-                last:  e.last_error_time() as i64,
+                id:    e.v.id(),
+                nr:    e.v.nr() as u64,
+                first: e.v.first_error_time() as i64,
+                last:  e.v.last_error_time() as i64,
             }).collect());
     }
 }
@@ -118,43 +121,46 @@ struct Entry {
 }
 
 /// One BCHFS_IOC_READDIR_FLAGS call, advancing the opaque cursor. An
-/// empty result means enumeration is complete.
-fn readdir_flags(fd: &OwnedFd, flags: u32, pos: &mut [u64; 2]) -> std::io::Result<Vec<Entry>> {
-    let mut buf = vec![0u8; 64 << 10];
-    let mut arg = c::bch_ioctl_readdir_flags {
-        pos: *pos,
-        buf: buf.as_mut_ptr() as u64,
-        buf_size: buf.len() as u32,
-        flags,
-        used: 0,
-        pad: 0,
-    };
+/// empty result means enumeration is complete; an entry that doesn't fit
+/// in what the kernel says it wrote, or has no name, is an error. A
+/// recursive listing's paths have no limit: an entry bigger than the
+/// buffer is ERANGE, and the call is retried with twice the room.
+fn readdir_flags(fd: &OwnedFd, flags: u32, pos: &mut [u64; 2]) -> Result<Vec<Entry>> {
+    // u64s: the kernel writes each entry at a multiple of 8 from the start,
+    // aligned for one if the buffer is
+    let mut buf = vec![0u64; (64 << 10) / 8];
+    let arg = loop {
+        let mut arg = c::bch_ioctl_readdir_flags {
+            pos: *pos,
+            buf: buf.as_mut_ptr() as u64,
+            buf_size: u32::try_from(mem::size_of_val(&*buf))
+                .context("an entry bigger than any buffer the ioctl can be given")?,
+            flags,
+            used: 0,
+            pad: 0,
+        };
 
-    ioctl_rw::<BCHFS_IOC_READDIR_FLAGS>(fd, &mut arg)?;
+        match ioctl_rw::<BCHFS_IOC_READDIR_FLAGS>(fd, &mut arg) {
+            Err(e) if e.raw_os_error() == Some(libc::ERANGE) => buf.resize(buf.len() * 2, 0),
+            r => { r?; break arg; }
+        }
+    };
     *pos = arg.pos;
 
-    const D_TYPE: usize   = mem::offset_of!(c::bch_ioctl_readdir_entry, d_type);
-    const NAME_LEN: usize = mem::offset_of!(c::bch_ioctl_readdir_entry, name_len);
-    const NAME: usize     = mem::offset_of!(c::bch_ioctl_readdir_entry, name);
+    let reply = plain_bytes(&buf[..]).get(..arg.used as usize)
+        .ok_or_else(|| anyhow!("{} bytes used, of {}", arg.used, arg.buf_size))?;
 
-    let mut entries = Vec::new();
-    let mut offset = 0usize;
-    while offset + NAME < arg.used as usize {
-        let rec = &buf[offset..];
-        let name_len = u16::from_ne_bytes(rec[NAME_LEN..NAME_LEN + 2].try_into().unwrap()) as usize;
-        let reclen = (NAME + name_len).next_multiple_of(8);
-        if name_len == 0 || offset + reclen > arg.used as usize {
-            break;
-        }
+    VstructRefEntries::<c::bch_ioctl_readdir_entry>::new(reply)
+        .map(|e| {
+            let e = e?;
+            let name = &e.as_bytes()[mem::offset_of!(c::bch_ioctl_readdir_entry, name)..];
+            let name = CStr::from_bytes_until_nul(name)
+                .map_err(|_| anyhow!("inode {}: name not NUL-terminated", e.inum))?;
+            ensure!(!name.is_empty(), "inode {}: empty name", e.inum);
 
-        entries.push(Entry {
-            d_type: rec[D_TYPE],
-            /* name_len includes the nul */
-            name:   rec[NAME..NAME + name_len - 1].to_vec(),
-        });
-        offset += reclen;
-    }
-    Ok(entries)
+            Ok(Entry { d_type: e.d_type, name: name.to_bytes().to_vec() })
+        })
+        .collect()
 }
 
 // ---- Commands ----
@@ -201,7 +207,7 @@ fn cmd_ls(path: &Path, recursive: bool) -> Result<()> {
             match entry_errors(&dir, e) {
                 Some(errs) if !errs.is_empty() =>
                     println!("{name}: {}",
-                             errs.iter().map(|e| sb_error_name(e.id))
+                             errs.iter().map(|e| e.id.to_string())
                                  .collect::<Vec<_>>().join(" ")),
                 _ => println!("{name}"),
             }
@@ -222,7 +228,7 @@ fn cmd_show(path: &Path) -> Result<()> {
 
     for e in errs {
         println!("{:<48} nr {:<8} first {}  last {}",
-                 sb_error_name(e.id), e.nr, e.first_seen(), e.last_seen());
+                 e.id.to_string(), e.nr, e.first_seen(), e.last_seen());
     }
     Ok(())
 }

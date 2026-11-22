@@ -1,51 +1,45 @@
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::File;
 use std::io;
-use std::os::fd::OwnedFd;
-use std::os::raw::c_char;
-use std::os::unix::fs::FileTypeExt;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use bch_bindgen::c;
 use crossterm::{cursor, execute, terminal};
-use rustix::ioctl::{self, Getter};
 
-/// Page-aligned buffer for O_DIRECT IO.
-///
-/// Allocates zeroed memory at 4096-byte alignment. Derefs to `[u8]` for
-/// convenient slice access; freed automatically on drop.
-pub struct AlignedBuf {
-    ptr: *mut u8,
-    layout: std::alloc::Layout,
+pub use bcachefs_kernel::util::vstructs::assume_init_mut;
+
+/// Print error to stderr and exit with failure status.
+/// Matches the C `die()` function behavior.
+pub fn die(msg: &str) -> ! {
+    eprintln!("{}", msg);
+    std::process::exit(1);
 }
 
-impl AlignedBuf {
-    pub fn new(size: usize) -> Self {
-        let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        assert!(!ptr.is_null(), "aligned allocation failed");
-        Self { ptr, layout }
+/// FileExt::read_exact_at(), of a borrowed fd.
+pub fn read_exact_at(fd: BorrowedFd<'_>, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match rustix::io::pread(fd, &mut *buf, offset) {
+            Ok(0)                        => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n)                        => { buf = &mut std::mem::take(&mut buf)[n..]; offset += n as u64; }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e)                       => return Err(e.into()),
+        }
     }
+    Ok(())
 }
 
-impl std::ops::Deref for AlignedBuf {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.layout.size()) }
+/// FileExt::write_all_at(), of a borrowed fd.
+pub fn write_all_at(fd: BorrowedFd<'_>, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        match rustix::io::pwrite(fd, buf, offset) {
+            Ok(0)                        => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n)                        => { buf = &buf[n..]; offset += n as u64; }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e)                       => return Err(e.into()),
+        }
     }
-}
-
-impl std::ops::DerefMut for AlignedBuf {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
-    }
-}
-
-impl Drop for AlignedBuf {
-    fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr, self.layout) }
-    }
+    Ok(())
 }
 
 /// Open a directory fd for directory-scoped ioctls and *at() calls.
@@ -60,7 +54,7 @@ pub fn open_dir(path: &Path) -> Result<OwnedFd> {
 }
 
 /* Not in the libc crate yet; from linux/stat.h */
-const STATX_SUBVOL: libc::c_uint = 0x8000;
+const STATX_SUBVOL: core::ffi::c_uint = 0x8000;
 
 /// Which filesystem and subvolume @path is in, or None if it isn't on a
 /// filesystem that reports subvolumes.
@@ -74,19 +68,14 @@ fn path_subvol(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
 
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
-
-    if unsafe {
-        libc::statx(libc::AT_FDCWD, c_path.as_ptr(), 0, STATX_SUBVOL, &mut stx)
-    } != 0 {
-        return None;
-    }
+    let stx = rustix::fs::statx(rustix::fs::CWD, c_path.as_c_str(), rustix::fs::AtFlags::empty(),
+                                rustix::fs::StatxFlags::from_bits_retain(STATX_SUBVOL)).ok()?;
 
     if stx.stx_mask & STATX_SUBVOL == 0 {
         return None;
     }
 
-    Some((libc::makedev(stx.stx_dev_major, stx.stx_dev_minor),
+    Some((rustix::fs::makedev(stx.stx_dev_major, stx.stx_dev_minor),
           stx.stx_subvol))
 }
 
@@ -120,26 +109,24 @@ pub fn subvol_root(path: &Path) -> Result<std::path::PathBuf> {
     Ok(root)
 }
 
-/// The name of a bch_sb_error_id - the same table fsck and the
-/// superblock error counters use.
-pub fn sb_error_name(id: u32) -> String {
-    if id < c::bch_sb_error_id::BCH_FSCK_ERR_MAX as u32 {
-        unsafe { CStr::from_ptr(*c::bch2_sb_error_strs.as_ptr().add(id as usize)) }
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        format!("(unknown error {id})")
+/// A y/n answer from stdin, after the caller's question: yes if it starts
+/// with y or Y.
+pub fn ask_yn() -> bool {
+    use std::io::{BufRead, Write};
+
+    print!(" (y,n) ");
+    let _ = io::stdout().flush();
+
+    let mut line = String::new();
+    if matches!(io::stdin().lock().read_line(&mut line), Err(_) | Ok(0)) {
+        die("error reading from standard input");
     }
+    matches!(line.as_bytes().first(), Some(b'y' | b'Y'))
 }
 
-/// Parse a human-readable size string (e.g. "1G", "512M") via bch2_strtoull_h.
+/// Parse a human-readable size string (e.g. "1G", "512M").
 pub fn parse_human_size(s: &str) -> Result<u64> {
-    let cstr = CString::new(s)?;
-    let mut val: u64 = 0;
-    if unsafe { c::bch2_strtoull_h(cstr.as_ptr(), &mut val) } != 0 {
-        return Err(anyhow!("invalid size: {}", s));
-    }
-    Ok(val)
+    bcachefs_kernel::util::printbuf::parse_human_u64(s).map_err(|_| anyhow!("invalid size: {}", s))
 }
 
 pub fn fmt_sectors_human(sectors: u64) -> String {
@@ -195,29 +182,13 @@ pub fn fmt_num_human(n: u64) -> String {
     format!("{}", n)
 }
 
-/// Get the size of a file or block device in bytes.
-pub fn file_size(f: &File) -> Result<u64> {
-    let meta = f.metadata()?;
-    if meta.file_type().is_block_device() {
-        // _IOR(0x12, 114, size_t): the size encoded in the number is
-        // sizeof(size_t), not of the u64 we read into - they differ on 32
-        // bit, so take the number bindgen computed for the target.
-        const BLKGETSIZE64: ioctl::Opcode = bch_bindgen::c::BCH_BLKGETSIZE64 as ioctl::Opcode;
-        Ok(unsafe { ioctl::ioctl(f, Getter::<BLKGETSIZE64, u64>::new()) }?)
-    } else {
-        Ok(meta.len())
-    }
-}
-
-/// Parse a comma-separated flag list against a C string table.
+/// Parse a comma-separated flag list against a table of names.
 ///
 /// Returns a bitmask of matched flags, or an error if any flag is unrecognized.
-pub fn read_flag_list(s: &str, list: &[*const c_char], what: &str) -> Result<u64> {
-    let c_str = CString::new(s)?;
-    let v = unsafe { c::bch2_read_flag_list(c_str.as_ptr(), list.as_ptr()) };
-    if v == u64::MAX {
+pub fn read_flag_list(s: &str, list: &[&str], what: &str) -> Result<u64> {
+    let Ok(v) = bcachefs_kernel::opts::read_flag_list(s.as_bytes(), list, u64::MAX) else {
         bail!("Bad {} {}", what, s);
-    }
+    };
     Ok(v)
 }
 
@@ -233,6 +204,17 @@ where F: FnOnce(&mut io::Stdout) -> Result<()>
     let _ = execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
     result
+}
+
+/// The size of the terminal @fd is, (columns, rows): None if it isn't one, or
+/// doesn't know - a serial console answers zero.
+///
+/// Not crossterm's terminal::size(): when the ioctl gives it nothing, that
+/// forks and execs `tput cols` and `tput lines`, on every call - a display
+/// redrawing on a serial console was two execs a redraw, all its CPU.
+pub fn terminal_size(fd: impl std::os::fd::AsFd) -> Option<(u16, u16)> {
+    let ws = rustix::termios::tcgetwinsize(fd).ok()?;
+    (ws.ws_col != 0 && ws.ws_row != 0).then_some((ws.ws_col, ws.ws_row))
 }
 
 /// Run @f with stderr going to a scratch file, shown only if @f fails.

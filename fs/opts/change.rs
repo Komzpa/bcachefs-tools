@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: GPL-2.0
+//! Changing an option on a running filesystem: OptChange, the option change
+//! lock held, and the hooks either side of the change - before, what it
+//! needs, and whether it may be: the reconcile scans of what it changes the
+//! io options of registered, feature bits, a device's state; after, what it
+//! starts. The pre-set hooks run at mount too, for every option, with no
+//! change to register: opts_hooks_pre_set().
+
+use crate::format::{MemberState, SbFeature};
+use crate::fs::Dev;
+use super::{opt_to_text, Opt, OptId, OPTS};
+use crate::c;
+use crate::data::compress;
+use crate::errcode::{Errcode, BchError};
+use crate::fs::Fs;
+use crate::locking::{ExclusiveGuard, Mutex};
+use crate::sb::io::SbFieldOps;
+use crate::util::printbuf::Printbuf;
+
+impl Fs {
+    /// Before setting option @id to @v, for device @ca or the filesystem,
+    /// without an OptChange - offline: as OptChange::pre_set().
+    pub fn opt_hook_pre_set(&self, ca: Option<&Dev>, id: OptId, v: u64) -> Result<(), BchError> {
+        opt_hook_pre_set(self, ca, 0, id, v, true)
+    }
+}
+
+/// The reconcile scans an option change needs, registered before it and
+/// done after: those of what it changes the io options of.
+fn opt_hook_io(fs: &Fs, ca: Option<&Dev>, inum: u64, id: OptId, v: u64, post: bool)
+    -> Result<(), BchError>
+{
+    use c::ReconcileScan as scan;
+
+    if !fs.flags.get(c::FsFlag::started) {
+        return Ok(());
+    }
+
+    let bracket = |s: scan| if post { fs.opt_change_scan_post(s) } else { fs.opt_change_scan_pre(s) };
+    let dev = || u32::from(ca.expect("a device option").dev_idx);
+
+    match id {
+        OptId::foreground_target |
+        OptId::background_target |
+        OptId::promote_target |
+        OptId::compression |
+        OptId::background_compression |
+        OptId::data_checksum |
+        OptId::data_replicas |
+        OptId::erasure_code |
+        OptId::nocow => bracket(if inum == 0 {
+            scan::fs
+        } else {
+            scan::inum(inum)
+        })?,
+        OptId::metadata_target |
+        OptId::metadata_checksum |
+        OptId::metadata_replicas => bracket(scan::metadata)?,
+        OptId::durability => {
+            if !post && v > ca.expect("a device option").mi.get().durability.into() {
+                fs.request_scan(scan::pending, false)?;
+            }
+            bracket(scan::device(dev()))?;
+        }
+        // The cap is in stripe.can_widen: existing stripes converge to it
+        OptId::ec_max_data_blocks => bracket(scan::stripes)?,
+        OptId::label | OptId::failure_domain => {
+            // The in-memory label tree before the scan wakes: reconcile reads
+            // the groups' devs masks. An error (ENOMEM) leaves it stale until
+            // the next superblock swap
+            if post {
+                let _ = crate::bch_err_fn!(fs, c::bch_sb_field_disk_groups::<crate::util::vstructs::Validated>::to_cpu(fs, &mut fs.sb_lock()));
+            }
+
+            // Only the label is in targets: a failure domain only spreads
+            // future allocations
+            if id == OptId::label {
+                bracket(scan::pending)?;
+                // Data on the device may now be outside its target
+                bracket(scan::device(dev()))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Before setting option @id to @v - for device @ca, or inode @inum, or with
+/// neither (0) the filesystem: what it needs, and whether it may be; with
+/// @change, the scans it needs registered.
+fn opt_hook_pre_set(fs: &Fs, ca: Option<&Dev>, inum: u64, id: OptId, v: u64, change: bool)
+    -> Result<(), BchError>
+{
+    match id {
+        OptId::state => {
+            if let Some(ca) = ca {
+                return fs.dev_set_state(ca, MemberState(v as u8), c::BCH_FORCE_IF_DEGRADED, None);
+            }
+        }
+        OptId::compression | OptId::background_compression => {
+            compress::check_set_has_compressed_data(fs, v as u8)?;
+        }
+        OptId::erasure_code => {
+            if v != 0 {
+                fs.check_set_feature(SbFeature::ec);
+            }
+        }
+        OptId::rotational => {
+            // Offline: there's no post hook, and nothing to race with
+            if let Some(ca) = ca {
+                if change && v != u64::from(ca.mi.get().rotational) && !fs.flags.get(c::FsFlag::started) {
+                    crate::data::reconcile::check::rotational_changed(fs, ca);
+                }
+            }
+        }
+        OptId::casefold_disabled => {
+            if v != 0 && fs.feature(SbFeature::casefolding) {
+                crate::bch_err!(fs, "cannot mount with casefolding disabled: casefolding already in use");
+                return fs.throw(Errcode::casefolding_in_use);
+            }
+        }
+        _ => {}
+    }
+
+    if change {
+        opt_hook_io(fs, ca, inum, id, v, false)?;
+    }
+    Ok(())
+}
+
+/// Each option's pre-set hook, for c->opts as they are: at mount.
+pub(crate) fn opts_hooks_pre_set(fs: &Fs) -> Result<(), BchError> {
+    for opt in &OPTS {
+        opt_hook_pre_set(fs, None, 0, opt.id, fs.opts.get(opt.id), false)?;
+    }
+    Ok(())
+}
+
+/// After setting option @id to @v, as opt_hook_pre_set(): logged, and what
+/// the change starts.
+fn opt_hook_post_set(fs: &Fs, ca: Option<&Dev>, inum: u64, id: OptId, v: u64) {
+    if fs.flags.get(c::FsFlag::started) {
+        let mut buf = Printbuf::new();
+        write!(buf, "opt change: {}=", id.opt().name);
+        opt_to_text(&mut buf, Some(fs), None, id.opt(), v, 0);
+        if let Some(ca) = ca {
+            write!(buf, " dev {}", ca.dev_idx);
+        }
+        if inum != 0 {
+            write!(buf, " inum {inum}");
+        }
+        // Into the journal - or, while it's stopped (read-only), into the
+        // entries it starts with
+        let _ = fs.fs_log_msg(&buf);
+    }
+
+    let _ = opt_hook_io(fs, ca, inum, id, v, true);
+
+    match id {
+        OptId::reconcile_enabled | OptId::read_only => fs.reconcile_wakeup(),
+        OptId::copygc_enabled => fs.copygc_wakeup(),
+        OptId::discard => {
+            if ca.is_none() {
+                let mut sb = fs.sb_lock();
+                for ca in fs.members() {
+                    sb.fs_member_mut(ca.dev_idx.into()).set_discard(fs.opts.discard());
+                }
+                fs.write_super(&mut sb);
+            }
+        }
+        OptId::durability => {
+            let state = fs.state_lock_read();
+            if let Some(ca) = ca {
+                if fs.flags.get(c::FsFlag::rw) && ca.is_online() &&
+                   ca.mi.get().state == MemberState::rw {
+                    fs.dev_allocator_set_rw(ca.dev_idx.into(), true);
+                    state.recalc_capacity();
+                }
+            }
+        }
+        // XXX: in the future we'll likely want to do compatible upgrades at
+        // runtime as well, but right now there's nothing that does that
+        OptId::version_upgrade => {
+            if v == c::VersionUpgradeOpt::incompatible.0.into() {
+                fs.upgrade_incompat();
+            }
+        }
+        // Online: the new value has to be live before the pass runs
+        OptId::rotational => {
+            if let Some(ca) = ca {
+                if fs.flags.get(c::FsFlag::started) {
+                    crate::data::reconcile::check::rotational_changed(fs, ca);
+                }
+            }
+        }
+        OptId::btree_cache_shrinker_seeks => {
+            fs.btree.cache.set_shrinker_seeks(v as _);
+        }
+        _ => {}
+    }
+}
+
+/// An option change in progress: the option change lock held, and the scans
+/// its pre-set hooks request registered as in flight - the reconcile thread
+/// doesn't start them (data/reconcile/scan.rs). Both are released on drop,
+/// the registrations first - drop()'s, then the guard's.
+///
+/// c->opt_change_cookie is odd while it's held: io options read under an
+/// even one are as the options are.
+pub struct OptChange<'f> {
+    fs:    &'f Fs,
+    _lock: ExclusiveGuard<'f, Mutex>,
+}
+
+impl<'f> OptChange<'f> {
+    pub fn new(fs: &'f Fs) -> Self {
+        let _lock = fs.opt_change_lock.lock();
+        let cookie = fs.opt_change_cookie.get();
+        assert!(cookie & 1 == 0);
+        // the lock makes us its one writer
+        fs.opt_change_cookie.set(cookie + 1);
+        OptChange { fs, _lock }
+    }
+
+    /// Before setting option @id to @v - for device @ca, or inode @inum, or
+    /// with neither (0) the filesystem: records what the change needs, and
+    /// fails if it may not.
+    pub fn pre_set(&mut self, ca: Option<&Dev>, inum: u64, id: OptId, v: u64) -> Result<(), BchError> {
+        opt_hook_pre_set(self.fs, ca, inum, id, v, true)
+    }
+
+    pub fn post_set(&self, ca: Option<&Dev>, inum: u64, id: OptId, v: u64) {
+        opt_hook_post_set(self.fs, ca, inum, id, v)
+    }
+
+    /// Set @opt to @v - in the superblock if it's a field of it, @ca's member
+    /// for a device option - and for a filesystem option in c->opts, no longer
+    /// as mount set it; both under one sb_lock. Whether it changed.
+    pub fn set(&self, ca: Option<&Dev>, opt: &Opt, v: u64, val: &[u8]) -> Result<bool, BchError> {
+        let fs = self.fs;
+        let mut sb = fs.sb_lock();
+
+        let changed = if opt.in_sb() {
+            let changed = crate::opts::opt_set_sb(&mut sb, ca.map(|ca| ca.dev_idx.into()), opt, v, Some(val))?;
+            if changed {
+                fs.write_super(&mut sb);
+            }
+            changed
+        } else {
+            assert!(ca.is_none(), "device option {} isn't a superblock option: not supported", opt.name);
+            fs.opts().get(opt.id) != v
+        };
+
+        if changed && ca.is_none() {
+            fs.opts_writer(&mut sb).set(opt.id, v);
+            fs.mount_opts.clear(opt.id.0 as usize);
+        }
+        Ok(changed)
+    }
+}
+
+impl Drop for OptChange<'_> {
+    fn drop(&mut self) {
+        self.fs.opt_change_scans_done();
+        let cookie = self.fs.opt_change_cookie.get();
+        assert!(cookie & 1 != 0);
+        self.fs.opt_change_cookie.set(cookie + 1);
+    }
+}
