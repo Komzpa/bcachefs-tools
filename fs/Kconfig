@@ -2,6 +2,7 @@
 config BCACHEFS_FS
 	tristate "bcachefs filesystem support (EXPERIMENTAL)"
 	depends on BLOCK
+	depends on THREAD_INFO_IN_TASK
 	select EXPORTFS
 	select CRC32
 	select CRC64
@@ -65,16 +66,6 @@ config BCACHEFS_NO_LATENCY_ACCT
 	help
 	This disables device latency tracking and time stats, only for performance testing
 
-config BCACHEFS_SIX_OPTIMISTIC_SPIN
-	bool "Optimistic spinning for six locks"
-	depends on BCACHEFS_FS
-	depends on SMP
-	default y
-	help
-	Instead of immediately sleeping when attempting to take a six lock that
-	is held by another thread, spin for a short while, as long as the
-	thread owning the lock is running.
-
 config BCACHEFS_PATH_TRACEPOINTS
 	bool "Extra btree_path tracepoints"
 	depends on BCACHEFS_FS && TRACING
@@ -86,11 +77,3 @@ config BCACHEFS_TRANS_KMALLOC_TRACE
 	bool "Trace bch2_trans_kmalloc() calls"
 	depends on BCACHEFS_FS
 
-config MEAN_AND_VARIANCE_UNIT_TEST
-	tristate "mean_and_variance unit tests" if !KUNIT_ALL_TESTS
-	depends on KUNIT
-	depends on BCACHEFS_FS
-	default KUNIT_ALL_TESTS
-	help
-	  This option enables the kunit tests for mean_and_variance module.
-	  If unsure, say N.

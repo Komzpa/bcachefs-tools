@@ -6,27 +6,28 @@
 //! has to choose.
 //!
 //! This runs before [`crate::device_scan::filter_current_sbs`] because
-//! bch2_sbs_filter_dead() drops divergent devices *and frees their
+//! filter_dead() drops divergent devices *and frees their
 //! superblocks* - and drops them the same way it drops devices that were
 //! properly removed, so all that is left afterwards is a short device count,
 //! which reads as "you are missing a disk".
 //!
-//! bch2_dev_in_fs() (fs/init/dev.c) decides what diverged; this only decides
-//! what to say. Only BCH_ERR_device_splitbrain means divergence - the other
+//! dev_in_fs() (fs/init/dev.rs) decides what diverged; this only decides
+//! what to say. Only device_splitbrain means divergence - the other
 //! returns are different problems, left to the kernel to report. Its own
 //! account reaches stderr first, ending in "Not using <dev>", which describes
-//! what bch2_sbs_filter_dead() would do rather than what we do.
+//! what filter_dead() would do rather than what we do.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use log::warn;
 
-use crate::prompt::{fs_name, Choice, Prompt, Question, NO_ONE_TO_ASK, PROMPT_TIMEOUT};
+use bcachefs_kernel::util::prompt::{fs_name, Choice, Prompt, Question, Reply, NO_ONE_TO_ASK, PROMPT_TIMEOUT};
 use bcachefs_kernel::c;
-use bcachefs_kernel::errcode::BchError;
+use bcachefs_kernel::init::dev::dev_in_fs;
+use bcachefs_kernel::fs::newest;
 use bcachefs_kernel::sb::members;
-use bcachefs_kernel::util::printbuf::Printbuf;
+use bcachefs_kernel::util::printbuf::DateTime;
 use c::bch_sb_handle;
 
 pub struct Divergent {
@@ -39,24 +40,21 @@ pub struct Divergent {
 }
 
 fn seq(sb: &c::bch_sb) -> u64 {
-    u64::from_le(sb.seq)
+    sb.seq.get()
 }
 
 fn write_time(sb: &c::bch_sb) -> u64 {
-    u64::from_le(sb.write_time)
+    sb.write_time.get()
 }
 
-/// Highest seq, then newest write time - sb_cmp() in fs/init/fs.c.
+/// The filesystem's superblock as the kernel picks it: newest().
 ///
 /// Only authoritative in the sense the kernel means it: newest wins, which
 /// across a genuine fork is arbitrary and quite possibly wrong - a stale
 /// rescue image booted later is newer than the filesystem the user wants. Used
 /// to have something to compare against, never to decide anything.
 fn authoritative(sbs: &[(PathBuf, bch_sb_handle)]) -> Option<usize> {
-    sbs.iter()
-        .enumerate()
-        .max_by_key(|(_, (_, sb))| (seq(sb.sb()), write_time(sb.sb())))
-        .map(|(i, _)| i)
+    newest(sbs.iter().map(|(_, h)| h.sb()))
 }
 
 /// Devices that have diverged, or an empty vec. Never errors: anything that is
@@ -68,7 +66,6 @@ pub fn find(sbs: &[(PathBuf, bch_sb_handle)], opts: &c::bch_opts) -> Vec<Diverge
 
     let best_handle = &sbs[best_idx].1;
     let best_members = members::members_v2(best_handle.sb());
-    let mut opts = *opts;
     let mut out = Vec::new();
 
     for (i, (path, handle)) in sbs.iter().enumerate() {
@@ -76,18 +73,9 @@ pub fn find(sbs: &[(PathBuf, bch_sb_handle)], opts: &c::bch_opts) -> Vec<Diverge
             continue;
         }
 
-        // SAFETY: bch2_dev_in_fs() compares two superblocks and formats a
-        // message; it mutates neither handle. Both outlive the call. The
-        // non-const pointers are the C signature, not a licence.
-        let ret = unsafe {
-            c::bch2_dev_in_fs(
-                best_handle as *const _ as *mut _,
-                handle as *const _ as *mut _,
-                &mut opts,
-            )
-        };
+        let ret = dev_in_fs(best_handle.sb(), Some(best_handle.dev.bdev()), handle, opts);
 
-        if BchError::from_raw(-ret).matches(c::bch_errcode::BCH_ERR_device_splitbrain) {
+        if ret.is_err_and(|e| e.matches(c::Errcode::device_splitbrain)) {
             let sb = handle.sb();
             out.push(Divergent {
                 path: path.clone(),
@@ -102,19 +90,12 @@ pub fn find(sbs: &[(PathBuf, bch_sb_handle)], opts: &c::bch_opts) -> Vec<Diverge
                 expected_seq: best_members
                     .as_ref()
                     .and_then(|m| m.get(sb.dev_idx as u32))
-                    .map_or(0, |m| u64::from_le(m.seq)),
+                    .map_or(0, |m| m.seq.get()),
             });
         }
     }
 
     out
-}
-
-fn datetime(secs: u64) -> String {
-    let mut out = Printbuf::new();
-    // SAFETY: writing into a printbuf we own; the value is a plain time64_t.
-    unsafe { c::bch2_prt_datetime(out.as_raw(), secs as i64) };
-    out.as_str().to_owned()
 }
 
 fn name(path: &Path) -> String {
@@ -144,7 +125,7 @@ pub fn report(sbs: &[(PathBuf, bch_sb_handle)], divergent: &[Divergent]) -> Stri
             "  {} (device {}) last written {}, seq {}",
             name(&d.path),
             d.dev_idx,
-            datetime(d.write_time),
+            DateTime(d.write_time as i64),
             d.seq
         );
 
@@ -163,7 +144,7 @@ pub fn report(sbs: &[(PathBuf, bch_sb_handle)], divergent: &[Divergent]) -> Stri
         let _ = writeln!(
             out,
             "  {other} last written {}, seq {}.",
-            datetime(write_time(best)),
+            DateTime(write_time(best) as i64),
             seq(best)
         );
     }
@@ -215,28 +196,28 @@ pub fn ask(sb: &bch_sb_handle) -> Result<bool> {
         return Ok(false);
     }
 
-    let name = fs_name(sb);
+    let name = fs_name(sb.sb());
     let uuid = sb.sb().uuid().hyphenated().to_string();
 
     // Moot cannot happen: a device arriving does not un-diverge anything, so
     // no watch is passed.
-    Ok(p.put(&Question {
+    Ok(matches!(p.put(&Question {
         prompt:  &format!("Continue with {name}'s surviving history?"),
         choices: CHOICES,
-        silence: false,
+        silence: Some(false),
         // Not an alarm: what this question risks is in the report the scan
         // already printed above it, not in the one line here.
         alarm:   false,
         uuid:    &uuid,
         timeout: Some(PROMPT_TIMEOUT),
-    }, None)?.unwrap_or(false))
+    }, None)?, Reply::Answer(true)))
 }
 
 /// Only an explicit `c` continues, and note what is *not* here: `y`.
 ///
 /// This is not a yes/no. Someone answering a prompt they did not read out of
 /// habit should not thereby choose which of two histories to keep - so `y`
-/// matches nothing and falls to silence, which refuses.
+/// matches nothing, and is asked again.
 const CHOICES: &[Choice<bool>] = &[
     Choice { key: 'c', aliases: &["continue"], short: "continue",
              blurb: "continue, leaving the diverged device(s) out of this mount",
@@ -244,29 +225,6 @@ const CHOICES: &[Choice<bool>] = &[
     Choice { key: 'n', aliases: &["no"], short: "",
              blurb: "don't mount", answer: false },
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(reply: &str) -> bool {
-        Question {
-            prompt: "", choices: CHOICES,
-            silence: false, alarm: false, uuid: "", timeout: None,
-        }.parse(reply)
-    }
-
-    #[test]
-    fn only_an_explicit_c_continues() {
-        for yes in ["c", "C", "continue", "Continue", " c ", "c\n"] {
-            assert!(parse(yes), "{yes:?} should continue");
-        }
-        // "" is a bare Enter, and "y" is the habit this question must not honour.
-        for no in ["", " ", "n", "N", "no", "y", "Y", "yes", "f", "very", "cc", "x"] {
-            assert!(!parse(no), "{no:?} must not continue");
-        }
-    }
-}
 
 /// What to call the side that is not diverging.
 ///
@@ -281,5 +239,32 @@ fn other_side(sbs: &[(PathBuf, bch_sb_handle)], divergent: &[Divergent]) -> Stri
     match (surviving, authoritative(sbs)) {
         (1, Some(i)) => name(&sbs[i].0),
         _ => "the rest of the filesystem".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(reply: &str) -> Option<bool> {
+        Question {
+            prompt: "", choices: CHOICES,
+            silence: Some(false), alarm: false, uuid: "", timeout: None,
+        }.parse(reply)
+    }
+
+    #[test]
+    fn only_an_explicit_c_continues() {
+        for yes in ["c", "C", "continue", "Continue", " c ", "c\n"] {
+            assert_eq!(parse(yes), Some(true), "{yes:?} should continue");
+        }
+        // "" is a bare Enter
+        for no in ["", " ", "n", "N", "no"] {
+            assert_eq!(parse(no), Some(false), "{no:?} must not continue");
+        }
+        // and "y" is the habit this question must not honour
+        for unknown in ["y", "Y", "yes", "f", "very", "cc", "x"] {
+            assert_eq!(parse(unknown), None, "{unknown:?} must be asked again");
+        }
     }
 }

@@ -1,0 +1,326 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! Kobjects, after Wedson Almeida Filho's rust/kernel/kobject.rs (2021,
+//! never merged): a kobject's kobj_type made at compile time from its
+//! owner's KobjOwner impl - release, sysfs_ops and groups - and its files as
+//! attribute groups, a named group a subdirectory of the kobject's with no
+//! kobject, and no lifetime, of its own.
+//!
+//! Wedson's Object<T> allocates the kobject with its data; ours is a field of
+//! what it's the kobject of, where C has it: Kobject::new() makes it with its
+//! owner, and the last put is the owner's release.
+
+use core::cell::UnsafeCell;
+use core::ffi::CStr;
+use core::marker::PhantomData;
+use core::ptr::NonNull;
+
+use crate::c;
+use crate::errcode::{ret_to_result_void, BchError};
+use crate::os::sysfs::{self, obj_of, Bin, Dir, Files};
+use crate::util::ffi::c_char;
+use crate::util::place::{container_of_raw, Enclosing, Place, Placed};
+
+#[path = "../kobject.rs"]
+mod common;
+pub use common::StaticKobject;
+
+/// /sys/fs.
+pub fn fs_kobj() -> Option<&'static Kobject> {
+    // SAFETY: the kernel's, made at boot and never freed
+    Some(unsafe { Kobject::from_raw(c::fs_kobj) })
+}
+
+/// A Bin's file, of a directory D: a bin_attribute, for a static.
+#[repr(transparent)]
+pub(crate) struct BinFile<D>(c::bin_attribute, PhantomData<fn() -> D>);
+
+unsafe impl<D> Sync for BinFile<D> {}
+
+impl<D: Dir> BinFile<D> {
+    pub(crate) const fn new<B: Bin<Dir = D>>(name: &'static CStr, mode: u16) -> Self {
+        let mut a: c::bin_attribute = ::pin_init::zeroed();
+        a.attr = sysfs::attribute(name, mode);
+        a.read = Some(bin_read::<B>);
+        a.write = Some(bin_write::<B>);
+        BinFile(a, PhantomData)
+    }
+}
+
+unsafe extern "C" fn bin_read<B: Bin>(_file: *mut c::file, kobj: *mut c::kobject, _attr: *const c::bin_attribute,
+                                      buf: *mut c_char, off: c::loff_t, count: usize) -> isize {
+    // SAFETY: the file's kobject, B::Dir's; kernfs's buffer, of @count bytes
+    let (obj, buf) = unsafe {
+        (obj_of::<B::Dir>(kobj.cast()), core::slice::from_raw_parts_mut(buf.cast::<u8>(), count))
+    };
+    B::read(obj, buf, off as u64).map_or_else(|e| e.class() as isize, |n| n as isize)
+}
+
+unsafe extern "C" fn bin_write<B: Bin>(_file: *mut c::file, kobj: *mut c::kobject, _attr: *const c::bin_attribute,
+                                       buf: *mut c_char, off: c::loff_t, count: usize) -> isize {
+    // SAFETY: as bin_read()'s
+    let (obj, buf) = unsafe {
+        (obj_of::<B::Dir>(kobj.cast()), core::slice::from_raw_parts(buf.cast::<u8>(), count))
+    };
+    B::write(obj, buf, off as u64).map_or_else(|e| e.class() as isize, |n| n as isize)
+}
+
+/// A group's bin files: NULL terminated, N files plus one.
+#[repr(transparent)]
+pub(crate) struct BinFiles<D, const N: usize>([*const c::bin_attribute; N], PhantomData<fn() -> D>);
+
+unsafe impl<D, const N: usize> Sync for BinFiles<D, N> {}
+
+impl<D: Dir, const N: usize> BinFiles<D, N> {
+    pub const fn new<const M: usize>(files: [&'static BinFile<D>; M]) -> Self {
+        assert!(M + 1 == N);
+
+        let mut ptrs = [core::ptr::null(); N];
+        let mut i = 0;
+        while i < M {
+            ptrs[i] = &files[i].0;
+            i += 1;
+        }
+        BinFiles(ptrs, PhantomData)
+    }
+}
+
+/// An attribute group of a directory D: a kobject's files, or with a name a
+/// subdirectory of them.
+#[repr(transparent)]
+pub(crate) struct Group<D>(c::attribute_group, PhantomData<fn() -> D>);
+
+unsafe impl<D> Sync for Group<D> {}
+
+impl<D: Dir> Group<D> {
+    pub const fn new<const N: usize>(name: Option<&'static CStr>, files: &'static Files<D, N>) -> Self {
+        Self::make(name, files.as_ptr(), core::ptr::null())
+    }
+
+    pub const fn with_bin<const N: usize, const B: usize>(name: Option<&'static CStr>, files: &'static Files<D, N>,
+                                                          bin: &'static BinFiles<D, B>) -> Self {
+        Self::make(name, files.as_ptr(), bin.0.as_ptr())
+    }
+
+    const fn make(name: Option<&'static CStr>, attrs: *mut *mut c::attribute,
+                  bin_attrs: *const *const c::bin_attribute) -> Self {
+        let mut g: c::attribute_group = ::pin_init::zeroed();
+        if let Some(name) = name {
+            g.name = name.as_ptr().cast();
+        }
+
+        // where the kernel has them: a union with attrs_const from 6.19, and
+        // bin_attrs one with bin_attrs_new before 6.18
+        #[cfg(linux_ge = "6.19")]
+        {
+            g.__bindgen_anon_2.attrs = attrs;
+            g.bin_attrs = bin_attrs;
+        }
+        #[cfg(linux_ge = "6.18")]
+        #[cfg(not(linux_ge = "6.19"))]
+        {
+            g.attrs = attrs;
+            g.bin_attrs = bin_attrs;
+        }
+        #[cfg(not(linux_ge = "6.18"))]
+        {
+            g.attrs = attrs;
+            g.__bindgen_anon_1.bin_attrs_new = bin_attrs;
+        }
+        Group(g, PhantomData)
+    }
+}
+
+/// A kobject's groups, for its kobj_type: NULL terminated, N groups plus one.
+#[repr(transparent)]
+pub(crate) struct Groups<D, const N: usize>([*const c::attribute_group; N], PhantomData<fn() -> D>);
+
+unsafe impl<D, const N: usize> Sync for Groups<D, N> {}
+
+impl<D: Dir, const N: usize> Groups<D, N> {
+    pub const fn new<const M: usize>(groups: [&'static Group<D>; M]) -> Self {
+        assert!(M + 1 == N);
+
+        let mut ptrs = [core::ptr::null(); N];
+        let mut i = 0;
+        while i < M {
+            ptrs[i] = &groups[i].0;
+            i += 1;
+        }
+        Groups(ptrs, PhantomData)
+    }
+
+    pub const fn list(&'static self) -> GroupList<D> {
+        GroupList(self.0.as_ptr(), PhantomData)
+    }
+}
+
+/// Groups<D, N>, its N forgotten: what a kobj_type points to.
+pub(crate) struct GroupList<D>(*const *const c::attribute_group, PhantomData<fn() -> D>);
+
+/// Where a kobject is, as a type: what it's the kobject of - owner() of a
+/// kobject at this place is the Owner it's in.
+pub(crate) trait KobjPlace {
+    type Owner;
+
+    /// # Safety
+    /// @kobj is at this place.
+    unsafe fn owner(kobj: *mut Kobject) -> *mut Self::Owner;
+}
+
+impl<A: Place<Type = Self, Base: Enclosing<Visible = A::Base>>> KobjPlace for Placed<Kobject, A> {
+    type Owner = A::Base;
+
+    unsafe fn owner(kobj: *mut Kobject) -> *mut A::Base {
+        unsafe { container_of_raw(kobj.cast::<Self>()) }
+    }
+}
+
+/// What a kobject is the kobject of: its kobj_type's.
+///
+/// # Safety
+/// Its Dir's kobject was made with Kobject::new::<Self>(); release() frees
+/// what it's given.
+pub(crate) unsafe trait KobjOwner: Sized + 'static {
+    const GROUPS: GroupList<Self::Dir>;
+    type Dir: Dir<Obj = Self>;
+
+    /// The last ref's been put.
+    ///
+    /// # Safety
+    /// Nothing uses @this after.
+    unsafe fn release(this: NonNull<Self>);
+}
+
+struct Ktype<T>(PhantomData<T>);
+
+impl<T: KobjOwner> Ktype<T> {
+    const OPS: c::sysfs_ops = sysfs::ops::<T::Dir>();
+
+    const KTYPE: c::kobj_type = {
+        let mut k: c::kobj_type = ::pin_init::zeroed();
+        k.release = Some(Self::release);
+        k.sysfs_ops = &Self::OPS;
+        k.default_groups = T::GROUPS.0.cast_mut();
+        k
+    };
+
+    unsafe extern "C" fn release(kobj: *mut c::kobject) {
+        unsafe { T::release(NonNull::new_unchecked(<T::Dir as Dir>::Kobj::owner(kobj.cast()))) }
+    }
+}
+
+/// A struct kobject, in what it's the kobject of.
+#[repr(transparent)]
+pub struct Kobject(UnsafeCell<c::kobject>);
+
+unsafe impl Send for Kobject {}
+unsafe impl Sync for Kobject {}
+
+unsafe impl ::pin_init::Zeroable for Kobject {}
+
+impl Kobject {
+    /// kobject_init(), with T's kobj_type: holding the ref the owner's last
+    /// put() drops.
+    ///
+    /// # Safety
+    /// For T's kobject, its Dir's Kobj.
+    pub(crate) unsafe fn new<T: KobjOwner>() -> impl ::pin_init::PinInit<Self> {
+        unsafe {
+            ::pin_init::pin_init_from_closure(|slot: *mut Self| {
+                slot.write_bytes(0, 1);
+                (*slot).init::<T>();
+                Ok(())
+            })
+        }
+    }
+
+    /// new(), for one already in place, zeroed: a static's.
+    ///
+    /// # Safety
+    /// As new()'s.
+    pub(crate) unsafe fn init<T: KobjOwner>(&self) {
+        unsafe { c::kobject_init(self.as_ptr(), &Ktype::<T>::KTYPE) }
+    }
+
+    pub fn as_ptr(&self) -> *mut c::kobject {
+        self.0.get()
+    }
+
+    /// The kobject @kobj, as C's: a static one, or another's.
+    ///
+    /// # Safety
+    /// @kobj is initialized, and lives as long as 'a.
+    pub unsafe fn from_raw<'a>(kobj: *mut c::kobject) -> &'a Kobject {
+        unsafe { &*kobj.cast() }
+    }
+
+    /// init()ed, or made by new().
+    pub fn initialized(&self) -> bool {
+        u32::from(unsafe { (*self.as_ptr()).state_initialized() }) != 0
+    }
+
+    /// In sysfs: added, and not deleted since.
+    pub fn in_sysfs(&self) -> bool {
+        u32::from(unsafe { (*self.as_ptr()).state_in_sysfs() }) != 0
+    }
+
+    /// Into sysfs as @name, in @parent's directory - or at the top, without
+    /// one: its groups' files with it.
+    pub fn add(&self, parent: Option<&Kobject>, name: &CStr) -> Result<(), BchError> {
+        let parent = parent.map_or(core::ptr::null_mut(), Kobject::as_ptr);
+        ret_to_result_void(unsafe {
+            c::kobject_add(self.as_ptr(), parent, c"%s".as_ptr().cast(), name.as_ptr())
+        })
+    }
+
+    /// A link in its directory, @name, to @target's: sysfs_create_link().
+    pub fn link(&self, target: &Kobject, name: &CStr) -> Result<(), BchError> {
+        ret_to_result_void(unsafe { c::sysfs_create_link(self.as_ptr(), target.as_ptr(), name.as_ptr().cast()) })
+    }
+
+    /// link()'s @name, removed.
+    pub fn unlink(&self, name: &CStr) {
+        unsafe { c::sysfs_remove_link(self.as_ptr(), name.as_ptr().cast()) }
+    }
+
+    /// A KOBJ_CHANGE uevent, @env its VAR=value strings.
+    pub fn uevent_change(&self, env: &[&CStr]) -> Result<(), BchError> {
+        use crate::util::alloc::KVVec;
+
+        let mut envp = KVVec::with_capacity(env.len() + 1)?;
+        for e in env {
+            envp.push(e.as_ptr().cast_mut())?;
+        }
+        envp.push(core::ptr::null_mut())?;
+        ret_to_result_void(unsafe {
+            c::kobject_uevent_env(self.as_ptr(), c::kobject_action_KOBJ_CHANGE, envp.as_mut_ptr().cast())
+        })
+    }
+
+    /// Out of sysfs, if it's there.
+    pub fn del(&self) {
+        if self.in_sysfs() {
+            unsafe { c::kobject_del(self.as_ptr()) }
+        }
+    }
+
+    /// A ref, for put() to give back.
+    pub fn get(&self) {
+        unsafe { c::kobject_get(self.as_ptr()) };
+    }
+
+    /// get(), unless the last ref's been put: kobject_get_unless_zero().
+    pub fn get_unless_zero(&self) -> bool {
+        !unsafe { c::kobject_get_unless_zero(self.as_ptr()) }.is_null()
+    }
+
+    /// A ref given back: the last releases the owner - frees it.
+    ///
+    /// # Safety
+    /// The caller holds the ref; if it's the last, nothing uses the owner
+    /// after.
+    pub unsafe fn put(this: *const Kobject) {
+        unsafe { c::kobject_put(UnsafeCell::raw_get(this.cast())) }
+    }
+}

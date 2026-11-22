@@ -1,9 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#include <linux/err.h>
-#include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/string.h>
-#include <linux/slab.h>
+#include <stdlib.h>
 //#include <linux/parser.h>
 #include <linux/errno.h>
 //#include <linux/stringhash.h>
@@ -16,7 +13,6 @@ int utf8_validate(const struct unicode_map *um, const struct qstr *str)
 		return -1;
 	return 0;
 }
-EXPORT_SYMBOL(utf8_validate);
 
 int utf8_strncmp(const struct unicode_map *um,
 		 const struct qstr *s1, const struct qstr *s2)
@@ -42,7 +38,6 @@ int utf8_strncmp(const struct unicode_map *um,
 
 	return 0;
 }
-EXPORT_SYMBOL(utf8_strncmp);
 
 int utf8_strncasecmp(const struct unicode_map *um,
 		     const struct qstr *s1, const struct qstr *s2)
@@ -68,7 +63,6 @@ int utf8_strncasecmp(const struct unicode_map *um,
 
 	return 0;
 }
-EXPORT_SYMBOL(utf8_strncasecmp);
 
 /* String cf is expected to be a valid UTF-8 casefolded
  * string.
@@ -95,7 +89,6 @@ int utf8_strncasecmp_folded(const struct unicode_map *um,
 
 	return 0;
 }
-EXPORT_SYMBOL(utf8_strncasecmp_folded);
 
 int utf8_casefold(const struct unicode_map *um, const struct qstr *str,
 		  unsigned char *dest, size_t dlen)
@@ -117,7 +110,6 @@ int utf8_casefold(const struct unicode_map *um, const struct qstr *str,
 	}
 	return -EINVAL;
 }
-EXPORT_SYMBOL(utf8_casefold);
 
 int utf8_normalize(const struct unicode_map *um, const struct qstr *str,
 		   unsigned char *dest, size_t dlen)
@@ -139,7 +131,6 @@ int utf8_normalize(const struct unicode_map *um, const struct qstr *str,
 	}
 	return -EINVAL;
 }
-EXPORT_SYMBOL(utf8_normalize);
 
 static const struct utf8data *find_table_version(const struct utf8data *table,
 		size_t nr_entries, unsigned int version)
@@ -159,9 +150,9 @@ struct unicode_map *utf8_load(unsigned int version)
 {
 	struct unicode_map *um;
 
-	um = kzalloc(sizeof(struct unicode_map), GFP_KERNEL);
+	um = calloc(1, sizeof(struct unicode_map));
 	if (!um)
-		return ERR_PTR(-ENOMEM);
+		return NULL;
 	um->version = version;
 
 	um->tables = &utf8_data_table;
@@ -181,15 +172,12 @@ struct unicode_map *utf8_load(unsigned int version)
 	return um;
 
 out_free_um:
-	kfree(um);
-	return ERR_PTR(-EINVAL);
+	free(um);
+	return NULL;
 }
-EXPORT_SYMBOL(utf8_load);
 
 void utf8_unload(struct unicode_map *um)
 {
-	if (um)
-		kfree(um);
+	free(um);
 }
-EXPORT_SYMBOL(utf8_unload);
 

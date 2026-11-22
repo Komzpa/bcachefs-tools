@@ -1,9 +1,9 @@
-use std::ffi::CString;
 
 use anyhow::{bail, Result};
 use bcachefs_kernel::c;
-use bcachefs_kernel::fs::Fs;
-use bcachefs_kernel::opt_set;
+use bcachefs_kernel::fs::{Fs, OpenFs};
+use bcachefs_kernel::util::printbuf::Printbuf;
+use bcachefs_kernel::util::rcu;
 use clap::{Arg, ArgAction, Command};
 
 use crate::commands::opts::{bch_opt_lookup, bch_option_args, bch_options_from_matches};
@@ -12,7 +12,7 @@ use crate::wrappers::handle::BcachefsHandle;
 use crate::wrappers::sysfs;
 
 fn opt_flags() -> u32 {
-    c::opt_flags::OPT_FS as u32 | c::opt_flags::OPT_DEVICE as u32
+    c::OptFlags::fs.bits() | c::OptFlags::device.bits()
 }
 
 fn set_option_cmd() -> Command {
@@ -52,8 +52,8 @@ fn cmd_set_option(argv: Vec<String>) -> Result<()> {
     let devs: Vec<std::path::PathBuf> = devices.iter().map(|d| d.as_str().into()).collect();
 
     let mut fs_opts = c::bch_opts::default();
-    opt_set!(fs_opts, nostart, 1);
-    opt_set!(fs_opts, will_not_start, 1);
+    fs_opts.set_nostart(true);
+    fs_opts.set_will_not_start(true);
 
     match crate::device_scan::open_online_or_offline(&devs, fs_opts)? {
         OpenedFs::Online(fs)  => set_option_online(fs, &devices, &dev_idxs, &opts),
@@ -83,7 +83,7 @@ fn set_option_online(
             failed.insert(name.as_str());
             continue;
         };
-        let flags = opt.flags as u32;
+        let flags = opt.flags.bits();
 
         if flags & opt_flags() == 0 {
             eprintln!("Can't set option {name}");
@@ -92,21 +92,21 @@ fn set_option_online(
         }
 
         // The online path can only write sysfs, and the kernel creates an
-        // option's attribute 0444 unless it is OPT_RUNTIME (fs/opts.c:
-        // `.attr.mode = (_flags) & OPT_RUNTIME ? 0644 : 0444`). So a
+        // option's attribute 0444 unless it is a runtime option (OPT_FILES,
+        // fs/debug/sysfs.rs). So a
         // non-runtime option has a file that cannot be opened for writing,
-        // and testing OPT_FS|OPT_DEVICE above lets it through to fail.
+        // and testing fs|device above lets it through to fail.
         // Many such options *can* be set with the filesystem unmounted, so
         // say that rather than just refusing.
-        if flags & c::opt_flags::OPT_RUNTIME as u32 == 0 {
+        if flags & c::OptFlags::runtime.bits() == 0 {
             eprintln!("{name} cannot be set while the filesystem is mounted \
                        (unmount and set it offline)");
             failed.insert(name.as_str());
             continue;
         }
 
-        let is_fs_opt = flags & c::opt_flags::OPT_FS as u32 != 0;
-        let is_device_opt = flags & c::opt_flags::OPT_DEVICE as u32 != 0;
+        let is_fs_opt = flags & c::OptFlags::fs.bits() != 0;
+        let is_device_opt = flags & c::OptFlags::device.bits() != 0;
 
         if is_fs_opt && !is_device_opt {
             if let Err(e) = sysfs::sysfs_write_str(fs.sysfs_fd(), &format!("options/{name}"), value) {
@@ -155,7 +155,7 @@ fn set_option_online(
 }
 
 fn set_option_offline(
-    fs: Fs,
+    fs: OpenFs,
     devices: &[&String],
     dev_idxs: &[u32],
     opts: &[(String, String)],
@@ -170,7 +170,7 @@ fn set_option_offline(
             failed.insert(name.as_str());
             continue;
         };
-        let flags = opt.flags as u32;
+        let flags = opt.flags.bits();
 
         if flags & opt_flags() == 0 {
             eprintln!("Can't set option {name}");
@@ -178,24 +178,31 @@ fn set_option_offline(
             continue;
         }
 
-        let c_value = CString::new(value.as_str())?;
-        let Ok(val) = bcachefs_kernel::opts::opt_parse(Some(&fs), opt, &c_value, None) else {
-            eprintln!("Error parsing {name}={value}");
+        let mut err = Printbuf::new();
+        let Ok(val) = bcachefs_kernel::opts::opt_parse(Some(&fs), opt, Some(value.as_bytes()), Some(&mut err)) else {
+            match err.as_str().trim_end() {
+                ""  => eprintln!("Error parsing {name}={value}"),
+                msg => eprintln!("Error parsing {name}={value}: {msg}"),
+            }
             failed.insert(name.as_str());
             continue;
         };
 
-        if flags & c::opt_flags::OPT_FS as u32 != 0 {
+        if flags & c::OptFlags::fs.bits() != 0 {
             if let Err(e) = fs.opt_hook_pre_set(None, opt_id, val) {
                 eprintln!("Error setting {name}: {e}");
                 failed.insert(name.as_str());
                 continue;
             }
-            fs.opt_set_sb(None, opt, val, Some(&c_value));
+            if let Err(e) = fs.opt_set_sb(None, opt, val, Some(value.as_bytes())) {
+                eprintln!("Error setting {name}={value}: {e}");
+                failed.insert(name.as_str());
+                continue;
+            }
             modified = true;
         }
 
-        if flags & c::opt_flags::OPT_DEVICE as u32 != 0 {
+        if flags & c::OptFlags::device.bits() != 0 {
             let indices: Vec<u32> = if !dev_idxs.is_empty() {
                 dev_idxs.to_vec()
             } else {
@@ -227,20 +234,23 @@ fn set_option_offline(
                     continue;
                 };
 
-                if let Err(e) = fs.opt_hook_pre_set(Some(&ca), opt_id, val) {
+                if let Err(e) = fs.opt_hook_pre_set(Some(&*ca), opt_id, val) {
                     eprintln!("Error setting {name}: {e}");
                     failed.insert(name.as_str());
                     continue;
                 }
-                fs.opt_set_sb(Some(&ca), opt, val, Some(&c_value));
+                if let Err(e) = fs.opt_set_sb(Some(&*ca), opt, val, Some(value.as_bytes())) {
+                    eprintln!("Error setting {name}={value} on device {idx}: {e}");
+                    failed.insert(name.as_str());
+                    continue;
+                }
                 modified = true;
             }
         }
     }
 
     if modified {
-        let _lock = fs.sb_lock();
-        fs.write_super_ret()
+        fs.write_super_ret(&mut fs.sb_lock())
             .map_err(|e| anyhow::anyhow!("error writing superblock: {e}"))?;
     }
 
@@ -254,9 +264,9 @@ fn set_option_offline(
 }
 
 fn name_to_dev_idx(fs: &Fs, name: &str) -> Option<usize> {
-    (0..fs.nr_devices())
-        .find(|&i| fs.dev_get(i).is_some_and(|ca| ca.name().to_bytes() == name.as_bytes()))
-        .map(|i| i as usize)
+    fs.devs_rcu(&rcu::read_lock())
+        .find(|ca| ca.name().to_bytes() == name.as_bytes())
+        .map(|ca| ca.dev_idx as usize)
 }
 
 pub const CMD: super::CmdDef = raw_cmd!("set-fs-option", "Set filesystem options", cmd_set_option);

@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! linux/hash.h's hash_64(), for Rust: the golden ratio multiply, its top
+//! bits the hash - and Fold, a core::hash::Hasher that folds a key's words
+//! into the one word it multiplies, so any Hash key has a hash_64(); and
+//! GoldenRatio, the same as a keyed BuildHasher, for a table to hash with.
+//!
+//! Cheap - a multiply a word - and well spread for keys counting up, but
+//! keyed only by xors: for tables whose keys an attacker doesn't choose.
+
+use core::hash::{BuildHasher, Hash, Hasher};
+
+/// linux/hash.h's: 2^64 over the golden ratio, made odd.
+const GOLDEN_RATIO_64: u64 = 0x61C8_8646_80B5_83EB;
+
+/// The top @bits of @v times the golden ratio. Zero @bits: all of it.
+pub fn hash_64(v: u64, bits: u32) -> u64 {
+    v.wrapping_mul(GOLDEN_RATIO_64).wrapping_shr(64 - bits)
+}
+
+/// A key's words folded into one, by hash_64()'s multiply: a u64 key's is
+/// itself.
+#[derive(Default)]
+pub struct Fold(u64);
+
+impl Fold {
+    /// @key, folded: what hash_64() takes.
+    pub fn of<K: ?Sized + Hash>(key: &K) -> u64 {
+        let mut f = Fold::default();
+        key.hash(&mut f);
+        f.finish()
+    }
+}
+
+impl Hasher for Fold {
+    fn write(&mut self, bytes: &[u8]) {
+        for w in bytes.chunks(8) {
+            let mut b = [0; 8];
+            b[..w.len()].copy_from_slice(w);
+            self.write_u64(u64::from_le_bytes(b));
+        }
+    }
+
+    fn write_u64(&mut self, w: u64) {
+        self.0 = self.0.wrapping_mul(GOLDEN_RATIO_64) ^ w;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// hash_64() as a keyed BuildHasher: a key's words folded from the first key
+/// word, the second xored in, times the golden ratio - the top bits the best.
+#[derive(Clone, Copy)]
+pub struct GoldenRatio([u64; 2]);
+
+impl From<[u64; 2]> for GoldenRatio {
+    fn from(k: [u64; 2]) -> Self {
+        Self(k)
+    }
+}
+
+impl BuildHasher for GoldenRatio {
+    type Hasher = GoldenRatioHasher;
+
+    fn build_hasher(&self) -> GoldenRatioHasher {
+        GoldenRatioHasher(Fold(self.0[0]), self.0[1])
+    }
+}
+
+pub struct GoldenRatioHasher(Fold, u64);
+
+impl Hasher for GoldenRatioHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes)
+    }
+
+    fn write_u64(&mut self, w: u64) {
+        self.0.write_u64(w)
+    }
+
+    fn finish(&self) -> u64 {
+        (self.0.finish() ^ self.1).wrapping_mul(GOLDEN_RATIO_64)
+    }
+}

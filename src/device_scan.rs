@@ -13,7 +13,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{CStr, CString, c_char, OsString, OsStr},
+    ffi::{OsString, OsStr},
     fs,
     os::fd::{AsRawFd, BorrowedFd},
     os::unix::ffi::OsStringExt,
@@ -25,11 +25,11 @@ use std::{
 use anyhow::{bail, Result};
 use crate::wrappers::sysfs::DevInfo;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
-use bch_bindgen::fs::FsExt;
-use bcachefs_kernel::{c, opt_defined, opt_get, opt_set};
+use crate::wrappers::fs::FsExt;
+use bcachefs_kernel::c;
 use bcachefs_kernel::errcode::BchError;
-use bcachefs_kernel::fs::Fs;
-use bcachefs_kernel::util::darray::DarrayVec;
+use bcachefs_kernel::fs::{filter_dead, Fs, OpenFs};
+use bcachefs_kernel::util::alloc::KVVec;
 use c::bch_sb_handle;
 use c::bch_opts;
 use uuid::Uuid;
@@ -40,11 +40,11 @@ use crate::device_multipath::{
 };
 
 pub fn read_super_silent(path: impl AsRef<Path>, mut opts: bch_opts) -> Result<bch_sb_handle, BchError> {
-    opt_set!(opts, noexcl, 1);
-    opt_set!(opts, nochanges, 1);
-    opt_set!(opts, no_version_check, 1);
+    opts.set_noexcl(true);
+    opts.set_nochanges(true);
+    opts.set_no_version_check(true);
 
-    bch_bindgen::sb::io::read_super_silent(path.as_ref(), opts)
+    bcachefs_kernel::sb::io::read_super_silent(&bcachefs_kernel::path_to_cstr(path), &mut opts)
 }
 
 pub fn should_skip_multipath_component(dev: &udev::Device) -> bool {
@@ -222,54 +222,38 @@ fn read_sbs_matching_label(
 }
 
 fn sb_handle_path(sb: &bch_sb_handle) -> PathBuf {
-	if sb.sb_name.is_null() {
-		PathBuf::new()
-	} else {
-		unsafe {
-			PathBuf::from(OsString::from_vec(
-				CStr::from_ptr(sb.sb_name).to_bytes().to_vec()))
-		}
-	}
+	PathBuf::from(OsString::from_vec(sb.dev.name().to_bytes().to_vec()))
 }
 
 pub fn filter_current_sbs(
 	sbs: Vec<(PathBuf, bch_sb_handle)>,
 	opts: &bch_opts,
 ) -> Result<Vec<(PathBuf, bch_sb_handle)>, BchError> {
-	let mut opts = *opts;
-
-	// Ahead of bch2_sbs_filter_dead(), which frees the superblock of every
+	// Ahead of filter_dead(), which frees the superblock of every
 	// device it drops - and drops one that diverged the same way it drops one
 	// that was properly removed, leaving nothing to tell them apart afterwards.
 	// The short device count then reads as "a disk is missing", so mount asks
 	// whether to go degraded, and yes silently picks one of two histories.
-	if opt_get!(opts, no_splitbrain_check) == 0 {
-		let divergent = crate::splitbrain::find(&sbs, &opts);
+	if !opts.no_splitbrain_check_or_default() {
+		let divergent = crate::splitbrain::find(&sbs, opts);
 		if !divergent.is_empty() {
 			// One warning, not one per line: the report is a single
 			// account with blank lines in it for readability, and a
 			// warn! per line stamps file:line on every one of them -
 			// including the blanks.
 			warn!("{}", crate::splitbrain::report(&sbs, &divergent).trim_end());
-			return Err(BchError::from_errcode(c::bch_errcode::BCH_ERR_device_splitbrain));
+			return Err(c::Errcode::device_splitbrain.into());
 		}
 	}
 
-	let handles = sbs.into_iter()
-		.map(|(_, sb)| sb)
-		.collect::<Vec<_>>();
-	let mut handles = DarrayVec::<c::bch_sb_handles, bch_sb_handle>::from_vec(handles);
-
-	let ret = unsafe {
-		c::bch2_sbs_filter_dead(handles.as_mut(), &mut opts, std::ptr::null_mut())
-	};
-	if ret != 0 {
-		return Err(BchError::from_raw(-ret));
+	let mut handles = KVVec::with_capacity(sbs.len())?;
+	for (_, sb) in sbs {
+		handles.push(sb)?;
 	}
+	filter_dead(&mut handles, opts, None)?;
 
-	let handles = handles.into_vec();
 	let mut filtered = Vec::with_capacity(handles.len());
-	for sb in handles {
+	for sb in handles.drain_all() {
 		let path = sb_handle_path(&sb);
 		let path = preferred_multipath_devnode(&path).unwrap_or(path);
 		filtered.push((path, sb));
@@ -353,9 +337,7 @@ pub fn present_devices(sbs: &[(PathBuf, bch_sb_handle)]) -> HashSet<u8> {
 /// a member the superblock names and we didn't turn up is missing, whichever
 /// way it went missing.
 ///
-/// Durability is one-biased on disk, zero meaning one, as bch2_mi_to_cpu()
-/// reads it. Taking the raw field would report every default device as
-/// contributing no durability at all.
+/// Durability as to_cpu() decodes it: one-biased on disk, zero meaning one.
 pub fn devices_from_superblocks(sbs: &[(PathBuf, bch_sb_handle)]) -> Vec<DevInfo> {
     let Some((_, first)) = sbs.first() else { return Vec::new() };
     let Some(members) = bcachefs_kernel::sb::members::members_v2(first.sb()) else {
@@ -369,11 +351,10 @@ pub fn devices_from_superblocks(sbs: &[(PathBuf, bch_sb_handle)]) -> Vec<DevInfo
     (0..members.nr_devices())
         .filter_map(|idx| {
             let m = members.get(idx)?;
-            if !crate::wrappers::sb_display::member_alive(&m) {
+            if !m.alive() {
                 return None;
             }
 
-            let raw = m.durability();
 
             Some(DevInfo {
                 idx,
@@ -382,7 +363,7 @@ pub fn devices_from_superblocks(sbs: &[(PathBuf, bch_sb_handle)]) -> Vec<DevInfo
                     .unwrap_or_else(|| format!("dev-{idx}")),
                 label:          None,
                 failure_domain: None,
-                durability:     if raw != 0 { raw as u32 - 1 } else { 1 },
+                durability:     m.to_cpu().durability.into(),
                 online:         have.contains(&(idx as u8)),
             })
         })
@@ -398,14 +379,14 @@ fn have_every_device(sbs: &[(PathBuf, bch_sb_handle)]) -> bool {
 
 /// How long to keep waiting.
 ///
-/// -o missing_dev_timeout wins: the option is OPT_MOUNT, so someone who passes
+/// -o missing_dev_timeout wins: the option is a mount option, so someone who passes
 /// it means this mount, not this filesystem. Otherwise the filesystem's own
 /// value, if we've found enough of one to read it. Zero on disk means "unset",
 /// since every filesystem written before the option existed reads back zero, so
 /// it falls through to the same built-in as having found nothing at all.
 fn missing_dev_timeout(sbs: &[(PathBuf, bch_sb_handle)], cli_opts: &bch_opts) -> Duration {
-    if opt_defined!(cli_opts, missing_dev_timeout) != 0 {
-        return Duration::from_secs(opt_get!(cli_opts, missing_dev_timeout) as u64);
+    if cli_opts.defined(c::OptId::missing_dev_timeout) {
+        return Duration::from_secs(cli_opts.missing_dev_timeout() as u64);
     }
 
     let Some((_, sb)) = sbs.first() else {
@@ -413,11 +394,9 @@ fn missing_dev_timeout(sbs: &[(PathBuf, bch_sb_handle)], cli_opts: &bch_opts) ->
     };
 
     let mut sb_opts: bch_opts = Default::default();
-    if unsafe { c::bch2_opts_from_sb(&mut sb_opts, sb.sb) } != 0 {
-        return DEFAULT_MISSING_DEV_TIMEOUT;
-    }
+    bcachefs_kernel::opts::opts_from_sb(&mut sb_opts, sb.sb().as_unvalidated());
 
-    match opt_get!(sb_opts, missing_dev_timeout) {
+    match sb_opts.missing_dev_timeout_or_default() {
         0 => DEFAULT_MISSING_DEV_TIMEOUT,
         secs => Duration::from_secs(secs as u64),
     }
@@ -659,7 +638,7 @@ where
 fn scan_sbs_maybe_waiting(device: &String, opts: &bch_opts, wait: bool)
     -> Result<Vec<(PathBuf, bch_sb_handle)>>
 {
-    let udev = opt_get!(opts, mount_trusts_udev) != 0;
+    let udev = opts.mount_trusts_udev_or_default();
 
     if let Some(uuid) = parse_uuid_equals(device)? {
         return search(opts, wait, || get_devices_by_uuid(uuid, opts, udev));
@@ -671,9 +650,9 @@ fn scan_sbs_maybe_waiting(device: &String, opts: &bch_opts, wait: bool)
 
     if device.contains(':') {
         let mut opts = *opts;
-        opt_set!(opts, noexcl, 1);
-        opt_set!(opts, nochanges, 1);
-        opt_set!(opts, no_version_check, 1);
+        opts.set_noexcl(true);
+        opts.set_nochanges(true);
+        opts.set_no_version_check(true);
 
         // If the device string contains ":" we will assume the user knows the
         // entire list. If they supply a single device it could be either the FS
@@ -688,8 +667,10 @@ fn scan_sbs_maybe_waiting(device: &String, opts: &bch_opts, wait: bool)
                     warn_multipath_component(path.as_path(), &mpath_dev);
                 }
 
-                bch_bindgen::sb::io::read_super_opts(path.as_ref(), opts)
+                let mut opts = opts;
+                bcachefs_kernel::sb::io::read_super(&bcachefs_kernel::path_to_cstr(&path), &mut opts, None)
                     .map(|sb| (path, sb))
+                    .map_err(|e| anyhow::anyhow!(e))
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -704,17 +685,11 @@ pub fn joined_device_str(sbs: &[(PathBuf, bch_sb_handle)]) -> OsString {
         .join(OsStr::new(":"))
 }
 
-pub fn scan_devices(device: &String, opts: &bch_opts) -> Result<OsString> {
-    let sbs = scan_sbs(device, opts)?;
-
-    Ok(joined_device_str(&sbs))
-}
-
 /// A filesystem opened either online (mounted: talk to the kernel via
 /// ioctl/sysfs) or offline (opened in userspace via libbcachefs):
 pub enum OpenedFs {
     Online(crate::wrappers::handle::BcachefsHandle),
-    Offline(Fs),
+    Offline(OpenFs),
 }
 
 /// The standard "operate on a filesystem that may or may not be mounted"
@@ -739,7 +714,7 @@ pub fn open_online_or_offline(devs: &[PathBuf], offline_opts: bch_opts)
 
 /// One device names a filesystem, so find its members the way mount does.
 /// Several were named deliberately, and pass through as-is.
-pub fn open_scan(devs: &[PathBuf], fs_opts: bch_opts) -> Result<Fs, BchError> {
+pub fn open_scan(devs: &[PathBuf], fs_opts: bch_opts) -> Result<OpenFs, BchError> {
     let devs = if devs.len() == 1 {
         let mut dev_str = devs[0].to_string_lossy().into_owned();
 
@@ -760,22 +735,6 @@ pub fn open_scan(devs: &[PathBuf], fs_opts: bch_opts) -> Result<Fs, BchError> {
     };
 
     Fs::open(&devs, fs_opts)
-}
-
-#[allow(dead_code)]
-pub fn bch2_scan_devices(device: *const c_char) -> *mut c_char {
-    let device = unsafe { CStr::from_ptr(device) };
-    let device = device.to_string_lossy().into_owned();
-
-    // how to initialize to default/empty?
-    let opts = bcachefs_kernel::opts::parse_mount_opts(None, None, true).unwrap_or_default();
-
-    let devs = scan_devices(&device, &opts).unwrap_or_else(|e| {
-        eprintln!("bcachefs ({}): error reading superblock: {}", device, e);
-        std::process::exit(-1);
-    });
-
-    CString::new(devs.into_vec()).unwrap().into_raw()
 }
 
 /// A udev monitor, and the question "have the missing members turned up?"
@@ -817,17 +776,14 @@ impl DeviceWatch {
 	}
 }
 
-impl crate::prompt::Watch for DeviceWatch {
+impl bcachefs_kernel::util::prompt::Watch for DeviceWatch {
 	fn raw_fd(&self) -> std::os::fd::RawFd {
 		self.socket.as_raw_fd()
 	}
 
 	/// A device arriving never *answers* "mount without it?" - it withdraws the
 	/// question.
-	fn stirred(&mut self) -> crate::prompt::Stirred {
-		match self.every_member_present() {
-			true  => crate::prompt::Stirred::Moot,
-			false => crate::prompt::Stirred::Nothing,
-		}
+	fn settled(&mut self) -> bool {
+		self.every_member_present()
 	}
 }
