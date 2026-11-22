@@ -1,4 +1,6 @@
 use std::io::{self, IsTerminal, Read, Write};
+use bcachefs_kernel::format::DataType;
+use bcachefs_kernel::util::vstructs::read_past;
 use std::os::unix::io::FromRawFd;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,11 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use bch_bindgen::c::{
-    bch_ioctl_data, bch_ioctl_data_event_ret, bch_ioctl_data_progress,
-    bch_ioctl_data__bindgen_ty_1__bindgen_ty_1 as ScrubArgs,
+use bcachefs_kernel::c::{
+    bch_ioctl_data, bch_ioctl_data_args, IoctlDataEventRet, bch_ioctl_data_progress,
+    bch_ioctl_data_scrub,
 };
-use bch_bindgen::accounting::data_type;
 use clap::Parser;
 
 use crate::commands::DeviceNameArgs;
@@ -21,7 +22,7 @@ use crate::wrappers::sysfs::{fs_get_devices, sysfs_path_from_fd};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn sigint_handler(_: libc::c_int) {
+extern "C" fn sigint_handler(_: core::ffi::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
@@ -39,29 +40,18 @@ fn read_data_event(fd: &mut std::fs::File) -> io::Result<(u8, u8, bch_ioctl_data
     }
     let event_type = buf[0];
     let event_ret = buf[1];
-    let p = unsafe {
-        std::ptr::read_unaligned(buf.as_ptr().add(8) as *const bch_ioctl_data_progress)
-    };
+    let p = read_past::<bch_ioctl_data_progress>(&buf, 8);
     Ok((event_type, event_ret, p))
 }
 
 fn start_scrub(ioctl_fd: std::os::fd::BorrowedFd, dev_idx: u32, data_types: u32) -> Result<std::fs::File> {
-    let mut cmd = bch_ioctl_data {
-        op: bch_bindgen::c::bch_data_ops::BCH_DATA_OP_scrub as u16,
-        ..Default::default()
+    let cmd = bch_ioctl_data {
+        op: bcachefs_kernel::c::DataOp::scrub.0 as u16,
+        args: bch_ioctl_data_args {
+            scrub: bch_ioctl_data_scrub { dev: dev_idx, data_types },
+        },
+        ..pin_init::zeroed()
     };
-    // bch_ioctl_data's op-params union is emitted as either a native Rust union or
-    // the __BindgenUnionField wrapper, depending on the host libclang's Copy analysis
-    // of its blocklisted __u32 members — non-deterministic across build hosts, and
-    // the wrapper's helper type isn't nameable here. Both forms share one C layout,
-    // so write the scrub params positionally; the asserts pin the layout we rely on.
-    const _: () = assert!(std::mem::offset_of!(ScrubArgs, dev) == 0);
-    const _: () = assert!(std::mem::offset_of!(ScrubArgs, data_types) == 4);
-    unsafe {
-        let p = std::ptr::addr_of_mut!(cmd.__bindgen_anon_1) as *mut u32;
-        p.write(dev_idx);
-        p.add(1).write(data_types);
-    }
 
     let ret = ioctl_w::<BCH_IOCTL_DATA>(ioctl_fd, &cmd)?;
     Ok(unsafe { std::fs::File::from_raw_fd(ret) })
@@ -79,15 +69,11 @@ struct ScrubDev {
 
 impl ScrubDev {
     fn format_line(&self, rate: u64) -> String {
-        let pct = if self.total > 0 {
-            format!("{}%", self.done * 100 / self.total)
-        } else {
-            "0%".to_string()
-        };
+        let pct = format!("{}%", (self.done * 100).checked_div(self.total).unwrap_or(0));
 
         let status = if self.progress_fd.is_some() {
             format!("{}/sec", fmt_bytes_human(rate))
-        } else if self.ret_status == bch_ioctl_data_event_ret::BCH_IOCTL_DATA_EVENT_RET_device_offline as u8 {
+        } else if self.ret_status == IoctlDataEventRet::BCH_IOCTL_DATA_EVENT_RET_device_offline.0 as u8 {
             "offline".to_string()
         } else {
             "complete".to_string()
@@ -122,11 +108,11 @@ fn scrub(cli: Cli) -> Result<()> {
 
     unsafe {
         libc::signal(libc::SIGINT,
-                     sigint_handler as extern "C" fn(libc::c_int) as libc::sighandler_t);
+                     sigint_handler as extern "C" fn(core::ffi::c_int) as libc::sighandler_t);
     }
 
     let data_types: u32 = if cli.metadata {
-        1 << u32::from(data_type::btree)
+        1 << u32::from(DataType::btree)
     } else {
         !0u32
     };

@@ -1,9 +1,7 @@
 use std::path::PathBuf;
-use bch_bindgen::c;
-use bcachefs_kernel::opt_set;
+use bcachefs_kernel::c;
 use anyhow::bail;
 use clap::Parser;
-use crate::wrappers::bch_err_str;
 
 #[derive(Parser, Debug)]
 #[command(about = "Strip alloc info for read-only use")]
@@ -18,16 +16,15 @@ fn cmd_strip_alloc(cli: Cli) -> anyhow::Result<()> {
 
     loop {
         let mut opts: c::bch_opts = Default::default();
-        opt_set!(opts, nostart, 1);
+        opts.set_nostart(true);
 
         let fs = crate::device_scan::open_scan(&devs, opts)
             .map_err(|e| anyhow::anyhow!("Error opening filesystem: {}", e))?;
 
-        if unsafe { (*fs.raw).sb.clean } == 0 {
+        if fs.sb.clean.get() == 0 {
             println!("Filesystem not clean, running recovery");
-            let ret = unsafe { c::bch2_fs_start(fs.raw) };
-            if ret != 0 {
-                bail!("Error starting filesystem: {}", bch_err_str(ret));
+            if let Err(e) = fs.start() {
+                bail!("Error starting filesystem: {}", e.msg());
             }
             drop(fs);
             continue;
@@ -37,7 +34,7 @@ fn cmd_strip_alloc(cli: Cli) -> anyhow::Result<()> {
         let mut capacity: u64 = 0;
         for dev in 0..fs.nr_devices() {
             if let Some(ca) = fs.dev_get(dev) {
-                capacity += (ca.mi.nbuckets * ca.mi.bucket_size as u64) << 9;
+                capacity += (ca.mi.get().nbuckets * ca.mi.get().bucket_size as u64) << 9;
             }
         }
         if capacity > 1u64 << 40 {
@@ -45,7 +42,9 @@ fn cmd_strip_alloc(cli: Cli) -> anyhow::Result<()> {
         }
 
         println!("Stripping alloc info from {}", devs[0].display());
-        unsafe { c::rust_strip_alloc_do(fs.raw) };
+        let mut sb = fs.sb_lock();
+        bcachefs_kernel::sb::clean::strip_alloc(&fs, &mut sb);
+        fs.write_super(&mut sb);
         return Ok(());
     }
 }

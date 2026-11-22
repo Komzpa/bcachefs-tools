@@ -27,6 +27,12 @@
       url = "github:nix-community/nix-github-actions";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Rust MIR, as Charon's LLBC: what a function's locals and temporaries
+    # are, and what's moved by value - for looking at stack frames, and the
+    # front end of Aeneas. Not following our nixpkgs: it pins the nightly
+    # rustc it's built against.
+    charon.url = "github:AeneasVerif/charon";
   };
 
   outputs =
@@ -39,6 +45,7 @@
       rust-overlay,
       flake-compat,
       nix-github-actions,
+      charon,
     }:
     let
       # i686-linux dropped: no real consumers, and cross sqlite tcltest
@@ -189,7 +196,7 @@
               cargo-test
               ;
 
-            # cargo clippy with the current minimum supported rust version
+            # cargo test with the current minimum supported rust version
             # according to Cargo.toml
             msrv =
               let
@@ -201,6 +208,20 @@
                   pname = "${prev.pname}-msrv";
                 }
               );
+
+            # The module with that rustc: against a kernel built with
+            # nixpkgs', so from the vendored stack - as on a distro whose
+            # kernel's rustc isn't the one installed.
+            bcachefs-module-msrv =
+              let
+                rust = pkgs.rust-bin.stable.${cargoToml.package.rust-version}.minimal.override {
+                  extensions = [ "rust-src" ];
+                };
+              in
+              pkgs.linuxPackages_latest.callPackage self'.packages.bcachefs-tools.kernelModule {
+                moduleRustc = rust;
+                moduleRustLibSrc = "${rust}/lib/rustlib/src/rust/library";
+              };
 
             # The test derivation hardcodes "kvm" into requiredSystemFeatures
             # for any Linux test, which GitHub's hosted aarch64 runners don't
@@ -230,6 +251,7 @@
               cargo-audit
               cargo-outdated
               clang-tools
+              charon.packages.${system}.default
               (rust-bin.stable.latest.minimal.override {
                 extensions = [
                   "rust-analyzer"

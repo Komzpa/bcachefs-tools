@@ -1,0 +1,835 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! A value's place: the field of a parent it lives at - and container_of()
+//! from it, safe because the type system knows the value is there.
+//!
+//! container_of() needs two things true: the value is a P's field - its
+//! location - and the P is valid while it's used. This is the first: a type
+//! that's Contained is, every value of it, its parent's field N, so its
+//! container() is a safe call. The parent's validity is the parent's own:
+//! a &child borrowed from it is had only while it is.
+//!
+//! #[placed(Fs.snapshots)] on the type is all that's written, on it or its
+//! parent - cstruct-macros' place.rs is what it makes:
+//!
+//! - Field<N> is a struct's field N, a hash of its name - name("snapshots")
+//!   - with its type and offset: a field as a type, which the language doesn't
+//!   have yet. It's field representing types' Field (field_of!(), nightly),
+//!   faked as util/projections.rs's fakes are, to go when they arrive.
+//!   #[derive(Init)] makes one for each field of the structs it's on.
+//!
+//! - At<B, N> is the proof: a field the placed type holds, zero bytes, that
+//!   only at() makes. Nothing else can - its fields are private, and it's
+//!   not Clone, Default or Zeroable - so neither a literal nor a zeroed value
+//!   nor a pin_init!() of the type can be had anywhere: a value of it is one
+//!   at() made.
+//!
+//! - at() makes it, called only by InitAt<N>'s init(): B's initializer for
+//!   field N, which #[placed] implements on B and B's #[derive(Init)] picks
+//!   for that field - Pick. So the At a field's value is given is its own
+//!   field's: an At is made only in the line that puts it in place. (A
+//!   PinInit can be run anywhere: that's why it can't be a value anyone
+//!   holds, and InitAt::init() is unsafe.)
+//!
+//! - AtIndex<B, N, I> is an array element's: #[placed(B.field[], index =
+//!   name: I)] - its index, which C sees as the field it replaces, as C named
+//!   it, and at_index() writes for each element as the array's InitAt makes
+//!   them. Its container() is the array's offset, plus that many elements.
+//!   The field's an Array: an array, or a type wrapping one - a FixedFifo -
+//!   whose elements stay where they're made.
+//!
+//! - Contained is the child's side - its Parent, and its At, which ties the two
+//!   - and container() the field's address back to its parent's.
+//!
+//! What keeps a placed value at its place is that no value of it can be had
+//! anywhere else - not Pin. A swap of two, through &muts, is harmless: each
+//! is still some parent's field N, and nothing else can be swapped in -
+//! but not two array elements, each holding its index; and that takes a
+//! &mut to the array, the parent's discipline again. The way out is the
+//! parent's: had by value, it can be taken apart - let P {
+//! child, .. } = p - leaving the child nowhere. Fs never is: it lives in its
+//! pinned allocation, a &Fs to everyone. At is !Unpin all the same, for what
+//! needs its address to stay put - C's &c->snapshots.
+//!
+//! container() widens a reference to the child to one to its parent. Under
+//! Tree Borrows that's allowed, the parent's bytes outside the child getting
+//! the permission the child's type implies: read-only, from a type with no
+//! interior mutability - writing an atomic of the parent's through the &P
+//! would be UB - and as a shared reference's, from one with some. So At
+//! holds an atomic - an array of none - and every placed type has interior
+//! mutability.
+//!
+//! Known gaps, to come back to:
+//!
+//! - The parent's own discipline. A &mut P lets a &p.child and writes to p's
+//!   other fields coexist - split borrows, the paths disjoint - and the &P
+//!   container() makes of the child would see those fields change under it:
+//!   UB. The borrow checker could see that a &child's container() borrows
+//!   all of P, and doesn't know to. And a P had by value can be taken apart,
+//!   as above. So container() is sound only for a parent never had by &mut
+//!   or by value: Fs. Unchecked.
+//!
+//! - Drop. Fields drop in order, so a placed type's own drop would find its
+//!   parent's earlier fields dropped, its container() a &P to them. So it
+//!   has none: #[placed] refuses #[pin_data(PinnedDrop)], pin_data()'s
+//!   check refuses a Drop, and a struct without #[pin_data] gets an empty
+//!   Drop for one to conflict with. A placed type that needs teardown has
+//!   PlacedDrop: unsafe, its caller - the parent's teardown - saying the
+//!   parent's whole. Nothing makes that call: what has to have been torn
+//!   down checks it was, in a Drop of its own - a Shrinker's.
+//!
+//! An element of a container - #[placed(Base.field[..])] - has a place too,
+//! but no address in it: it's in the Container at Base's field, wherever
+//! the container keeps it. There's no container() for one; what its place
+//! is for is the guarantee that it never outlives its Base. A Container is
+//! made only at its field - its InitAt, by container() - and its insert()
+//! is the only thing that makes an AtIn, so a T is had only from the
+//! container's insert(); Holds, the container proper's promise, keeps it
+//! there - made in place, dropped in place, never had by value - until the
+//! container drops it, with itself. An element may have a Drop of its own:
+//! its container's whole while it runs.
+//!
+//! An AtIn is given to the element's initializer, and only to that: what
+//! insert() takes is a PlacedInit - sealed, its one implementation made by
+//! placed_init!(), which is written as pin_init!() is and puts the AtIn in
+//! _placed_at, under a name its fields can't name. So the code that wrote
+//! an initializer never has the AtIn - to keep, and make a T somewhere else
+//! with.
+//!
+//! A type lives at one place. One that lives at several, as a kobject or a
+//! work_struct does, is given one by a type parameter: ReffedWork<F, R> is
+//! the work_struct of work function F, whose WorkFunc - from the parent's
+//! #[derive(Init)], for the one field of that type - gives it its At, Contained
+//! as any field's type is (os/*/workqueue.rs).
+
+use crate::errcode::BchError;
+use crate::util::alloc::{kbox_pin_init, AllocError, KBox, KVVec};
+use crate::util::rcu::FreeAnytime;
+use core::marker::{PhantomData, PhantomPinned};
+use core::mem::size_of;
+use core::pin::Pin;
+use core::sync::atomic::AtomicU8;
+use pin_init::{pin_data, pin_init, Init, PinInit, Zeroable};
+
+/// A field's name, as Field<N>'s N: its FNV-1a hash.
+pub const fn name(s: &str) -> u64 {
+    let b = s.as_bytes();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < b.len() {
+        h ^= b[i] as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    h
+}
+
+
+/// Self's field N, named N: its type, Type, and where it is, OFFSET.
+pub(crate) trait Field<const N: u64> {
+    type Type;
+    const OFFSET: usize;
+}
+
+/// Proof that what holds it was made at B's field N - by at(), which alone
+/// makes one. Zero bytes, as C's char[0] for it: FFI-safe, as CacheAligned
+/// is, for the C structs that hold one. The atomics, none of them, are so
+/// container() widens to a usable &P - see the file comment.
+#[repr(C)]
+pub struct At<B, const N: u64> {
+    _c:   [AtomicU8; 0],
+    _b:   PhantomData<fn() -> B>,
+    /// !Unpin - a PhantomData of it, which improper_ctypes skips, as it
+    /// doesn't a PhantomPinned field
+    _pin: PhantomData<PhantomPinned>,
+}
+
+mod sealed {
+    pub(crate) trait Sealed {}
+}
+
+/// What an At says: B's field N - the type there, and where in B the value
+/// holding the At is.
+pub(crate) trait Place: sealed::Sealed {
+    type Base;
+    type Type;
+    fn offset(&self) -> usize;
+}
+
+impl<B, const N: u64> sealed::Sealed for At<B, N> {}
+
+impl<B: Field<N>, const N: u64> Place for At<B, N> {
+    type Base = B;
+    type Type = B::Type;
+    fn offset(&self) -> usize {
+        B::OFFSET
+    }
+}
+
+/// An index, as an array's element holds its own: C's integer for it.
+pub(crate) trait Index: Copy {
+    fn from_usize(i: usize) -> Self;
+    fn to_usize(self) -> usize;
+}
+
+macro_rules! index {
+    ($($t:ty),*) => {$(
+        impl Index for $t {
+            fn from_usize(i: usize) -> Self {
+                Self::try_from(i).expect("an array index past its integer")
+            }
+            fn to_usize(self) -> usize {
+                self as usize
+            }
+        }
+    )*};
+}
+index!(u8, u16, u32, u64, usize);
+
+/// An array, or a type wrapping one: what an element placed at a field is an
+/// element of - its elements in a row from ELEMS_OFFSET, each made in place
+/// by init_each(), element i with what @make gives it for i, and staying
+/// where it's made, never moved out or remade, until Self drops.
+pub(crate) trait Array: Sized {
+    type Elem;
+    const ELEMS_OFFSET: usize;
+
+    fn init_each<I: PinInit<Self::Elem, E>, E>(make: impl FnMut(usize) -> I) -> impl PinInit<Self, E>;
+}
+
+impl<T, const L: usize> Array for [T; L] {
+    type Elem = T;
+    const ELEMS_OFFSET: usize = 0;
+
+    fn init_each<I: PinInit<T, E>, E>(make: impl FnMut(usize) -> I) -> impl PinInit<Self, E> {
+        pin_init::pin_init_array_from_fn(make)
+    }
+}
+
+/// Proof that what holds it was made as element @index of B's array field N
+/// - by at_index(), which alone makes one. The index itself to C: the field
+/// it's in is the element's own index, as C named it.
+#[repr(C)]
+pub(crate) struct AtIndex<B, const N: u64, I> {
+    index: I,
+    _c:    [AtomicU8; 0],
+    _b:    PhantomData<fn() -> B>,
+    _pin:  PhantomData<PhantomPinned>,
+}
+
+impl<B, const N: u64, I: Index> AtIndex<B, N, I> {
+    /// Which element it is, as C's integer for it.
+    pub(crate) fn get(&self) -> I {
+        self.index
+    }
+}
+
+impl<B, const N: u64, I> sealed::Sealed for AtIndex<B, N, I> {}
+
+impl<B: Field<N>, const N: u64, I: Index> Place for AtIndex<B, N, I>
+where
+    B::Type: Array,
+{
+    type Base = B;
+    type Type = <B::Type as Array>::Elem;
+    fn offset(&self) -> usize {
+        B::OFFSET + <B::Type as Array>::ELEMS_OFFSET + self.index.to_usize() * size_of::<Self::Type>()
+    }
+}
+
+/// A type holding one value, an Inner at INNER_OFFSET, for as long as it is -
+/// a Locked's protected data - for a type placed in it:
+/// #[placed(Base.field.*)].
+pub(crate) trait Wrapper {
+    type Inner;
+    const INNER_OFFSET: usize;
+}
+
+/// Proof that what holds it was made as the Inner of B's field N, a Wrapper -
+/// by at_inner(), which alone makes one. Zero bytes, as At.
+#[repr(C)]
+pub(crate) struct AtInner<B, const N: u64> {
+    _c:   [AtomicU8; 0],
+    _b:   PhantomData<fn() -> B>,
+    _pin: PhantomData<PhantomPinned>,
+}
+
+impl<B, const N: u64> sealed::Sealed for AtInner<B, N> {}
+
+impl<B: Field<N>, const N: u64> AtInner<B, N>
+where
+    B::Type: Wrapper,
+{
+    pub(crate) const OFFSET: usize = B::OFFSET + <B::Type as Wrapper>::INNER_OFFSET;
+}
+
+impl<B: Field<N>, const N: u64> Place for AtInner<B, N>
+where
+    B::Type: Wrapper,
+{
+    type Base = B;
+    type Type = <B::Type as Wrapper>::Inner;
+    fn offset(&self) -> usize {
+        Self::OFFSET
+    }
+}
+
+/// What a value placed in Self has for its parent: Self - or, Self placed in
+/// a Wrapper, the struct holding that, as a Locked's data is had only with
+/// its lock held, and what's placed in it is had without. #[derive(Init)]
+/// implements it, on every struct, as its At says.
+pub(crate) trait Enclosing {
+    type Visible;
+
+    /// Where Self is in its Visible.
+    #[doc(hidden)]
+    const VISIBLE_OFFSET: usize;
+}
+
+/// The At for B's field N, given to @init - the field's type's initializer -
+/// for the initializer it returns. Only #[placed]'s InitAt calls it.
+///
+/// # Safety
+/// What it returns is run into B's field N, of a B being initialized.
+#[doc(hidden)]
+pub(crate) unsafe fn at<B: Field<N>, const N: u64, I, E>(init: impl FnOnce(At<B, N>) -> I) -> I
+where
+    I: PinInit<B::Type, E>,
+{
+    init(At { _c: [], _b: PhantomData, _pin: PhantomData })
+}
+
+/// The AtIndex for element @i of B's array field N, given to @init - the
+/// element type's initializer - for the initializer it returns. Only
+/// #[placed]'s InitAt calls it, for each element.
+///
+/// # Safety
+/// What it returns is run into element @i of B's field N, of a B being
+/// initialized.
+#[doc(hidden)]
+pub(crate) unsafe fn at_index<B: Field<N>, const N: u64, X: Index, I, E>(
+    i:    usize,
+    init: impl FnOnce(AtIndex<B, N, X>) -> I,
+) -> I
+where
+    B::Type: Array,
+    I: PinInit<<B::Type as Array>::Elem, E>,
+{
+    init(AtIndex { index: X::from_usize(i), _c: [], _b: PhantomData, _pin: PhantomData })
+}
+
+/// The AtInner for the Inner of B's field N, given to @init - the field's
+/// initializer, which gives it to the Inner's - for the initializer it
+/// returns. Only B's #[derive(Init)] calls it, for a field with
+/// #[init_locked], and writes @init.
+///
+/// # Safety
+/// What it returns is run into B's field N, of a B being initialized, and
+/// gives the AtInner to the Inner's initializer, run into the Inner.
+#[doc(hidden)]
+pub(crate) unsafe fn at_inner<B: Field<N>, const N: u64, I, E>(init: impl FnOnce(AtInner<B, N>) -> I) -> I
+where
+    B::Type: Wrapper,
+    I: PinInit<B::Type, E>,
+{
+    init(AtInner { _c: [], _b: PhantomData, _pin: PhantomData })
+}
+
+/// B's field N's initializer, where a placed type lives there: #[placed]
+/// on the type implements it, its At from at(), for B's #[derive(Init)] to
+/// pick for the field. @A is the placed type's #[init_args], a tuple, which
+/// the field's #[placed_args] gives - or none, and #[derive(Init)] picks it.
+/// init() gives its field an At.
+#[doc(hidden)]
+pub(crate) trait InitAt<const N: u64, A = ()>: Field<N> {
+    /// # Safety
+    /// What it returns is run into Self's field N, of a Self being
+    /// initialized.
+    unsafe fn init(args: A) -> impl PinInit<Self::Type, BchError>;
+}
+
+/// #[derive(Init)]'s initializer for B's field N, without #[init]: its
+/// InitAt, if a placed type lives there, else zeroed - picked by which
+/// trait's pick() method resolution finds first, PickPlaced's on a Pick,
+/// before PickZeroed's on a &Pick. A wrong pick doesn't compile: a placed
+/// type isn't Zeroable, and its init() takes only its own field's At. A
+/// placed field must be #[pin]: its initializer's only a PinInit.
+#[doc(hidden)]
+pub(crate) struct Pick<B, const N: u64>(PhantomData<fn() -> B>);
+
+impl<B, const N: u64> Pick<B, N> {
+    /// A const, so &NEW is promoted to 'static: what pick() returns borrows
+    /// the Pick, and a temporary one would be dropped at the end of the
+    /// initializer's block, as edition 2024 scopes it.
+    pub(crate) const NEW: Self = Pick(PhantomData);
+}
+
+#[doc(hidden)]
+pub(crate) trait PickPlaced<T> {
+    /// # Safety
+    /// As InitAt::init()'s.
+    unsafe fn pick(&self) -> impl PinInit<T, BchError>;
+}
+
+impl<B: InitAt<N>, const N: u64> PickPlaced<B::Type> for Pick<B, N> {
+    unsafe fn pick(&self) -> impl PinInit<B::Type, BchError> {
+        // SAFETY: the caller's
+        unsafe { B::init(()) }
+    }
+}
+
+#[doc(hidden)]
+pub(crate) trait PickZeroed<T> {
+    fn pick(&self) -> impl Init<T>;
+}
+
+impl<B: Field<N>, const N: u64> PickZeroed<B::Type> for &Pick<B, N>
+where
+    B::Type: Zeroable,
+{
+    fn pick(&self) -> impl Init<B::Type> {
+        pin_init::init_zeroed()
+    }
+}
+
+/// Every Self is its parent's field: it holds an At, which at() made where
+/// the At says - a field of type Self::At, so a Self is had only from an
+/// initializer at() was given. #[placed] implements it.
+pub(crate) trait Contained: Sized {
+    /// What it's the field of - or, that placed in a Wrapper, the struct
+    /// holding it: its Base's Enclosing.
+    type Parent;
+    /// Its proof - which ties Parent to where at() made it.
+    #[doc(hidden)]
+    type At: Place<Type = Self, Base: Enclosing<Visible = Self::Parent>>;
+
+    /// Where its At field is in it.
+    #[doc(hidden)]
+    const AT_OFFSET: usize;
+
+    /// The parent this is the field of.
+    fn container(&self) -> &Self::Parent {
+        // SAFETY: a Self, borrowed
+        unsafe { container_of(self) }
+    }
+}
+
+/// A placed type's drop: what it has to undo while its parent's whole - a
+/// registration whose callbacks use container(). Its parent's teardown calls
+/// it, where that teardown has what it uses still there.
+pub(crate) trait PlacedDrop: Contained {
+    /// # Safety
+    /// The parent is whole, and nothing uses this after but its Rust drop.
+    unsafe fn placed_drop(&self);
+}
+
+/// container(), from a pointer: for a placed value had only by one - behind
+/// an Opaque, which C writes through.
+///
+/// # Safety
+/// @p points to a live Self, initialized - had for 'a.
+pub(crate) unsafe fn container_of<'a, T: Contained>(p: *const T) -> &'a T::Parent {
+    // SAFETY: had for 'a, so the parent's live for 'a. Its known gap, the
+    // parent's discipline: see the file comment
+    unsafe { &*container_of_raw(p.cast_mut()) }
+}
+
+/// container_of(), as the pointer it was given: for what frees the parent.
+///
+/// # Safety
+/// @p points to a live Self, initialized.
+pub(crate) unsafe fn container_of_raw<T: Contained>(p: *mut T) -> *mut T::Parent {
+    // SAFETY: Contained's - p is in its At's Base, at its offset(), the At
+    // fixed once made - and Enclosing's
+    unsafe {
+        let at = &*p.byte_add(T::AT_OFFSET).cast::<T::At>();
+        p.byte_sub(at.offset() + <<T::At as Place>::Base as Enclosing>::VISIBLE_OFFSET).cast()
+    }
+}
+
+/// C, at the field A names - at!(Fs.ro_ref) - so container() is the struct
+/// it's in. What C is, it is as itself: a ref on a Placed AtomicRef is a ref
+/// on its container. The parent's #[derive(Init)] makes a field of this type
+/// with at(), around the field's #[init]: so A is the place it's at.
+#[pin_data]
+#[repr(C)]
+pub struct Placed<C, A> {
+    #[pin]
+    value:      C,
+    _placed_at: A,
+}
+
+impl<C, A: Place<Type = Self, Base: Enclosing>> Contained for Placed<C, A> {
+    type Parent = <A::Base as Enclosing>::Visible;
+    type At = A;
+    const AT_OFFSET: usize = core::mem::offset_of!(Self, _placed_at);
+}
+
+impl<C, A> Placed<C, A> {
+    /// Where the C is in a Placed.
+    pub(crate) const VALUE_OFFSET: usize = core::mem::offset_of!(Self, value);
+
+    #[doc(hidden)]
+    pub fn new<E: From<F>, F>(at: A, value: impl PinInit<C, F>) -> impl PinInit<Self, E> {
+        pin_init!(Self { value <- value, _placed_at: at }? E)
+    }
+}
+
+// A placed Locked's data is placed as a Locked's is: C is at its start.
+impl<C: Wrapper, A> Wrapper for Placed<C, A> {
+    type Inner = C::Inner;
+    const INNER_OFFSET: usize = core::mem::offset_of!(Self, value) + C::INNER_OFFSET;
+}
+
+impl<C, A> core::ops::Deref for Placed<C, A> {
+    type Target = C;
+
+    fn deref(&self) -> &C {
+        &self.value
+    }
+}
+
+/// The At of field @f of @B, as a type: at!(Fs.ro_ref), for a Placed.
+#[macro_export]
+macro_rules! at {
+    ($b:ident . $f:ident) => {
+        $crate::util::place::At<$b, { $crate::util::place::name(::core::stringify!($f)) }>
+    };
+}
+
+// ── Paths ────────────────────────────────────────────────────────────────
+
+/// A path from a value, as a type - for a field's type to name what's
+/// reached from the struct it's in: a ReffedWork's ref. Here is the value;
+/// Up<P> the parent of what P reaches, by its container(); FieldOf<P, N>
+/// field N of what P reaches, by Field<N>; ElemOf<P, I> element I of the
+/// array P reaches; Through<P> what the pointer P reaches points to - a
+/// BackRef. field!() writes one: from bch_fs_snapshots, field!(super.writes)
+/// - FieldOf<Up<Here>, N> - is the write refs of its Fs.
+///
+/// A path of every step but Through stays within what the value it starts
+/// from is in: Within.
+pub struct Here;
+
+pub struct Up<P>(PhantomData<P>);
+
+pub struct FieldOf<P, const N: u64>(PhantomData<P>);
+
+pub struct ElemOf<P, const I: usize>(PhantomData<P>);
+
+pub struct Through<P>(PhantomData<P>);
+
+/// The value of the AtomicRef P reaches: no Path - it's live only while a ref
+/// is held - but a GuardPath, for a guard that holds one.
+pub struct RefValue<P>(PhantomData<P>);
+
+/// A path within what the value it starts from is in: no Through - so a ref
+/// on a count it reaches keeps the value.
+pub(crate) trait Within {}
+
+impl Within for Here {}
+impl<P: Within> Within for Up<P> {}
+impl<P: Within, const N: u64> Within for FieldOf<P, N> {}
+impl<P: Within, const I: usize> Within for ElemOf<P, I> {}
+
+/// Each of the path types: one path, where a tuple of them is several. An
+/// impl for one and an impl for a tuple can't overlap through this, as they
+/// could through Path<T>: a downstream crate could implement Path<ItsType>
+/// for a tuple.
+pub(crate) trait OnePath {}
+
+impl OnePath for Here {}
+impl<P> OnePath for Up<P> {}
+impl<P, const N: u64> OnePath for FieldOf<P, N> {}
+impl<P, const I: usize> OnePath for ElemOf<P, I> {}
+impl<P> OnePath for Through<P> {}
+
+/// A path from the struct a field's in, as a type: its fields by name,
+/// elements of an array field by index, what a pointer field points to by ->,
+/// the value of an AtomicRef by *, and super for its parent -
+/// `field!(super.writes)`, `field!(super.super.c)`, `field!(io_ref[WRITE])`,
+/// `field!(fs->writes)`, `field!(journal_keys.*.keys)`.
+#[macro_export]
+macro_rules! field {
+    ($($path:tt)+) => {
+        $crate::__field_path!($crate::util::place::Here; $($path)+)
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __field_path {
+    ($p:ty;) => {
+        $p
+    };
+    ($p:ty; super $(. $($rest:tt)+)?) => {
+        $crate::__field_path!($crate::util::place::Up<$p>; $($($rest)+)?)
+    };
+    ($p:ty; * $(. $($rest:tt)+)?) => {
+        $crate::__field_path!($crate::util::place::RefValue<$p>; $($($rest)+)?)
+    };
+    ($p:ty; $f:ident -> $($rest:tt)+) => {
+        $crate::__field_path!(
+            $crate::util::place::Through<
+                $crate::util::place::FieldOf<$p, { $crate::util::place::name(stringify!($f)) }>>;
+            $($rest)+)
+    };
+    ($p:ty; $f:ident [ $i:expr ] $(. $($rest:tt)+)?) => {
+        $crate::__field_path!(
+            $crate::util::place::ElemOf<
+                $crate::util::place::FieldOf<$p, { $crate::util::place::name(stringify!($f)) }>,
+                { $i }>;
+            $($($rest)+)?)
+    };
+    ($p:ty; $f:ident $(. $($rest:tt)+)?) => {
+        $crate::__field_path!(
+            $crate::util::place::FieldOf<$p, { $crate::util::place::name(stringify!($f)) }>;
+            $($($rest)+)?)
+    };
+}
+
+/// What path Self reaches from a T.
+pub(crate) trait Path<T> {
+    type To;
+    fn get(t: &T) -> &Self::To;
+}
+
+impl<T> Path<T> for Here {
+    type To = T;
+    fn get(t: &T) -> &T {
+        t
+    }
+}
+
+impl<T, P: Path<T>> Path<T> for Up<P>
+where
+    P::To: Contained + 'static,
+{
+    type To = <P::To as Contained>::Parent;
+    fn get(t: &T) -> &Self::To {
+        P::get(t).container()
+    }
+}
+
+impl<T, P: Path<T>, const N: u64> Path<T> for FieldOf<P, N>
+where
+    P::To: Field<N> + 'static,
+{
+    type To = <P::To as Field<N>>::Type;
+    fn get(t: &T) -> &Self::To {
+        let b: *const P::To = P::get(t);
+        // SAFETY: Field<N>'s - its field of that type, at that offset - in
+        // a B borrowed for as long
+        unsafe { &*b.byte_add(<P::To as Field<N>>::OFFSET).cast() }
+    }
+}
+
+impl<T, P, E, const I: usize, const N: usize> Path<T> for ElemOf<P, I>
+where
+    P: Path<T, To = [E; N]>,
+{
+    type To = E;
+    fn get(t: &T) -> &E {
+        const { assert!(I < N, "an array path's index past its end") };
+        &P::get(t)[I]
+    }
+}
+
+impl<T, P: Path<T>> Path<T> for Through<P>
+where
+    P::To: core::ops::Deref + 'static,
+    <P::To as core::ops::Deref>::Target: Sized,
+{
+    type To = <P::To as core::ops::Deref>::Target;
+    fn get(t: &T) -> &Self::To {
+        P::get(t)
+    }
+}
+
+/// A path of fields and elements only: what it reaches is at a fixed offset
+/// in the T it starts from, so the T is had back from it - up().
+pub(crate) trait FieldPath<T>: Path<T> {
+    const OFFSET: usize;
+}
+
+impl<T> FieldPath<T> for Here {
+    const OFFSET: usize = 0;
+}
+
+impl<T, P: FieldPath<T>, const N: u64> FieldPath<T> for FieldOf<P, N>
+where
+    P::To: Field<N> + 'static,
+{
+    const OFFSET: usize = P::OFFSET + <P::To as Field<N>>::OFFSET;
+}
+
+impl<T, P, E, const I: usize, const N: usize> FieldPath<T> for ElemOf<P, I>
+where
+    P: FieldPath<T, To = [E; N]>,
+{
+    const OFFSET: usize = {
+        assert!(I < N, "an array path's index past its end");
+        P::OFFSET + I * size_of::<E>()
+    };
+}
+
+/// The T @to is in, at P.
+///
+/// # Safety
+/// @to is what P reaches from a T, borrowed from it.
+pub(crate) unsafe fn up<T, P: FieldPath<T>>(to: &P::To) -> &T {
+    unsafe { &*core::ptr::from_ref(to).byte_sub(P::OFFSET).cast() }
+}
+
+// ── Elements of a container ──────────────────────────────────────────────
+
+/// Every Self lives in the container at Base's field - a Container, which
+/// Self's #[placed(Base.field[..])] makes there: a Self is had only from
+/// that container's insert(), and dies in it. So none outlives its Base: Self
+/// has a field of type AtIn<Self>, so a Self is had only from a PlacedInit
+/// its Container's insert() ran.
+pub(crate) trait PlacedIn: Sized {
+    type Base;
+}
+
+/// Proof that what holds it was made by its container's insert(), which
+/// alone makes one. Zero bytes, as At, and as At interior mutable and !Unpin.
+#[repr(C)]
+pub(crate) struct AtIn<T> {
+    _c:   [AtomicU8; 0],
+    _t:   PhantomData<fn() -> T>,
+    _pin: PhantomData<PhantomPinned>,
+}
+
+/// What a Container keeps its elements in. An element gets in only by
+/// insert(), made in place and never moved; it leaves only by retain(),
+/// dropped; and what's held is dropped when the container is. No element is
+/// had by value, before or after.
+pub(crate) trait Holds<T>: Sized {
+    fn empty() -> Self;
+    fn insert<E: From<AllocError>>(&mut self, init: impl PinInit<T, E>) -> Result<(), E>;
+    fn iter<'a>(&'a self) -> impl Iterator<Item = &'a T> where T: 'a;
+    /// Keep the elements @f says to; drop the rest.
+    fn retain(&mut self, f: impl FnMut(&T) -> bool);
+}
+
+// each element in a pinned box of its own, made there; room for its box is
+// made first, so an element made is an element held
+impl<T: FreeAnytime> Holds<T> for KVVec<Pin<KBox<T>>> {
+    fn empty() -> Self {
+        KVVec::new()
+    }
+
+    fn insert<E: From<AllocError>>(&mut self, init: impl PinInit<T, E>) -> Result<(), E> {
+        self.reserve(1)?;
+        let b = kbox_pin_init(init)?;
+        self.push(b).expect("room reserved");
+        Ok(())
+    }
+
+    fn iter<'a>(&'a self) -> impl Iterator<Item = &'a T> where T: 'a {
+        self[..].iter().map(|b| &**b)
+    }
+
+    fn retain(&mut self, mut f: impl FnMut(&T) -> bool) {
+        KVVec::retain(self, |b| f(&**b))
+    }
+}
+
+/// The container of a placed field's elements: T's #[placed(Base.field[..])]
+/// makes it, at Base's field - its InitAt, by container(), the only way to
+/// have one - and its insert() is the only thing that makes a T. It keeps
+/// its C to itself: no &mut C, and no T by value, for an element to leave
+/// by.
+pub(crate) struct Container<T, C> {
+    c:  C,
+    _t: PhantomData<fn() -> T>,
+}
+
+impl<T: PlacedIn, C: Holds<T>> Container<T, C> {
+    /// Make an element here, by @init - placed_init!()'s, given its AtIn.
+    pub(crate) fn insert<E: From<AllocError>>(&mut self, init: impl PlacedInit<T, E>) -> Result<(), E> {
+        self.c.insert(init.__init(AtIn { _c: [], _t: PhantomData, _pin: PhantomData }))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.c.iter()
+    }
+
+    /// Keep the elements @f says to; drop the rest.
+    pub(crate) fn retain(&mut self, f: impl FnMut(&T) -> bool) {
+        self.c.retain(f)
+    }
+}
+
+/// An element's initializer, for its container's insert(): placed_init!()'s,
+/// which is pin_init!()'s, but for the element's _placed_at - which it's
+/// given the AtIn for, by insert(). Sealed, its one implementation made by
+/// the macro alone: so the code that wrote the initializer never has the
+/// AtIn, to put anywhere else.
+pub(crate) trait PlacedInit<T, E>: sealed::Sealed {
+    #[doc(hidden)]
+    fn __init(self, at: AtIn<T>) -> impl PinInit<T, E>;
+}
+
+/// placed_init!()'s PlacedInit: a closure of the AtIn.
+#[doc(hidden)]
+pub(crate) struct InitIn<T, F>(F, PhantomData<fn() -> T>);
+
+impl<T, F> InitIn<T, F> {
+    /// # Safety
+    /// @f puts the AtIn it's given in the T's _placed_at, and nowhere else:
+    /// placed_init!()'s.
+    #[doc(hidden)]
+    pub(crate) unsafe fn __new(f: F) -> Self {
+        InitIn(f, PhantomData)
+    }
+}
+
+impl<T, F> sealed::Sealed for InitIn<T, F> {}
+
+impl<T, E, I: PinInit<T, E>, F: FnOnce(AtIn<T>) -> I> PlacedInit<T, E> for InitIn<T, F> {
+    fn __init(self, at: AtIn<T>) -> impl PinInit<T, E> {
+        (self.0)(at)
+    }
+}
+
+/// An element's initializer, written as pin_init!()'s is, but for its
+/// _placed_at: that's its container's to give it, by insert().
+///
+/// ```text
+/// fn new(n: u64) -> impl PlacedInit<Self, BchError> {
+///     placed_init!(Self { n }? BchError)
+/// }
+/// // elems.insert(Elem::new(n))?
+/// ```
+#[macro_export]
+macro_rules! placed_init {
+    ($t:path { $($fields:tt)* } $(? $e:ty)?) => {{
+        // the AtIn's name is the macro's: the fields can't name it
+        let f = move |__placed_at| ::pin_init::pin_init!($t { _placed_at: __placed_at, $($fields)* } $(? $e)?);
+        // SAFETY: the AtIn goes in _placed_at, and nowhere else
+        unsafe { $crate::util::place::InitIn::__new(f) }
+    }};
+}
+
+/// The Container for B's field N - its InitAt's, which #[placed] on the
+/// element type makes.
+///
+/// # Safety
+/// What it returns is run into B's field N, of a B being initialized.
+#[doc(hidden)]
+pub(crate) unsafe fn container<B, const N: u64, T, C>() -> impl PinInit<Container<T, C>, BchError>
+where
+    B: Field<N, Type = Container<T, C>>,
+    T: PlacedIn<Base = B>,
+    C: Holds<T>,
+{
+    // SAFETY: all of it written
+    unsafe {
+        pin_init::init_from_closure(|slot: *mut Container<T, C>| {
+            slot.write(Container { c: C::empty(), _t: PhantomData });
+            Ok(())
+        })
+    }
+}

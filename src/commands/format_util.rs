@@ -2,16 +2,38 @@
 
 //! Rust implementation of bch2_format and bch2_format_for_device_add.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::FileExt;
 use std::os::unix::io::RawFd;
 
-use bch_bindgen::c;
-use bcachefs_kernel::{metadata_version, opt_defined, opt_get, opt_set};
+use bcachefs_kernel::c;
+use bcachefs_kernel::os::blkdev;
+use bcachefs_kernel::alloc::disk_groups::Target;
 
-use crate::wrappers::super_io::{die, SUPERBLOCK_SIZE_DEFAULT};
+use crate::util::{die, read_exact_at, write_all_at};
+use bcachefs_kernel::format::{MetadataVersion, SbFeatures};
 use bcachefs_kernel::sb::io::BCHFS_MAGIC;
+use bcachefs_kernel::util::vstructs::Head;
+use bcachefs_kernel::sb::io::SbResize;
+use bcachefs_kernel::sb::members::SbMembersMut;
+use bcachefs_kernel::alloc::disk_groups::SbDiskGroupsMut;
+
+use crate::key::Passphrase;
+
+/// What's formatted beside the filesystem's options: its identity, and its
+/// superblock's.
+#[derive(Clone, Copy, Default)]
+pub struct FormatOpts<'a> {
+    pub label:           Option<&'a str>,
+    /// None: a new one.
+    pub uuid:            Option<[u8; 16]>,
+    pub version:         MetadataVersion,
+    pub superblock_size: u32,
+    pub encrypted:       bool,
+    /// Encrypted without one, the key's stored as it is.
+    pub passphrase:      Option<&'a Passphrase>,
+    pub no_sb_at_end:    bool,
+}
 
 /// Device options for formatting — Rust replacement for C struct dev_opts.
 ///
@@ -21,7 +43,7 @@ pub struct DevOpts {
     pub path: CString,
     /// Deferred device options (labels): their values are resolved against
     /// the superblock being built, after it exists.
-    pub opt_strs: Vec<(c::bch_opt_id, CString)>,
+    pub opt_strs: Vec<(c::OptId, CString)>,
     pub sb_offset: u64,
     pub sb_end: u64,
     pub nbuckets: u64,
@@ -59,8 +81,8 @@ impl DevOpts {
     /// Adds READ|WRITE|EXCL|BUFFERED to the given extra flags
     /// (matching the old C open_for_format behavior).
     pub fn open(&mut self, extra_mode: u32, force: bool) -> Result<(), i32> {
-        use crate::wrappers::bdev::*;
-        let mode = BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL | BLK_OPEN_BUFFERED | extra_mode;
+        use crate::wrappers::bdev::{blkid_check, open_device};
+        let mode = c::BLK_OPEN_READ | c::BLK_OPEN_WRITE | c::BLK_OPEN_EXCL | c::BLK_OPEN_BUFFERED | extra_mode;
         self.file = Some(open_device(&self.path, mode)?);
         blkid_check(self.fd(), &self.path, force);
         Ok(())
@@ -73,100 +95,65 @@ impl DevOpts {
     }
 }
 
-/// Features enabled on all new filesystems.
-/// Must match BCH_SB_FEATURES_ALL in bcachefs_format.h.
-const BCH_SB_FEATURES_ALL: u64 = {
-    use c::bch_sb_feature::*;
-    // BCH_SB_FEATURES_ALWAYS:
-    (1 << BCH_FEATURE_new_extent_overwrite as u64) |
-    (1 << BCH_FEATURE_extents_above_btree_updates as u64) |
-    (1 << BCH_FEATURE_btree_updates_journalled as u64) |
-    (1 << BCH_FEATURE_alloc_v2 as u64) |
-    (1 << BCH_FEATURE_extents_across_btree_nodes as u64) |
-    // Plus FEATURES_ALL additions:
-    (1 << BCH_FEATURE_new_siphash as u64) |
-    (1 << BCH_FEATURE_btree_ptr_v2 as u64) |
-    (1 << BCH_FEATURE_new_varint as u64) |
-    (1 << BCH_FEATURE_journal_no_flush as u64) |
-    (1 << BCH_FEATURE_incompat_version_field as u64)
-};
-
-const TARGET_DEV_START: u32 = 1;
-const TARGET_GROUP_START: u32 = 256 + TARGET_DEV_START;
-
-fn dev_to_target(dev: usize) -> u32 {
-    TARGET_DEV_START + dev as u32
-}
-
-fn group_to_target(group: u32) -> u32 {
-    TARGET_GROUP_START + group
-}
-
 /// Resolve a target string (device path or disk group name) to a target id.
 fn parse_target(
-    sb: &mut c::bch_sb_handle,
+    sb: &c::bch_sb_handle,
     devs: &[DevOpts],
-    s: *const std::os::raw::c_char,
-) -> u32 {
-    if s.is_null() {
+    s: Option<&str>,
+) -> u16 {
+    let Some(target_str) = s else {
         return 0;
-    }
-
-    let target_str = unsafe { CStr::from_ptr(s) };
-    let target_str_slice = target_str.to_bytes();
+    };
+    let target_str_slice = target_str.as_bytes();
 
     for (idx, dev) in devs.iter().enumerate() {
         if target_str_slice == dev.path.as_bytes() {
-            return dev_to_target(idx);
+            return Target::Dev(idx as u32).encode();
         }
     }
 
-    if let Some(idx) = sb.disk_path_find(target_str) {
-        return group_to_target(idx);
+    if let Some(idx) = sb.disk_path_find(target_str_slice) {
+        return Target::Group(idx).encode();
     }
 
-    die(&format!("Invalid target {}", target_str.to_string_lossy()));
+    die(&format!("Invalid target {target_str}"));
 }
 
 /// Set all sb options from a bch_opts struct.
-fn opt_set_sb_all(sb: &mut c::bch_sb, dev_idx: i32, opts: &mut c::bch_opts) {
+fn opt_set_sb_all(sb: &mut c::bch_sb_buf, dev_idx: Option<u32>, opts: &mut c::bch_opts) {
     use bcachefs_kernel::opts;
 
-    for (id, opt) in opts::opt_table().iter().enumerate() {
-        let opt_id = opts::opt_id(id);
-
-        let v = if opts::opt_defined_by_id(opts, opt_id) {
-            opts::opt_get_by_id(opts, opt_id)
-        } else {
-            opts::opt_get_by_id(opts::opts_default(), opt_id)
-        };
-
-        opts::opt_set_sb(sb, dev_idx, opt, v);
+    for opt in &opts::OPTS {
+        let v = if opts.defined(opt.id) { opts.get(opt.id) } else { opts::DEFAULTS.get(opt.id) };
+        opts::opt_set_sb(sb, dev_idx, opt, v, None)
+            .unwrap_or_else(|e| die(&format!("error setting {}={v}: {e}", opt.name)));
     }
 }
 
 /// Format one or more devices as a bcachefs filesystem.
 ///
-/// Returns a pointer to the superblock (caller must free with `free()`).
+/// Returns the superblock written, or None if a device's layout didn't fit.
 ///
 /// Exits on fatal errors (matching the C `die()` behavior).
 pub fn format(
-    fs_opt_strs: c::bch_opt_strs,
+    fs_opt_strs: &[(c::OptId, String)],
     mut fs_opts: c::bch_opts,
-    mut opts: c::format_opts,
+    opts: FormatOpts<'_>,
     dev_slice: &mut [DevOpts],
-) -> *mut c::bch_sb {
+) -> Option<c::bch_sb_handle> {
 
     // Get device size if not specified (needed for block size threshold)
     for dev in dev_slice.iter_mut() {
         if dev.fs_size == 0 {
-            dev.fs_size = crate::wrappers::bdev::get_size(dev.fd());
+            dev.fs_size = blkdev::size(dev.as_fd()).unwrap_or_else(|e| {
+                die(&format!("error getting size of {}: {e}", dev.path.to_string_lossy()))
+            });
         }
     }
 
-    if opt_defined!(fs_opts, block_size) == 0 {
+    if !fs_opts.defined(c::OptId::block_size) {
         let block_size = pick_block_size(&fs_opts, dev_slice);
-        opt_set!(fs_opts, block_size, block_size as u16);
+        fs_opts.set_block_size(block_size as u16);
     }
 
     if fs_opts.block_size < 512 {
@@ -181,9 +168,9 @@ pub fn format(
 
     for dev in dev_slice.iter_mut() {
         let opts = &mut dev.opts;
-        if opt_defined!(opts, bucket_size) == 0 {
+        if !opts.defined(c::OptId::bucket_size) {
             let clamped = dev_bucket_size_clamp(fs_opts, dev.fs_size, fs_bucket_size);
-            opt_set!(opts, bucket_size, clamped as u32);
+            opts.set_bucket_size(clamped as u32);
         }
     }
 
@@ -193,12 +180,12 @@ pub fn format(
     }
 
     // Calculate btree node size
-    if opt_defined!(fs_opts, btree_node_size) == 0 {
-        let mut s = bcachefs_kernel::opts::opts_default().btree_node_size;
+    if !fs_opts.defined(c::OptId::btree_node_size) {
+        let mut s = bcachefs_kernel::opts::DEFAULTS.btree_node_size;
         for dev in dev_slice.iter() {
             s = s.min(dev.opts.bucket_size);
         }
-        opt_set!(fs_opts, btree_node_size, s);
+        fs_opts.set_btree_node_size(s);
     }
 
     if fs_opts.btree_node_size <= fs_opts.block_size as u32 {
@@ -208,44 +195,33 @@ pub fn format(
         ));
     }
 
-    // UUID
-    if opts.uuid.b == [0u8; 16] {
-        opts.uuid.b = *uuid::Uuid::new_v4().as_bytes();
-    }
-
-    // Allocate superblock
-    // ManuallyDrop: we return sb.sb to the caller (who frees it),
-    // so we must not let bch_sb_handle's Drop call bch2_free_super.
-    let mut sb = std::mem::ManuallyDrop::new(c::bch_sb_handle::default());
+    let mut sb = c::bch_sb_handle::default();
     if sb.sb_realloc(0).is_err() {
         die("insufficient memory");
     }
 
-    sb.sb_mut().version = (opts.version as u16).to_le();
-    sb.sb_mut().version_min = (opts.version as u16).to_le();
+    sb.sb_mut().version.set(opts.version);
+    sb.sb_mut().version_min.set(opts.version);
     sb.sb_mut().magic.b = BCHFS_MAGIC;
-    sb.sb_mut().user_uuid = opts.uuid;
+    sb.sb_mut().user_uuid.b = opts.uuid.unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
     sb.sb_mut().nr_devices = dev_slice.len() as u8;
 
-    sb.sb_mut().set_sb_version_incompat_allowed(opts.version as u64);
+    sb.sb_mut().set_version_incompat_allowed(opts.version);
     // These are no longer options, only for compatibility with old versions
-    sb.sb_mut().set_sb_meta_replicas_req(1);
-    sb.sb_mut().set_sb_data_replicas_req(1);
-    sb.sb_mut().set_sb_extent_bp_shift(16);
+    sb.sb_mut().set_meta_replicas_req(1);
+    sb.sb_mut().set_data_replicas_req(1);
+    sb.sb_mut().set_extent_bp_shift(16);
 
-    let version_threshold =
-        u32::from(metadata_version::disk_accounting_big_endian);
-    if opts.version > version_threshold {
-        sb.sb_mut().features[0] |= BCH_SB_FEATURES_ALL.to_le();
+    if opts.version > MetadataVersion::disk_accounting_big_endian {
+        sb.sb_mut().features.update(|f| f | SbFeatures::ALL);
     }
 
     // Internal UUID (different from user_uuid)
     sb.sb_mut().uuid.b = *uuid::Uuid::new_v4().as_bytes();
 
     // Label
-    if !opts.label.is_null() {
-        let label = unsafe { CStr::from_ptr(opts.label) };
-        let label_bytes = label.to_bytes();
+    if let Some(label) = opts.label {
+        let label_bytes = label.as_bytes();
         if label_bytes.len() >= sb.sb().label.len() {
             die(&format!(
                 "filesystem label too long (max {} characters)",
@@ -260,41 +236,40 @@ pub fn format(
     let ext_u64s = (std::mem::size_of::<c::bch_sb_field_ext>() / std::mem::size_of::<u64>()) as u32;
     sb.field_get_minsize::<c::bch_sb_field_ext>(ext_u64s);
 
-    opt_set_sb_all(sb.sb_mut(), -1, &mut fs_opts);
+    opt_set_sb_all(&mut sb, None, &mut fs_opts);
 
     // Time
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|_| die("error getting current time"));
     let nsec = now.as_secs() * 1_000_000_000 + now.subsec_nanos() as u64;
-    sb.sb_mut().time_base_lo = nsec.to_le();
-    sb.sb_mut().time_precision = 1u32.to_le();
+    sb.sb_mut().time_base_lo = nsec.into();
+    sb.sb_mut().time_precision = 1u32.into();
 
     // Member info
-    let mi_size = std::mem::size_of::<c::bch_sb_field_members_v2>()
+    let mi_size = std::mem::size_of::<Head<c::bch_sb_field_members_v2>>()
         + std::mem::size_of::<c::bch_member>() * dev_slice.len();
     let mi_u64s = mi_size / std::mem::size_of::<u64>();
 
-    let mi = bcachefs_kernel::sb::io::sb_field_resize::<c::bch_sb_field_members_v2>(&mut sb, mi_u64s as u32)
+    let mi = sb.field_resize::<c::bch_sb_field_members_v2>(mi_u64s as u32)
         .unwrap_or_else(|| die("failed to resize members_v2 field"));
-    mi.member_bytes = (std::mem::size_of::<c::bch_member>() as u16).to_le();
+    mi.member_bytes = (std::mem::size_of::<c::bch_member>() as u16).into();
 
     for (idx, dev) in dev_slice.iter_mut().enumerate() {
         let m = sb.member_mut(idx as u32)
             .unwrap_or_else(|| die("member index out of range"));
         m.uuid.b = *uuid::Uuid::new_v4().as_bytes();
-        m.nbuckets = dev.nbuckets.to_le();
-        m.first_bucket = 0;
+        m.nbuckets = dev.nbuckets.into();
+        m.first_bucket = 0u16.into();
 
-        let fd = dev.fd();
+        let rotational = blkdev::is_rotational(dev.as_fd());
         let opts = &mut dev.opts;
-        if opt_defined!(opts, rotational) == 0 {
-            let nonrot = crate::wrappers::bdev::nonrot(fd);
-            opt_set!(opts, rotational, !nonrot as u8);
+        if !opts.defined(c::OptId::rotational) {
+            opts.set_rotational(rotational);
         }
 
-        opt_set_sb_all(sb.sb_mut(), idx as i32, &mut dev.opts);
-        sb.member_mut(idx as u32).unwrap().set_member_rotational_set(1);
+        opt_set_sb_all(&mut sb, Some(idx as u32), &mut dev.opts);
+        sb.member_mut(idx as u32).unwrap().set_rotational_set(true);
     }
 
     // Deferred device options: labels resolve to a disk path against the sb we
@@ -302,14 +277,13 @@ pub fn format(
     for (idx, dev) in dev_slice.iter().enumerate() {
         for (opt_id, val) in &dev.opt_strs {
             match *opt_id {
-                c::bch_opt_id::Opt_label => {
-                    let path_idx = sb.disk_path_find_or_create(val).unwrap_or_else(|e|
-                        die(&format!("error creating disk path: {}",
-                                     std::io::Error::from_raw_os_error(e))));
+                c::OptId::label => {
+                    let path_idx = sb.disk_path_find_or_create(val.to_bytes()).unwrap_or_else(|e|
+                        die(&format!("error creating disk path {}: {e}", val.to_string_lossy())));
                     // Recompute m after sb modification (may have been reallocated)
-                    sb.member_mut(idx as u32).unwrap().set_member_group(path_idx as u64 + 1);
+                    sb.member_mut(idx as u32).unwrap().set_group((path_idx + 1).try_into().expect("a disk group a member can name"));
                 }
-                c::bch_opt_id::Opt_failure_domain => {
+                c::OptId::failure_domain => {
                     let bytes = val.to_bytes();
                     let m = sb.member_mut(idx as u32).unwrap();
                     if bytes.len() > m.failure_domain.len() {
@@ -325,29 +299,40 @@ pub fn format(
     }
 
     // Targets
-    let target_strs = unsafe { &fs_opt_strs.__bindgen_anon_1.__bindgen_anon_1 };
-    let sb_handle = &mut *sb;
-    let foreground = parse_target(sb_handle, dev_slice, target_strs.foreground_target);
-    let background = parse_target(sb_handle, dev_slice, target_strs.background_target);
-    let promote    = parse_target(sb_handle, dev_slice, target_strs.promote_target);
-    let metadata   = parse_target(sb_handle, dev_slice, target_strs.metadata_target);
-    sb.sb_mut().set_sb_foreground_target(foreground as u64);
-    sb.sb_mut().set_sb_background_target(background as u64);
-    sb.sb_mut().set_sb_promote_target(promote as u64);
-    sb.sb_mut().set_sb_metadata_target(metadata as u64);
+    // the last given, as a later option overrides an earlier
+    let target_str = |id| fs_opt_strs.iter().rev().find(|(i, _)| *i == id).map(|(_, s)| s.as_str());
+    let foreground = parse_target(&sb, dev_slice, target_str(c::OptId::foreground_target));
+    let background = parse_target(&sb, dev_slice, target_str(c::OptId::background_target));
+    let promote    = parse_target(&sb, dev_slice, target_str(c::OptId::promote_target));
+    let metadata   = parse_target(&sb, dev_slice, target_str(c::OptId::metadata_target));
+    sb.sb_mut().set_foreground_target(foreground);
+    sb.sb_mut().set_background_target(background);
+    sb.sb_mut().set_promote_target(promote);
+    sb.sb_mut().set_metadata_target(metadata);
 
     // Encryption
     if opts.encrypted {
         let crypt_u64s =
             std::mem::size_of::<c::bch_sb_field_crypt>() / std::mem::size_of::<u64>();
-        let crypt: &mut c::bch_sb_field_crypt = sb.field_resize(crypt_u64s as u32)
+        let nonce = sb.sb().nonce();
+        let crypt = sb.field_resize::<c::bch_sb_field_crypt>(crypt_u64s as u32)
             .unwrap_or_else(|| die("failed to create crypt field"));
-        let crypt_ptr = crypt as *mut c::bch_sb_field_crypt;
-        unsafe { c::bch_sb_crypt_init(sb.sb, crypt_ptr, opts.passphrase) };
-        sb.sb_mut().set_sb_encryption_type(1);
+
+        let mut key = c::bch_key::default();
+        bcachefs_kernel::os::kernel::random_bytes(bcachefs_kernel::util::vstructs::plain_bytes_mut(&mut key));
+        let mut sb_key = c::bch_encrypted_key::new_unencrypted(key);
+
+        if let Some(passphrase) = opts.passphrase {
+            crypt.kdf_init();
+            let passphrase_key = crypt.derive_passphrase(passphrase.get())
+                .unwrap_or_else(|e| die(&format!("error deriving key from passphrase: {e}")));
+            sb_key.chacha20(&passphrase_key, nonce);
+        }
+        crypt.key = sb_key;
+        sb.sb_mut().set_encryption_type(1);
     }
 
-    sb.members_cpy_v2_v1();
+    sb.members_cpy_v2_v1().unwrap_or_else(|e| die(&format!("copying members to members_v1: {e}")));
 
     // Write superblocks to each device
     for (idx, dev) in dev_slice.iter_mut().enumerate() {
@@ -359,7 +344,7 @@ pub fn format(
             dev.sb_end = size_sectors;
         }
 
-        if let Err(e) = crate::wrappers::super_io::sb_layout_init(
+        if let Err(e) = sb_layout_init(
             &mut sb.sb_mut().layout,
             fs_opts.block_size as u32,
             dev.opts.bucket_size,
@@ -369,38 +354,49 @@ pub fn format(
             opts.no_sb_at_end,
         ) {
             eprintln!("Error: {}", e);
-            return std::ptr::null_mut();
+            return None;
         }
 
-        let fd = dev.fd();
+        let fd = dev.as_fd();
 
         if dev.sb_offset == c::BCH_SB_SECTOR as u64 {
             // Zero start of disk
             let zeroes = vec![0u8; (c::BCH_SB_SECTOR as usize) << 9];
-            let file = crate::wrappers::super_io::borrowed_file(fd);
-            file.write_all_at(&zeroes, 0)
+            write_all_at(fd, &zeroes, 0)
                 .unwrap_or_else(|e| die(&format!("zeroing start of disk: {}", e)));
         }
 
-        crate::wrappers::super_io::bch2_super_write(fd, &mut *sb);
+        bch2_super_write(fd, sb.sb_mut());
     }
 
-    let paths: Vec<&str> = dev_slice
+    let paths: Vec<&std::ffi::OsStr> = dev_slice
         .iter()
-        .map(|dev| dev.path.to_str().unwrap_or(""))
+        .map(|dev| std::os::unix::ffi::OsStrExt::from_bytes(dev.path.as_bytes()))
         .collect();
     trigger_udev_for_paths(&paths);
 
-    sb.sb
+    Some(sb)
 }
 
-pub fn trigger_udev_for_paths(paths: &[&str]) {
-    let mut udevadm = std::process::Command::new("udevadm");
-    udevadm.args(["trigger", "--settle"]);
-    for path in paths {
-        udevadm.arg(path);
+/// Have udev re-read the devices we just wrote superblocks to, so that
+/// 'bcachefs mount' finds them by UUID in its database. Only block devices:
+/// an image file has no udev device - udevadm refuses it - and a trigger
+/// naming no devices would trigger every device on the system.
+pub fn trigger_udev_for_paths<P: AsRef<std::path::Path>>(paths: &[P]) {
+    use std::os::unix::fs::FileTypeExt;
+
+    let devs: Vec<&std::path::Path> = paths.iter()
+        .map(AsRef::as_ref)
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.file_type().is_block_device()))
+        .collect();
+    if devs.is_empty() {
+        return;
     }
-    let _ = udevadm.status();
+
+    let _ = std::process::Command::new("udevadm")
+        .args(["trigger", "--settle"])
+        .args(devs)
+        .status();
 }
 
 /// Format a single device for addition to an existing filesystem.
@@ -409,20 +405,18 @@ pub fn format_for_device_add(
     block_size: u32,
     btree_node_size: u32,
 ) -> i32 {
-    let fs_opt_strs: c::bch_opt_strs = Default::default();
-    let mut fs_opts = fs_opt_strs.parse();
-    opt_set!(fs_opts, block_size, block_size as u16);
-    opt_set!(fs_opts, btree_node_size, btree_node_size);
+    let mut fs_opts = c::bch_opts::default();
+    fs_opts.set_block_size(block_size as u16);
+    fs_opts.set_btree_node_size(btree_node_size);
 
     let fmt_opts = format_opts_default();
-    let sb = format(fs_opt_strs, fs_opts, fmt_opts, std::slice::from_mut(dev));
-    unsafe { libc::free(sb as *mut _) };
+    format(&[], fs_opts, fmt_opts, std::slice::from_mut(dev));
 
     0
 }
 
-/// Mirrors the C `format_opts_default()` inline function.
-pub(crate) fn format_opts_default() -> c::format_opts {
+/// The newest version the running kernel mounts: ours, if there's no module.
+pub(crate) fn kernel_format_version() -> MetadataVersion {
     // Try to load bcachefs module to detect kernel version
     let _ = std::process::Command::new("modprobe")
         .arg("bcachefs")
@@ -430,18 +424,14 @@ pub(crate) fn format_opts_default() -> c::format_opts {
         .stderr(std::process::Stdio::null())
         .status();
 
-    let kernel_version = crate::wrappers::sysfs::bcachefs_kernel_version() as u32;
-    let current =
-        u32::from(metadata_version::max) - 1;
+    let current = MetadataVersion::CURRENT;
+    crate::wrappers::sysfs::bcachefs_kernel_version().map_or(current, |k| current.min(k))
+}
 
-    let version = if kernel_version > 0 {
-        current.min(kernel_version)
-    } else {
-        current
-    };
-
-    c::format_opts {
-        version,
+/// The newest version the running kernel mounts, and the default superblock.
+pub(crate) fn format_opts_default() -> FormatOpts<'static> {
+    FormatOpts {
+        version: kernel_format_version(),
         superblock_size: SUPERBLOCK_SIZE_DEFAULT,
         ..Default::default()
     }
@@ -457,7 +447,7 @@ fn dev_bucket_size_clamp(fs_opts: c::bch_opts, dev_size: u64, fs_bucket_size: u6
 
     // Largest bucket size that still gives >= 2048 buckets
     let mut max_size = rounddown_pow_of_two(dev_size / (min_nr_nbuckets * 4));
-    if opt_defined!(fs_opts, btree_node_size) != 0 {
+    if fs_opts.defined(c::OptId::btree_node_size) {
         max_size = max_size.max(fs_opts.btree_node_size as u64);
     }
     if max_size * min_nr_nbuckets > dev_size {
@@ -467,7 +457,7 @@ fn dev_bucket_size_clamp(fs_opts: c::bch_opts, dev_size: u64, fs_bucket_size: u6
     let mut dev_bucket_size = max_size.min(fs_bucket_size);
 
     // Buckets >= encoded_extent_max avoid fragmenting encoded extents
-    let extent_min = opt_get!(fs_opts, encoded_extent_max) as u64;
+    let extent_min = fs_opts.encoded_extent_max_or_default() as u64;
     while dev_bucket_size < extent_min && dev_bucket_size < max_size {
         dev_bucket_size *= 2;
     }
@@ -476,10 +466,7 @@ fn dev_bucket_size_clamp(fs_opts: c::bch_opts, dev_size: u64, fs_bucket_size: u6
 }
 
 fn total_system_ram() -> u64 {
-    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
-    if unsafe { libc::sysinfo(&mut info) } != 0 {
-        die("sysinfo() failed");
-    }
+    let info = rustix::system::sysinfo();
     info.totalram as u64 * info.mem_unit as u64
 }
 
@@ -504,7 +491,7 @@ pub fn pick_block_size(_fs_opts: &c::bch_opts, dev_slice: &[DevOpts]) -> u32 {
     let block_size = if total_size >= 1u64 << 30 {
         let mut bs = 4096u32;
         for dev in dev_slice.iter() {
-            bs = bs.max(crate::wrappers::bdev::get_blocksize_physical_hint(dev.fd()));
+            bs = bs.max(crate::wrappers::bdev::get_blocksize_physical_hint(dev.as_fd()));
         }
         bs
     } else {
@@ -521,7 +508,7 @@ pub fn pick_block_size(_fs_opts: &c::bch_opts, dev_slice: &[DevOpts]) -> u32 {
 pub fn pick_bucket_size(opts: &c::bch_opts, devs: &[DevOpts]) -> u64 {
     // Hard minimum: bucket must hold a btree node
     let mut bucket_size = opts.block_size as u64;
-    if opt_defined!(opts, btree_node_size) != 0 {
+    if opts.defined(c::OptId::btree_node_size) {
         bucket_size = bucket_size.max(opts.btree_node_size as u64);
     }
 
@@ -548,7 +535,7 @@ pub fn pick_bucket_size(opts: &c::bch_opts, devs: &[DevOpts]) -> u64 {
     // Avoid fragmenting encoded (checksummed/compressed) extents
     // when they're moved — prefer buckets large enough for several
     // max-size extents
-    bucket_size = bucket_size.max(opt_get!(opts, encoded_extent_max) as u64 * 4);
+    bucket_size = bucket_size.max(opts.encoded_extent_max_or_default() as u64 * 4);
 
     // Prefer larger buckets up to 2MB — reduces allocator overhead.
     // Scales linearly with total filesystem size, reaching 2MB at 2TB
@@ -581,7 +568,7 @@ pub fn check_bucket_size(opts: &c::bch_opts, dev: &DevOpts) {
         ));
     }
 
-    if opt_defined!(opts, btree_node_size) != 0
+    if opts.defined(c::OptId::btree_node_size)
         && dev.opts.bucket_size < opts.btree_node_size
     {
         die(&format!(
@@ -598,4 +585,129 @@ pub fn check_bucket_size(opts: &c::bch_opts, dev: &DevOpts) {
             dev.opts.bucket_size
         ));
     }
+}
+
+/// Write superblock to all layout locations on disk.
+///
+/// Exits on I/O errors (matches C `die()` behavior).
+pub fn bch2_super_write(fd: BorrowedFd<'_>, sb: &mut c::bch_sb) {
+    let bs = crate::wrappers::bdev::get_blocksize_physical_hint(fd) as usize;
+    let layout_range = {
+        let off = std::mem::offset_of!(Head<c::bch_sb>, layout);
+        off..off + std::mem::size_of::<c::bch_sb_layout>()
+    };
+
+    let nr_superblocks = sb.layout.nr_superblocks as usize;
+    for i in 0..nr_superblocks {
+        let offset_le = sb.layout.sb_offset[i];
+        let offset_sectors = offset_le.get();
+
+        sb.offset = offset_le;
+        sb.csum = sb.as_unvalidated().checksum();
+
+        let sb_src = sb.as_bytes();
+        let sb_bytes = sb_src.len();
+        let layout_src = &sb_src[layout_range.clone()];
+
+        if offset_sectors == c::BCH_SB_SECTOR as u64 && bs > 4096 {
+            // Layout and superblock are in the same aligned block;
+            // write them together.
+            let layout_offset = (c::BCH_SB_LAYOUT_SECTOR as usize) << 9;
+            let sb_offset = (offset_sectors as usize) << 9;
+            let write_len = (sb_offset + sb_bytes).next_multiple_of(bs);
+            let mut buf = vec![0u8; write_len];
+
+            buf[layout_offset..layout_offset + layout_src.len()].copy_from_slice(layout_src);
+            buf[sb_offset..sb_offset + sb_bytes].copy_from_slice(sb_src);
+
+            pwrite_exact(fd, &buf, 0);
+        } else {
+            if offset_sectors == c::BCH_SB_SECTOR as u64 {
+                // Write backup layout in the block preceding the superblock
+                let mut buf = vec![0u8; bs];
+
+                read_exact_at(fd, &mut buf, 4096 - bs as u64)
+                    .unwrap_or_else(|e| die(&format!("pread failed at offset {}: {}", 4096 - bs, e)));
+
+                buf[bs - layout_src.len()..].copy_from_slice(layout_src);
+
+                pwrite_exact(fd, &buf, 4096 - bs as u64);
+            }
+
+            let write_len = sb_bytes.next_multiple_of(bs);
+            let mut buf = vec![0u8; write_len];
+            buf[..sb_bytes].copy_from_slice(sb_src);
+
+            pwrite_exact(fd, &buf, offset_sectors << 9);
+        }
+    }
+
+    if let Err(e) = rustix::fs::fsync(fd) {
+        die(&format!("fsync failed writing superblock: {}", e));
+    }
+}
+
+/// Write exactly `buf.len()` bytes at `offset`. Exits on error.
+fn pwrite_exact(fd: BorrowedFd<'_>, buf: &[u8], offset: u64) {
+    write_all_at(fd, buf, offset)
+        .unwrap_or_else(|e| die(&format!("pwrite failed at offset {}: {}", offset, e)));
+}
+
+/// Default superblock size in 512-byte sectors
+pub const SUPERBLOCK_SIZE_DEFAULT: u32 = 2048;
+
+/// Initialize superblock layout with primary and backup superblock positions.
+///
+/// `block_size` and `bucket_size` are in bytes.
+/// `sb_size`, `sb_start`, and `sb_end` are in 512-byte sectors.
+pub fn sb_layout_init(
+    l: &mut c::bch_sb_layout,
+    block_size: u32,
+    bucket_size: u32,
+    sb_size: u32,
+    sb_start: u64,
+    sb_end: u64,
+    no_sb_at_end: bool,
+) -> anyhow::Result<()> {
+    *l = pin_init::zeroed();
+
+    l.magic.b = bcachefs_kernel::sb::io::BCHFS_MAGIC;
+    l.layout_type = 0;
+    l.nr_superblocks = 2;
+    l.sb_max_size_bits = sb_size.ilog2() as u8;
+
+    // Create two superblocks in the allowed range
+    let mut sb_pos = sb_start;
+    for i in 0..l.nr_superblocks as usize {
+        if sb_pos != c::BCH_SB_SECTOR as u64 {
+            let align = (block_size >> 9) as u64;
+            sb_pos = sb_pos.next_multiple_of(align);
+        }
+
+        l.sb_offset[i] = sb_pos.into();
+        sb_pos += sb_size as u64;
+    }
+
+    if sb_pos > sb_end {
+        return Err(anyhow::anyhow!(
+            "insufficient space for superblocks: need {} sectors but only {} available",
+            sb_pos - sb_start, sb_end - sb_start
+        ));
+    }
+
+    // Also create a backup superblock at the end of the disk:
+    //
+    // If we're not creating a superblock at the default offset, it
+    // means we're being run from the migrate tool and we could be
+    // overwriting existing data if we write to the end of the disk
+    if sb_start == c::BCH_SB_SECTOR as u64 && !no_sb_at_end {
+        let sb_max_size = 1u64 << l.sb_max_size_bits;
+        let bucket_sectors = (bucket_size >> 9) as u64;
+        let backup_sb = (sb_end - sb_max_size) / bucket_sectors * bucket_sectors;
+        let idx = l.nr_superblocks as usize;
+        l.sb_offset[idx] = backup_sb.into();
+        l.nr_superblocks += 1;
+    }
+
+    Ok(())
 }

@@ -1,41 +1,46 @@
-//! What the userspace workqueue shim has to guarantee, exercised end to end.
+//! What util::task has to guarantee on the userspace workqueue shim,
+//! exercised end to end.
 //!
-//! These belong beside `fs/util/async_exec.rs` and cannot live there: a
-//! `cargo test -p bcachefs-kernel` binary links `-lbcachefs_static_wrappers`
-//! but not libbcachefs.a, so `queue_work()` and `system_unbound_wq` come out
-//! undefined. This crate's build.rs links libbcachefs whole-archive, which is
-//! also what makes `linux/workqueue.c`'s `constructor(102)` run, so the system
-//! queues actually exist here.
+//! These can't live beside `fs/util/task.rs`: a `cargo test -p
+//! bcachefs-kernel` binary doesn't link libbcachefs.a, the C the executor
+//! still calls into; this crate's build.rs links it whole-archive.
 //!
-//! Both tests are about linux/workqueue.c's contract rather than any Rust
-//! logic, which is the point: async_exec's soundness rests on that contract,
-//! the contract is invisible from Rust, and it has already been broken once by
-//! a change to workqueue.c that looked unrelated to async.
+//! One test is of the shim's workqueues' contract - par's workqueue jobs block,
+//! and rely on the queue having more than one worker; one of the executor's
+//! own - a task never polled twice at once, which its state word, not the
+//! workqueue, guarantees. Both silent if they break: a deadlock elsewhere, or
+//! a future polled concurrently.
 //!
-//! Each was checked against the break it is meant to catch, because a test that
-//! has never failed is not yet evidence of anything:
+//! Each was checked against the break it is meant to catch, because a test
+//! that has never failed is not yet evidence of anything:
 //!
-//! - `find_runnable_work()` reverted to taking the head unconditionally ->
-//!   `a_task_is_never_polled_concurrently` sees 36 overlaps in 100 polls
 //! - `max_active` forced to 1 -> `a_blocking_task_does_not_own_the_queue`
 //!   times out
+//! - a wake in a poll dispatching the task rather than marking it NOTIFIED
+//!   -> passes: the shim's non-reentrancy covers for it. An inline wake,
+//!   which bypasses the workqueue, made it fail; that test goes until
+//!   Resume::INLINE is implemented again.
 //!
-//! Caveat from that second run: both tests share `system_unbound()`, the only
-//! queue the shim exposes to Rust, so a task wedged by one test can starve the
-//! other and a single fault shows up as two failures. Both still mean "the
-//! workqueue contract is broken", so this is noise in attribution rather than
-//! in the verdict - but if the shim ever grows an `alloc_workqueue` binding,
-//! give each test its own queue.
+//! Both share `Queue::system_dfl()`, so a task wedged by one can starve the
+//! other: a single fault can show up as two failures.
 
-use bcachefs_kernel::util::async_exec::{spawn, system_unbound};
+use bcachefs_kernel::util::task::{waiter, Completion, Done, Resumable};
+use bcachefs_kernel::util::task::{spawn_detached, TASKS};
+use bcachefs_kernel::os::workqueue::Queue;
 
-use std::future::Future;
+use std::future::{poll_fn, Future};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+
+/// @f as a task on @q, nothing joining it.
+fn spawn<F: Future<Output = ()> + Send + 'static>(q: &'static Queue, f: F) {
+    // SAFETY: 'static: it borrows nothing
+    unsafe { spawn_detached(q, &TASKS, move || f) }.unwrap();
+}
 
 /// Run `f` on a helper thread and fail rather than hang if it wedges.
 ///
@@ -56,13 +61,13 @@ fn within(secs: u64, f: impl FnOnce() + Send + 'static) {
 
 /// Two tasks on one queue, the first blocking until the second runs.
 ///
-/// This is what the executor exists for, and what one worker per queue cannot
-/// serve: the worker blocks inside task A, and task B - the thing that would
-/// release it - is queued behind A on the same queue.
+/// What one worker per queue cannot serve: the worker blocks inside task A,
+/// and task B - the thing that would release it - is queued behind A on the
+/// same queue. par's workqueue jobs block like A.
 #[test]
 fn a_blocking_task_does_not_own_the_queue() {
     within(30, || {
-        let q = system_unbound();
+        let q = Queue::system_dfl();
         let (release, blocked) = mpsc::channel::<()>();
         let (finish, finished) = mpsc::channel::<()>();
 
@@ -71,65 +76,46 @@ fn a_blocking_task_does_not_own_the_queue() {
         spawn(q, async move {
             blocked.recv().unwrap();
             finish.send(()).unwrap();
-        })
-        .unwrap();
+        });
 
         spawn(q, async move {
             release.send(()).unwrap();
-        })
-        .unwrap();
+        });
 
         finished.recv().unwrap();
     });
 }
 
 /// A task that wakes itself from inside its own poll must still never be polled
-/// by two workers at once.
+/// twice at once.
 ///
-/// The pending bit does not give this: it is cleared before the work function
-/// runs, so the self-wake re-queues successfully and the item is back on the
-/// pending list while this very run is still going. What keeps a second worker
-/// off it is workqueue non-reentrancy - which is what makes async_exec's
-/// `UnsafeCell` access and its `unsafe impl Sync` sound, so it deserves a test
-/// that fails loudly rather than a comment that reads plausibly.
+/// The wake finds it RUNNING, and marks it NOTIFIED: the poll in progress
+/// repolls when it's done. Were it dispatched instead - queued again, with
+/// this run still going - only workqueue non-reentrancy would keep a second
+/// worker off it. The state word is what makes the future's `UnsafeCell`
+/// sound, so it deserves a test that fails loudly rather than a comment that
+/// reads plausibly.
 #[test]
 fn a_task_is_never_polled_concurrently() {
-    struct SelfWaking {
-        polls: u32,
+    /// @inner, counting polls that overlap.
+    struct Measured<F> {
+        inner: Pin<Box<F>>,
         inside: Arc<AtomicBool>,
         overlaps: Arc<AtomicUsize>,
-        finish: mpsc::Sender<()>,
     }
 
-    impl Future for SelfWaking {
-        type Output = ();
+    impl<F: Future> Future for Measured<F> {
+        type Output = F::Output;
 
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
             if self.inside.swap(true, Ordering::SeqCst) {
                 self.overlaps.fetch_add(1, Ordering::SeqCst);
             }
-
-            self.polls += 1;
-            let again = self.polls < 100;
-
-            // Wake from inside the poll: the re-enqueue lands while this run is
-            // still in progress, which is the whole point. Not on the last one
-            // though - a wake that outlives `Ready` buys one more poll, after
-            // the waiter has gone.
-            if again {
-                cx.waker().wake_by_ref();
-            }
-
+            let r = self.inner.as_mut().poll(cx);
             // Widen the window a second poll would have to land in.
             std::thread::sleep(Duration::from_millis(1));
             self.inside.store(false, Ordering::SeqCst);
-
-            if again {
-                Poll::Pending
-            } else {
-                self.finish.send(()).unwrap();
-                Poll::Ready(())
-            }
+            r
         }
     }
 
@@ -139,16 +125,29 @@ fn a_task_is_never_polled_concurrently() {
     within(30, move || {
         let (finish, finished) = mpsc::channel::<()>();
 
-        spawn(
-            system_unbound(),
-            SelfWaking {
-                polls: 0,
-                inside: Arc::new(AtomicBool::new(false)),
-                overlaps,
-                finish,
-            },
-        )
-        .unwrap();
+        let body = async move {
+            for _ in 0..99 {
+                // Woken from inside the poll: the wake lands while this run is
+                // still in progress, which is the whole point.
+                let mut slot = Done::completed();
+                let done = AtomicPtr::<Done>::new(&raw mut slot);
+                let mut c = Completion::new(&mut slot, waiter::Async::current().await);
+                let mut woken = false;
+                poll_fn(|cx| {
+                    if woken {
+                        return Poll::Ready(());
+                    }
+                    woken = true;
+                    let _ = Pin::new(&mut c).poll_resume(cx);
+                    // SAFETY: by its address, as an endio completes one
+                    unsafe { (*done.load(Ordering::Relaxed)).complete() };
+                    Poll::Pending
+                })
+                .await;
+            }
+            finish.send(()).unwrap();
+        };
+        spawn(Queue::system_dfl(), Measured { inner: Box::pin(body), inside: Arc::new(AtomicBool::new(false)), overlaps });
 
         finished.recv().unwrap();
     });
@@ -156,6 +155,6 @@ fn a_task_is_never_polled_concurrently() {
     assert_eq!(
         seen.load(Ordering::SeqCst),
         0,
-        "task was polled concurrently - workqueue non-reentrancy is broken"
+        "task was polled concurrently - the executor's state word is broken"
     );
 }

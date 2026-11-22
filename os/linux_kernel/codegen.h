@@ -1,0 +1,318 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef _BCACHEFS_CODEGEN_H
+#define _BCACHEFS_CODEGEN_H
+
+/*
+ * Kernel APIs the Rust calls that bindgen can't bind - macros, or macros in
+ * some kernels - as static inlines, which codegen.rs binds and wraps
+ * (extern.c). Kernel headers only, as codegen binds nothing of bcachefs's -
+ * but pf_memalloc.h, which only picks kernel bits.
+ */
+
+#include <linux/alloc_tag.h>
+#include <linux/blkdev.h>
+#include <linux/compat.h>
+#include <linux/cpumask.h>
+#include <linux/delay.h>
+#include <linux/falloc.h>
+#include <linux/fs.h>
+#include <linux/highmem.h>
+#include <linux/kallsyms.h>
+#include <linux/key.h>
+#include <linux/lz4.h>
+#include <linux/mount.h>
+#include <linux/namei.h>
+#include <linux/mm.h>
+#include <linux/notifier.h>
+#include <linux/numa.h>
+#include <linux/pagemap.h>
+#include <linux/perf_event.h>
+/* struct folio_batch: pagevec.h's, before 7.1 */
+#if __has_include(<linux/folio_batch.h>)
+#include <linux/folio_batch.h>
+#else
+#include <linux/pagevec.h>
+#endif
+#include <linux/poll.h>
+#include <linux/random.h>
+#include <linux/rmap.h>
+#include <linux/sched/clock.h>
+#include <linux/slab.h>
+#include <linux/srcu.h>
+#include <linux/timekeeping.h>
+#include <linux/version.h>
+#include <linux/vmalloc.h>
+#include <linux/workqueue.h>
+#include <linux/writeback.h>
+#include <asm/ioctl.h>
+#ifdef CONFIG_PARAVIRT_XXL
+#include <asm/paravirt_types.h>
+#endif
+#include <keys/user-type.h>
+
+#include "pf_memalloc.h"
+
+#ifdef __BINDGEN__
+/*
+ * Macros with casts, which bindgen doesn't evaluate: as consts, which it
+ * binds - the kernel's bindings_helper.h has its own the same way, and
+ * codegen.rs strips the prefix as rust/Makefile does.
+ */
+const blk_mode_t RUST_CONST_HELPER_BLK_OPEN_READ	= BLK_OPEN_READ;
+const blk_mode_t RUST_CONST_HELPER_BLK_OPEN_WRITE	= BLK_OPEN_WRITE;
+const blk_mode_t RUST_CONST_HELPER_BLK_OPEN_EXCL	= BLK_OPEN_EXCL;
+const blk_opf_t RUST_CONST_HELPER_REQ_SYNC		= REQ_SYNC;
+const blk_opf_t RUST_CONST_HELPER_REQ_META		= REQ_META;
+const blk_opf_t RUST_CONST_HELPER_REQ_IDLE		= REQ_IDLE;
+const blk_opf_t RUST_CONST_HELPER_REQ_FUA		= REQ_FUA;
+const blk_opf_t RUST_CONST_HELPER_REQ_PREFLUSH	= REQ_PREFLUSH;
+const fgf_t RUST_CONST_HELPER_FGP_LOCK		= FGP_LOCK;
+const fgf_t RUST_CONST_HELPER_FGP_CREAT		= FGP_CREAT;
+const fgf_t RUST_CONST_HELPER_FGP_NOWAIT		= FGP_NOWAIT;
+const fgf_t RUST_CONST_HELPER_FGP_WRITEBEGIN		= FGP_WRITEBEGIN;
+/* The inode states: macros before 6.19, an enum's from it - its values moved */
+const unsigned RUST_CONST_HELPER___I_NEW		= __I_NEW;
+const unsigned RUST_CONST_HELPER_I_WILL_FREE	= I_WILL_FREE;
+const unsigned RUST_CONST_HELPER_I_FREEING	= I_FREEING;
+const unsigned RUST_CONST_HELPER_I_DONTCACHE	= I_DONTCACHE;
+/* slab flags: casts */
+const slab_flags_t RUST_CONST_HELPER_SLAB_RECLAIM_ACCOUNT	= SLAB_RECLAIM_ACCOUNT;
+const slab_flags_t RUST_CONST_HELPER_SLAB_ACCOUNT	= SLAB_ACCOUNT;
+
+/*
+ * ioctl numbers' layout, the arch's own: powerpc, mips, sparc, alpha and
+ * parisc override asm-generic's (util/ioctl.rs)
+ */
+const unsigned int RUST_CONST_HELPER_MINORBITS		= MINORBITS;
+
+/* os/linux_kernel/super_block.rs and fs_context.rs: BIT()s, which bindgen can't evaluate */
+const unsigned long RUST_CONST_HELPER_SB_RDONLY		= SB_RDONLY;
+const unsigned long RUST_CONST_HELPER_SB_NOSEC		= SB_NOSEC;
+const unsigned long RUST_CONST_HELPER_SB_ACTIVE		= SB_ACTIVE;
+const loff_t RUST_CONST_HELPER_MAX_LFS_FILESIZE		= MAX_LFS_FILESIZE;
+
+/*
+ * the largest folio, for vfs's writepage_buf_pool: pagemap.h's
+ * MAX_PAGECACHE_ORDER, whose min() isn't allowed at file scope
+ */
+const unsigned int RUST_CONST_HELPER_MAX_PAGECACHE_ORDER	=
+	MIN(MAX_XAS_ORDER, PREFERRED_MAX_PAGECACHE_ORDER);
+
+#ifdef CONFIG_PARAVIRT_XXL
+/*
+ * pv_ops' irq ops, which percpu.rs's local_irq_save() and _restore() call
+ * through as C's paravirt patch sites do
+ */
+const size_t RUST_CONST_HELPER_PV_IRQ_SAVE_FL	=
+	offsetof(struct paravirt_patch_template, irq.save_fl.func);
+const size_t RUST_CONST_HELPER_PV_IRQ_DISABLE	=
+	offsetof(struct paravirt_patch_template, irq.irq_disable.func);
+const size_t RUST_CONST_HELPER_PV_IRQ_ENABLE	=
+	offsetof(struct paravirt_patch_template, irq.irq_enable.func);
+#endif
+
+/* blk_status_t's values, for errcode.rs's blk_status_to_bch_err() */
+const blk_status_t RUST_CONST_HELPER_BLK_STS_NOTSUPP		= BLK_STS_NOTSUPP;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_TIMEOUT		= BLK_STS_TIMEOUT;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_NOSPC		= BLK_STS_NOSPC;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_TRANSPORT		= BLK_STS_TRANSPORT;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_TARGET		= BLK_STS_TARGET;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_RESV_CONFLICT	= BLK_STS_RESV_CONFLICT;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_MEDIUM		= BLK_STS_MEDIUM;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_PROTECTION		= BLK_STS_PROTECTION;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_RESOURCE		= BLK_STS_RESOURCE;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_IOERR		= BLK_STS_IOERR;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_DM_REQUEUE		= BLK_STS_DM_REQUEUE;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_AGAIN		= BLK_STS_AGAIN;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_DEV_RESOURCE	= BLK_STS_DEV_RESOURCE;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_ZONE_OPEN_RESOURCE	= BLK_STS_ZONE_OPEN_RESOURCE;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_ZONE_ACTIVE_RESOURCE = BLK_STS_ZONE_ACTIVE_RESOURCE;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_OFFLINE		= BLK_STS_OFFLINE;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_DURATION_LIMIT	= BLK_STS_DURATION_LIMIT;
+const blk_status_t RUST_CONST_HELPER_BLK_STS_INVAL		= BLK_STS_INVAL;
+
+/* os::alloc::Flags' bits, which Flags::raw() maps: the kernel crate binds none */
+const gfp_t RUST_CONST_HELPER___GFP_DIRECT_RECLAIM	= __GFP_DIRECT_RECLAIM;
+const gfp_t RUST_CONST_HELPER___GFP_IO			= __GFP_IO;
+const gfp_t RUST_CONST_HELPER___GFP_FS			= __GFP_FS;
+const gfp_t RUST_CONST_HELPER___GFP_HIGH		= __GFP_HIGH;
+const gfp_t RUST_CONST_HELPER___GFP_NORETRY		= __GFP_NORETRY;
+const gfp_t RUST_CONST_HELPER___GFP_NOMEMALLOC		= __GFP_NOMEMALLOC;
+const gfp_t RUST_CONST_HELPER___GFP_ACCOUNT		= __GFP_ACCOUNT;
+const gfp_t RUST_CONST_HELPER___GFP_RECLAIMABLE	= __GFP_RECLAIMABLE;
+const gfp_t RUST_CONST_HELPER___GFP_SKIP_ZERO		= __GFP_SKIP_ZERO;
+const gfp_t RUST_CONST_HELPER___GFP_NOFAIL		= __GFP_NOFAIL;
+
+/* a notifier's answer, as reconcile's power supply notifier gives it */
+const int RUST_CONST_HELPER_NOTIFY_OK			= NOTIFY_OK;
+
+/* room for one symbol as kallsyms prints it, util/backtrace.rs's frames */
+const size_t RUST_CONST_HELPER_KSYM_SYMBOL_LEN		= KSYM_SYMBOL_LEN;
+
+/* how a directory was opened: the cookies vfs/dir.rs's readdir hands out */
+const fmode_t RUST_CONST_HELPER_FMODE_32BITHASH		= FMODE_32BITHASH;
+const fmode_t RUST_CONST_HELPER_FMODE_64BITHASH		= FMODE_64BITHASH;
+/* and a regular file's: vfs/file.rs's open */
+const fmode_t RUST_CONST_HELPER_FMODE_CAN_ODIRECT		= FMODE_CAN_ODIRECT;
+
+/* the VFS's own ioctl numbers, which vfs/ioctl.rs answers */
+const unsigned int RUST_CONST_HELPER_FS_IOC_GETVERSION	= FS_IOC_GETVERSION;
+const unsigned int RUST_CONST_HELPER_FS_IOC_GETFSLABEL	= FS_IOC_GETFSLABEL;
+const unsigned int RUST_CONST_HELPER_FS_IOC_SETFSLABEL	= FS_IOC_SETFSLABEL;
+const unsigned int RUST_CONST_HELPER_FS_IOC_SETVERSION	= FS_IOC_SETVERSION;
+const unsigned int RUST_CONST_HELPER_FS_IOC_GETFLAGS	= FS_IOC_GETFLAGS;
+const unsigned int RUST_CONST_HELPER_FS_IOC_SETFLAGS	= FS_IOC_SETFLAGS;
+const unsigned int RUST_CONST_HELPER_FS_IOC32_GETFLAGS	= FS_IOC32_GETFLAGS;
+const unsigned int RUST_CONST_HELPER_FS_IOC32_SETFLAGS	= FS_IOC32_SETFLAGS;
+const unsigned int RUST_CONST_HELPER_FS_IOC32_GETVERSION	= FS_IOC32_GETVERSION;
+
+/* a dentry's: dentry_flags, an enum, in d_flags, an unsigned int */
+const unsigned int RUST_CONST_HELPER_DCACHE_OP_HASH	= DCACHE_OP_HASH;
+const unsigned int RUST_CONST_HELPER_DCACHE_OP_COMPARE	= DCACHE_OP_COMPARE;
+
+/* a path lookup's flag, and a superblock's: vfs/ioctl.rs's subvolume create */
+const unsigned int RUST_CONST_HELPER_LOOKUP_FOLLOW	= LOOKUP_FOLLOW;
+const unsigned long RUST_CONST_HELPER_SB_POSIXACL	= SB_POSIXACL;
+const unsigned int RUST_CONST_HELPER__IOC_NONE		= _IOC_NONE;
+const unsigned int RUST_CONST_HELPER__IOC_READ		= _IOC_READ;
+const unsigned int RUST_CONST_HELPER__IOC_WRITE		= _IOC_WRITE;
+const unsigned int RUST_CONST_HELPER__IOC_NRSHIFT	= _IOC_NRSHIFT;
+const unsigned int RUST_CONST_HELPER__IOC_TYPESHIFT	= _IOC_TYPESHIFT;
+const unsigned int RUST_CONST_HELPER__IOC_SIZESHIFT	= _IOC_SIZESHIFT;
+const unsigned int RUST_CONST_HELPER__IOC_DIRSHIFT	= _IOC_DIRSHIFT;
+const unsigned int RUST_CONST_HELPER__IOC_NRMASK	= _IOC_NRMASK;
+const unsigned int RUST_CONST_HELPER__IOC_TYPEMASK	= _IOC_TYPEMASK;
+const unsigned int RUST_CONST_HELPER__IOC_SIZEMASK	= _IOC_SIZEMASK;
+
+const __poll_t RUST_CONST_HELPER_EPOLLIN		= EPOLLIN;
+const __poll_t RUST_CONST_HELPER_EPOLLOUT		= EPOLLOUT;
+const __poll_t RUST_CONST_HELPER_EPOLLERR		= EPOLLERR;
+const __poll_t RUST_CONST_HELPER_EPOLLHUP		= EPOLLHUP;
+
+/* lz4's compression workspace: a sizeof() */
+const size_t RUST_CONST_HELPER_LZ4_MEM_COMPRESS		= LZ4_MEM_COMPRESS;
+
+/* jiffies a second, os/linux_kernel/kernel.rs's */
+const unsigned long RUST_CONST_HELPER_HZ		= HZ;
+
+/* locking/noio.rs's: the holes pf_memalloc.h picked, as C has them */
+const unsigned int RUST_CONST_HELPER_PF_MEMALLOC_NORECLAIM	= PF_MEMALLOC_NORECLAIM;
+const unsigned int RUST_CONST_HELPER_PF_MEMALLOC_NOWARN	= PF_MEMALLOC_NOWARN;
+#endif
+
+static inline struct folio *rust_page_folio(struct page *page)
+{
+	return page_folio(page);
+}
+
+/* a macro before 6.18 */
+static inline unsigned long rust_folio_page_idx(struct folio *folio, struct page *page)
+{
+	return folio_page_idx(folio, page);
+}
+
+#ifdef CONFIG_COMPAT
+/*
+ * compat_ptr()'s compat_uptr_t is the kernel crate's only with CONFIG_COMPAT:
+ * a binding of it would name a type there isn't
+ */
+static inline void __user *rust_compat_ptr(u32 uptr)
+{
+	return compat_ptr(uptr);
+}
+#endif
+
+/* alloc_hooks()'s macro; from 6.19 it takes a mempolicy */
+static inline struct folio *rust_filemap_alloc_folio(gfp_t gfp, unsigned int order)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,19,0)
+	return filemap_alloc_folio(gfp, order);
+#else
+	return filemap_alloc_folio(gfp, order, NULL);
+#endif
+}
+
+/* in a union in struct folio, which bindgen names by number */
+static inline struct address_space *rust_folio_mapping(struct folio *folio)
+{
+	return folio->mapping;
+}
+
+/* a macro: */
+static inline void rust_folio_start_writeback(struct folio *folio)
+{
+	folio_start_writeback(folio);
+}
+
+/* fs.h's IS_SYNC(), a macro */
+static inline bool rust_is_sync(struct inode *inode)
+{
+	return IS_SYNC(inode);
+}
+
+static inline bool rust_page_highmem(struct page *page)
+{
+	return PageHighMem(page);
+}
+
+/* a macro, a static inline or exported, by the configuration */
+static inline void *rust_page_address(struct page *page)
+{
+	return page_address(page);
+}
+
+/*
+ * A bio's pages mapped as one buffer: PAGE_KERNEL isn't a constant - on x86
+ * it has the memory encryption mask.
+ */
+static inline void *rust_vmap(struct page **pages, unsigned int count)
+{
+	return vmap(pages, count, VM_MAP, PAGE_KERNEL);
+}
+
+/* macros: what tracepoint.rs's tracepoints and their probes run under */
+static inline void rust_preempt_disable_notrace(void)
+{
+	preempt_disable_notrace();
+}
+
+static inline void rust_preempt_enable_notrace(void)
+{
+	preempt_enable_notrace();
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7,0,0)
+/*
+ * a tracepoint's read side from 7.0: srcu_read_lock_fast_notrace()'s __percpu
+ * pointer, which bindgen's wrapper would declare without its address space, as
+ * a cookie
+ */
+static inline unsigned long rust_srcu_read_lock_fast_notrace(struct srcu_struct *ssp)
+{
+	return (unsigned long) srcu_read_lock_fast_notrace(ssp);
+}
+
+static inline void rust_srcu_read_unlock_fast_notrace(struct srcu_struct *ssp, unsigned long scp)
+{
+	srcu_read_unlock_fast_notrace(ssp, (struct srcu_ctr __percpu *) scp);
+}
+#endif
+
+#ifdef CONFIG_PERF_EVENTS
+/* perf_arch_fetch_caller_regs(), a macro: where a perf probe's callchain starts */
+static inline void rust_perf_fetch_caller_regs(struct pt_regs *regs)
+{
+	perf_fetch_caller_regs(regs);
+}
+#endif
+
+/* dereference_key_locked() is a macro: a user key's payload, its sem held */
+static inline const void *rust_user_key_data(struct key *key, unsigned short *len)
+{
+	const struct user_key_payload *ukp = dereference_key_locked(key);
+
+	*len = ukp->datalen;
+	return ukp->data;
+}
+
+#endif /* _BCACHEFS_CODEGEN_H */
