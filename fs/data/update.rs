@@ -1,0 +1,903 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! A data update reads an extent's data and writes it somewhere new - to move
+//! it, add replicas, recompress or scrub it - then replaces the old pointers
+//! in the extent with the new ones (update_index.rs).
+//!
+//! init(), in the caller's transaction, takes everything an update holds: its
+//! in-flight table entry, device refs, nocow locks, a disk reservation, and
+//! the pages its bios share. exit() gives all of it back. Between them the
+//! caller reads into rbio, and read_done() decides whether there's a write.
+//!
+//! The read and write paths hold pointers into the update - into rbio, op and
+//! wbio - so it doesn't move after init(). It's freed an RCU grace period
+//! after exit(), as in-flight table lookups may still be reading its key.
+//!
+//! The in-flight table allows one update per position, except that copygc
+//! conflicts only with copygc: promotes and reconcile mustn't hold up bucket
+//! evacuation. Inserting fails if the key is already there, so two updates
+//! can't both pass the check.
+
+#![allow(non_camel_case_types)]
+
+use crate::alloc::capacity::DiskReservation;
+use crate::alloc::foreground::AllocWait;
+use crate::alloc::disk_groups::Target;
+use crate::btree::bkey::{BkeyS, BkeySC, BkeyV};
+use crate::btree::iter::{is_restart, lockrestart_do, trans_commit_do, BtreeIter, BtreeIterFlags, BtreeTrans,
+                         CommitFlags, TransAttempt, UpdateTriggerFlags};
+use crate::c;
+use crate::c::Errcode;
+use crate::data::durability::{drop_extra_durability, drop_extra_ec_durability, extent_ptr_durability,
+                               BkeyVDurability};
+use crate::data::moving::Moving;
+use crate::data::scrub_journal;
+use crate::data::nocow_locking::{self, NocowKind};
+use crate::data::ptrs::{brand, BkeyVPtrs, Ptrs, PtrsMut};
+use crate::errcode::{ret_to_c, ret_to_result_void, BchError};
+use crate::fs::Fs;
+use crate::util::alloc::{init_at, Box, Flags, KVec, Kmalloc};
+use crate::util::bio::{pages, Bio, BioInPlace, HasBio};
+use crate::sb::members::DevRef;
+use crate::data_structures::cuckoo::{Cuckoo, Entry, RegisterError, Registration};
+use crate::locking::MemallocFlags;
+use crate::os::kernel::unlikely;
+use crate::util::rcu::read_lock;
+use crate::util::{Printbuf, ToText};
+use crate::util::log::should_print_err;
+use crate::{bch_err_ratelimited, here_str, prt};
+use crate::debug::trace::events;
+use core::ffi::{c_int, c_uint};
+use core::ptr::NonNull;
+use core::sync::atomic::Ordering::Relaxed;
+use cstruct_macros::{MaybeZeroable, bitfield, bch_enum, BitfieldMembers};
+use c::DataUpdateType as Type;
+use crate::data::read::{ReadFor, ReadDone, Rbio};
+use core::sync::atomic::AtomicBool;
+use nestify::nest;
+use crate::format::{Bpos, Btree, CompressionType};
+
+#[bch_enum(closed)]
+#[repr(u32)]
+pub enum DataUpdateType {
+    other,
+    copygc,
+    reconcile,
+    promote,
+    self_heal,
+    scrub,
+    scrub_no_repair,
+}
+
+/*
+ * @target: where the new copy goes. Movers rewriting existing data want the
+ * extent's background_target here: unset doesn't mean "no preference", it means
+ * "anywhere", which drags data off its tier.
+ *
+ * It also decides the disk label of any erasure coded stripe the write creates
+ * (bch2_ec_stripe_head_get()), and that label is stamped into the stripe on
+ * disk permanently, where 0 means every device in the filesystem - so a mover
+ * that leaves this unset doesn't just misplace one extent, it creates a stripe
+ * that will keep widening onto devices the data was never supposed to touch.
+ */
+nest! {
+    #[repr(C)]
+    #[derive(Clone, Copy, MaybeZeroable, BitfieldMembers)]
+    pub struct data_update_opts {
+        pub type_: c::DataUpdateType,
+        pub ptrs_io_error: u16,
+        pub ptrs_kill: u16,
+        pub ptrs_kill_ec: u16,
+        pub extra_replicas: u8,
+        pub target: u16,
+        #[members]
+        #>[bitfield(u8)]
+        pub bits: pub struct data_update_opts_bits {
+            no_devs_have:      bool,
+            checksum_paranoia: bool,
+            __pad:             u6,
+        },
+
+        pub read_dev: c_uint,
+        pub read_flags: c::ReadFlags,
+        pub write_flags: c::WriteFlags,
+        pub commit_flags: c::TransCommitFlags,
+    }
+}
+
+/// An update's key in the in-flight table: where it is, and whether it's
+/// copygc's - so one of each can be in flight at a position.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, MaybeZeroable)]
+pub struct data_update_key {
+    pub btree: Btree,
+    pub pos: Bpos,
+    pub copygc: bool,
+}
+
+/// What a data update's write reads of it, for its index update: the extent
+/// it rewrites - its btree and old key - what it does to it, and the moving
+/// context it's counted in.
+#[repr(C)]
+#[derive(MaybeZeroable)]
+pub struct data_update_index {
+    /* extent being updated: */
+    pub btree_id: Btree,
+    pub k: c::bkey_buf,
+    pub opts: c::data_update_opts,
+    pub ctxt: *mut crate::data::moving::MovingContext,
+}
+
+// borrowed by its write, on whatever thread that runs: @ctxt, its one raw
+// pointer, is to a moving context that outlives the update
+unsafe impl Sync for c::data_update_index {}
+
+#[repr(C)]
+#[derive(MaybeZeroable)]
+pub struct data_update {
+    pub rcu: c::rcu_head,
+    pub index: c::data_update_index,
+
+    /* read by the in-flight listing, racily */
+    pub read_done: AtomicBool,
+    /* its key in c->update_table, while it's in: Held's in_flight */
+    pub in_flight_key: c::data_update_key,
+
+    /* associated with @index.ctxt: its index in the context's updates */
+    pub io_seq: u64,
+
+    pub rbio: Rbio,
+    pub op: c::bch_write_op,
+    pub wbio: Bio,
+    pub bvecs: Option<Box<[c::bio_vec], Kmalloc>>,
+}
+
+/// The read failed only because the extent changed under it - the key was
+/// gone on retry, or the bucket's gen moved - so no data was lost.
+pub fn read_err_benign(e: BchError) -> bool {
+    e.matches(Errcode::data_read_key_overwritten) ||
+        e.matches(Errcode::data_read_ptr_stale_race)
+}
+
+/// Whether a failure is traced as a data_update_fail event. Routine failures
+/// aren't: in-flight collisions, need_copygc, blocked and would_block, and
+/// no_rw_devs for reconcile and promote, which wait on the pending list.
+/// ec_alloc_failed waits there too, but its transient subtypes and
+/// ec_alloc_failed_pending_race don't, and are traced.
+pub fn fail_should_trace(type_: Type, e: BchError) -> bool {
+    let parks = matches!(type_, Type::reconcile | Type::promote) &&
+        e.matches(Errcode::data_update_fail_no_rw_devs);
+
+    !(e.matches(Errcode::data_update_fail_in_flight) ||
+      e.matches(Errcode::data_update_fail_need_copygc) ||
+      e.matches(Errcode::data_update_fail_would_block) ||
+      e.matches(Errcode::operation_blocked) ||
+      (e.matches(Errcode::ec_alloc_failed) &&
+       !e.matches(Errcode::ec_alloc_failed_transient)) ||
+      parks)
+}
+
+// ── In flight ────────────────────────────────────────────────────────────
+
+pub(crate) type InFlightTable = Cuckoo<Entry<c::data_update_key>>;
+
+/// An update's place in the in-flight table, at its in_flight_key.
+pub(crate) type InFlightReg = Registration<c::data_update_key, c::data_update_key>;
+
+impl c::data_update_key {
+    fn new(pos: c::bbpos, type_: Type) -> Self {
+        c::data_update_key { btree: pos.btree, pos: pos.pos, copygc: type_ == Type::copygc }
+    }
+}
+
+impl Fs {
+    /// Whether an update in flight at @pos conflicts with a new one of @type_:
+    /// a new copygc update conflicts only with copygc, anything else with any.
+    pub fn data_update_in_flight(&self, pos: c::bbpos, type_: Type) -> bool {
+        let key = c::data_update_key::new(pos, type_);
+        self.update_table.contains(&key) ||
+            (!key.copygc && self.update_table.contains(&c::data_update_key { copygc: true, ..key }))
+    }
+
+    /// Adds @m to the in-flight table, or fails with data_update_fail_in_flight.
+    /// If the table can't grow, @m goes ahead untracked rather than failing.
+    pub fn data_update_in_flight_add(&self, m: &mut c::data_update, pos: c::bbpos)
+        -> Result<Option<InFlightReg>, BchError>
+    {
+        let type_ = m.index.opts.type_;
+        if !self.data_update_in_flight(pos, type_) {
+            m.in_flight_key = c::data_update_key::new(pos, type_);
+            // SAFETY: an update is freed a grace period after it's done, and
+            // in_flight_key is written only here, before it's inserted; the
+            // table is the filesystem's, which outlives its updates
+            let reg = {
+                let _noreclaim = MemallocFlags::noreclaim();
+                unsafe { Registration::register(&self.update_table, m.in_flight_key, NonNull::from(&m.in_flight_key)) }
+            };
+            match reg {
+                Ok(r) => return Ok(Some(r)),
+                Err(RegisterError::Exists) => {} // raced: another of its kind just went in
+                Err(RegisterError::Alloc) => return Ok(None),
+            }
+        }
+        self.event_inc(events::data_update_in_flight);
+        self.throw(Errcode::data_update_fail_in_flight)
+    }
+}
+
+/// What an update holds from init() to exit(), released as it's dropped, in
+/// no order that matters: its in-flight entry, its nocow locks, a ref on each
+/// pointer's device - what the nocow locks were worked out from, not
+/// c->devs[], which a device removal may clear while the ref pins the device.
+pub(crate) struct Held {
+    in_flight: Option<InFlightReg>,
+    nocow:     Option<nocow_locking::Locked>,
+    devs:      [Option<DevRef>; c::BCH_BKEY_PTRS_MAX as usize],
+}
+
+// ── To text ──────────────────────────────────────────────────────────────
+
+pub(crate) fn ptr_bits_to_text(out: &mut Printbuf, bits: u16, name: &str) {
+    if bits != 0 {
+        prt!(out, "{name} ptrs:\t{bits:b}");
+        out.newline();
+    }
+}
+
+impl Fs {
+    #[cold]
+    pub fn data_update_opts_to_text(&self, out: &mut Printbuf, io_opts: &c::bch_inode_opts,
+                                    data_opts: &c::data_update_opts) {
+        if out.nr_tabstops() == 0 {
+            out.tabstop_push(20);
+        }
+
+        prt!(out, "{}", data_opts.type_.name());
+        out.newline();
+
+        ptr_bits_to_text(out, data_opts.ptrs_io_error, "io error");
+        ptr_bits_to_text(out, data_opts.ptrs_kill, "kill");
+        ptr_bits_to_text(out, data_opts.ptrs_kill_ec, "kill ec");
+
+        prt!(out, "target:\t");
+        self.target_to_text(out, Target::decode(data_opts.target.into()));
+        out.newline();
+
+        prt!(out, "extra replicas:\t{}", data_opts.extra_replicas);
+        out.newline();
+
+        // an unset read_dev is -1
+        prt!(out, "read_dev:\t{}\n", data_opts.read_dev as i32);
+        prt!(out, "checksum_paranoia:\t{}\n", u8::from(data_opts.bits.checksum_paranoia()));
+
+        prt!(out, "io path options:\t");
+        crate::inode_opts::opts_to_text(out, self, io_opts);
+        out.newline();
+    }
+}
+
+
+impl c::data_update_index {
+    /// The update, @op its write.
+    #[cold]
+    pub(crate) fn to_text(&self, out: &mut Printbuf, op: &c::bch_write_op) {
+        let fs = op.fs();
+        fs.data_update_opts_to_text(out, &op.opts, &self.opts);
+        out.newline();
+
+        prt!(out, "old key:\t{}", BkeySC::from(self.k.key()).to_text(fs));
+        out.newline();
+
+        prt!(out, "write: ");
+        crate::data::write::__write_op_to_text(out, op);
+    }
+}
+
+impl ToText for c::data_update {
+    #[cold]
+    fn to_text(&self, out: &mut Printbuf) {
+        self.index.to_text(out, &self.op);
+    }
+}
+
+#[cold]
+pub fn data_update_inflight_to_text(out: &mut Printbuf, m: &c::data_update) {
+    let fs = m.op.fs();
+    prt!(out, "{}", BkeySC::from(m.index.k.key()).to_text(fs));
+    out.newline();
+
+    let mut out = out.indent(2);
+    fs.data_update_opts_to_text(&mut out, &m.op.opts, &m.index.opts);
+
+    if !m.read_done.load(Relaxed) {
+        prt!(out, "read:\n");
+        let mut out = out.indent(2);
+        m.rbio.to_text(&mut out);
+    } else {
+        prt!(out, "write:\n");
+        let mut out = out.indent(2);
+        crate::data::write::__write_op_to_text(&mut out, &m.op);
+    }
+}
+
+// ── init, read_done, exit ────────────────────────────────────────────────
+
+/// IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0): background IO yields to everyone else's.
+pub(crate) const IOPRIO_IDLE: u16 = 3 << 13;
+
+/// Both scrub types read to check, and must never rewrite what they're checking.
+pub(crate) fn is_scrub(t: Type) -> bool {
+    matches!(t, Type::scrub | Type::scrub_no_repair)
+}
+
+impl c::data_update_opts {
+    /// A checksummed extent with unchecksummed pointers: we mustn't apply the
+    /// existing checksum to unchecksummed data, or lose the ability to tell
+    /// that replicas differ. So read from the replica being rewritten, and
+    /// rewrite only that one.
+    fn checksummed_and_non_checksummed_handling(&mut self, fs: &Fs, k: BkeySC<'_>) {
+        let Some(kp) = k.arm::<Ptrs>() else { return };
+
+        let paranoia = self.bits.checksum_paranoia() || kp.ptrs_decoded(fs).any(|d| d.p.crc.csum_type == c::CsumType::none);
+        self.bits.set_checksum_paranoia(paranoia);
+        if !paranoia {
+            return;
+        }
+
+        let mut rewrite_found = false;
+        for (i, ptr) in kp.ptrs(fs).enumerate() {
+            let bit = 1u16 << i;
+            if bit & self.ptrs_kill != 0 && ptr.cached() == 0 {
+                if !rewrite_found {
+                    rewrite_found = true;
+                    self.read_dev = ptr.dev().into();
+                } else {
+                    self.ptrs_kill &= !bit;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn dev_ptr_bit(fs: &Fs, k: BkeySC<'_>, dev: u32) -> u32 {
+    k.arm::<Ptrs>()
+        .and_then(|k| k.ptrs(fs).position(|ptr| u32::from(ptr.dev()) == dev))
+        .map_or(0, |i| 1 << i)
+}
+
+/// For an update with nothing to write: drops @k's killed pointers and extra
+/// cached pointers, and commits.
+fn extent_drop_ptrs(t: &TransAttempt<'_, '_>, iter: &BtreeIter<'_>, k: BkeySC<'_>,
+                    io_opts: &c::bch_inode_opts, data_opts: &c::data_update_opts) -> Result<(), BchError> {
+    let fs = t.fs();
+    // an extents btree update always wants a reservation passed in
+    let res = DiskReservation::new(fs);
+    let mut n = t.bkey_make_mut_noupdate(k)?;
+
+    if let Some(kp) = BkeyS::from(&mut n).arm::<PtrsMut>() {
+        brand(kp, |mut kp| -> Result<(), BchError> {
+            if data_opts.ptrs_kill_ec != 0 {
+                let m = kp.assume(fs, data_opts.ptrs_kill_ec.into());
+                drop_extra_ec_durability(t, io_opts, &mut kp, m)?;
+            }
+            if data_opts.ptrs_kill != 0 {
+                let m = kp.assume(fs, data_opts.ptrs_kill.into());
+                drop_extra_durability(t, io_opts, kp, m, false)?;
+            }
+            Ok(())
+        })?;
+    }
+
+    // An extent left with no pointers is normalized into what it should be -
+    // KEY_TYPE_error, or a discard for a cached one
+    if let Some(mut kp) = BkeyS::from(&mut n).arm::<Ptrs>() {
+        kp.drop_extra_cached_ptrs(fs, io_opts);
+    }
+
+    // We're not inserting through an extent iterator - an all_snapshots
+    // iterator isn't one - so a deletion takes the plain key deletion path,
+    // not the extent overwrite path
+    if n.k().key_type().is_deleted() && !iter.iter_flags().contains(BtreeIterFlags::IS_EXTENTS) {
+        n.k_mut().size = 0;
+    }
+
+    t.relock()?;
+    t.update(iter, &n, UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE)?;
+    t.commit(Some(&res), CommitFlags::NO_ENOSPC)
+}
+
+impl c::data_update {
+    fn fs(&self) -> &'static Fs {
+        self.op.fs()
+    }
+
+    fn key(&self) -> BkeySC<'_> {
+        BkeySC::from(self.index.k.key())
+    }
+
+    /// The read and write bios share bvecs and pages: the write writes what
+    /// the read filled in.
+    fn bios_init(&mut self, io_opts: &c::bch_inode_opts, buf_bytes: u32) -> Result<(), BchError> {
+        let fs = self.fs();
+        let block_size = u32::from(fs.opts().block_size.get());
+        let buf_bytes = buf_bytes.next_multiple_of(block_size);
+        let nr_vecs = pages::nr_vecs(buf_bytes as usize);
+
+        let bvecs = KVec::from_elem(c::bio_vec::default(), nr_vecs as usize).map_err(|_| BchError::from(c::ENOMEM))?;
+        let bvecs = self.bvecs.insert(bvecs.into_boxed_slice()).as_mut_ptr();
+
+        // SAFETY: its bios, and the bvecs just made for them
+        unsafe {
+            Bio::init_borrowed(self.rbio.bio.as_ptr().cast(), core::ptr::null_mut(), bvecs, nr_vecs as u16,
+                               c::req_op_REQ_OP_READ);
+            Bio::init_borrowed(&raw mut self.wbio, core::ptr::null_mut(), bvecs, nr_vecs as u16, 0);
+        }
+        if pages::alloc_pages(self.wbio.raw_mut(), block_size, buf_bytes as usize, Flags::empty()).is_err() {
+            self.bios_free();
+            return Err(c::ENOMEM.into());
+        }
+
+        let read_for = if self.index.opts.type_ == Type::scrub {
+            ReadFor::BCH_READ_FOR_scrub
+        } else {
+            ReadFor::BCH_READ_FOR_update
+        };
+        let rbio = Rbio::update(*io_opts, read_for, unsafe { BioInPlace::at(self.rbio.bio.as_ptr()) });
+        if let Err(e) = unsafe { init_at(rbio, &raw mut self.rbio) } {
+            self.bios_free();
+            return Err(e);
+        }
+
+        let iter = c::bvec_iter { bi_sector: self.key().k.start_offset(), bi_size: buf_bytes, ..Default::default() };
+        unsafe { self.rbio.bio.get_mut().set_iter(iter) };
+        self.wbio.set_ioprio(IOPRIO_IDLE);
+        Ok(())
+    }
+
+    /// The write bio's pages and the bvecs bios_init() made, freed.
+    fn bios_free(&mut self) {
+        // SAFETY: the pages are alloc_pages()'s; neither bio is in flight
+        unsafe { pages::free_pages_pool(&self.fs().bio_bounce, self.wbio.raw_mut()) };
+        self.bvecs = None;
+    }
+
+    fn trace(&self, ret: c_int) {
+        let fs = self.fs();
+        let size = u64::from(self.key().k.size);
+        match ret_to_result_void(ret) {
+            Ok(()) => fs.event_add_trace(events::data_update, size, |out| self.to_text(out)),
+            Err(e) if e.matches(Errcode::data_update_done) =>
+                fs.event_add_trace(events::data_update_no_io, size, |out| {
+                    self.to_text(out);
+                    prt!(out, "\nret:\t{e}\n");
+                }),
+            Err(e) if fail_should_trace(self.index.opts.type_, e) =>
+                fs.event_add_trace(events::data_update_fail, size, |out| {
+                    self.to_text(out);
+                    prt!(out, "\nret:\t{e}\n");
+                }),
+            Err(_) => {}
+        }
+    }
+
+    /// An unwritten extent has no data to move: unwritten space is allocated
+    /// at the destination a piece at a time, each piece's index update done as
+    /// it's allocated. Runs transactions of its own.
+    fn update_unwritten_extent(&mut self, trans: &BtreeTrans<'_>) -> Result<(), BchError> {
+        let fs = self.fs();
+
+        let end = self.key().k.p;
+        while self.op.pos < end {
+            let ours = BkeySC::from(self.index.k.key());
+            if !lockrestart_do(trans, |t| {
+                let mut iter = BtreeIter::new(t, self.index.btree_id, self.op.pos, BtreeIterFlags::SLOTS);
+                let k = iter.peek_slot(t)?.expect("a slot always has a key");
+                Ok(crate::data::ptrs::extents_match(fs, k, ours))
+            })? {
+                break;
+            }
+
+            let r = lockrestart_do(trans, |t| {
+                let op = &mut self.op;
+                let nr = op.bits.nr_replicas().into();
+                let mut req = t.alloc_request(op.target.into(), false, Some(&op.devs_have), nr, nr,
+                                              c::Watermark::from_bits(op.bits.watermark().into()),
+                                              op.flags(), AllocWait::Sync(None))?;
+                match t.alloc_sectors(&mut req, op.write_point) {
+                    Err(e) if e.matches(Errcode::operation_blocked) => {
+                        t.wait_on_allocator(&mut req, e)?;
+                        Err(e)
+                    }
+                    r => r,
+                }
+            });
+            let wp = match r {
+                Ok(wp) => wp,
+                Err(e) if e.matches(Errcode::operation_blocked) => continue,
+                Err(e) => {
+                    if should_print_err(&e) {
+                        bch_err_ratelimited!(fs, "{}: error allocating for an unwritten extent: {e}",
+                                             here_str!());
+                    }
+                    return Err(e);
+                }
+            };
+            let op = &mut self.op;
+            op.insert_keys.reserve(c::BKEY_EXTENT_U64s_MAX as usize)?;
+            let (pos, obs) = (op.pos, &mut op.open_buckets);
+            let sectors = op.insert_keys.push_with(c::BKEY_EXTENT_U64s_MAX as usize, |k| {
+                wp.unwritten_extent(k, pos, (end.offset - pos.offset) as u32, obs)
+            });
+            op.pos.offset += u64::from(sectors);
+
+            let r = crate::data::update_index::index_update(trans, &mut self.op, &self.index);
+            drop(self.op.open_buckets.drain(fs));
+            r?;
+        }
+        Ok(())
+    }
+
+    /// Sets the update up against @k, in @t's attempt; @iter points at @k, and
+    /// a promote has none. On error everything taken has been given back, and
+    /// data_update_done_* means there's nothing to read.
+    ///
+    /// # Safety
+    /// The update is zeroed, and doesn't move until exit().
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn init(&mut self, t: &TransAttempt<'_, '_>, iter: Option<&BtreeIter<'_>>, moving: Option<&Moving<'_>>,
+                   wp: c::write_point_specifier, io_opts: &c::bch_inode_opts, data_opts: c::data_update_opts,
+                   btree_id: Btree, k: BkeySC<'_>) -> Result<Held, BchError> {
+        let fs = t.fs();
+        let pos = c::bbpos {
+            btree: iter.map_or(Btree::extents, |i| i.btree()),
+            pos:   k.k.p,
+        };
+
+        // SAFETY: the caller's: it stays where it is
+        unsafe { self.index.k.init() };
+        self.index.k.reassemble(k);
+
+        self.index.btree_id = btree_id;
+        self.index.opts = data_opts;
+        self.index.ctxt = moving.map_or(core::ptr::null_mut(), Moving::raw);
+
+        // SAFETY: an update is done before the filesystem goes
+        unsafe { c::bch_write_op::init_at(&raw mut self.op, fs, *io_opts) };
+        self.op.pos = self.index.k.key().k().start_pos();
+        self.op.version = self.index.k.key().k().bversion;
+        self.op.target = data_opts.target;
+        self.op.write_point = wp;
+        use c::WriteFlags as w;
+        self.op.set(w::pages_stable | w::pages_owned | w::data_encoded |
+                    w::update | data_opts.write_flags);
+        self.op.bits.set_compression_opt(io_opts.background_compression);
+        let watermark = (data_opts.commit_flags.bits() & c::BCH_WATERMARK_MASK)
+            .max(c::Watermark::normal as u32);
+        self.op.bits.set_watermark(watermark as u8);
+
+        let ret = self.init_body(t, iter, io_opts, pos);
+
+        if let Err(e) = &ret {
+            if !is_restart(e) {
+                self.trace(ret_to_c(Err::<(), _>(*e)));
+            }
+            self.op.res.put();
+            self.index.k.exit();
+        }
+        ret
+    }
+
+    /// On error, Held's guards - locals till it returns - are dropped; init()
+    /// gives back the rest.
+    fn init_body(&mut self, t: &TransAttempt<'_, '_>, iter: Option<&BtreeIter<'_>>,
+                 io_opts: &c::bch_inode_opts, pos: c::bbpos) -> Result<Held, BchError> {
+        let fs = self.fs();
+        let mut held = Held { in_flight: None, nocow: None, devs: Default::default() };
+        let type_ = self.index.opts.type_;
+        let k = BkeySC::from(self.index.k.key());
+
+        let snapshot = k.k.p.snapshot;
+        if type_ != Type::scrub_no_repair && snapshot != 0 && unlikely(!fs.snapshots.exists(snapshot)) {
+            let r = match crate::snapshots::check_snapshots::check_key_has_snapshot(t, iter, k) {
+                Ok(false) => Ok(()),
+                // the key was deleted
+                Ok(true) => t.commit(Some(&self.op.res), CommitFlags::NO_ENOSPC)
+                    .and_then(|()| fs.throw(Errcode::data_update_fail_no_snapshot)),
+                Err(e) => Err(e),
+            };
+            // can't repair yet, waiting on other recovery passes
+            r.map_err(|e| if e.matches(Errcode::recovery_will_run) {
+                fs.err(Errcode::data_update_fail_no_snapshot)
+            } else {
+                e
+            })?;
+        }
+
+        if self.index.opts.extra_replicas != 0 {
+            // the reservation's first charge: the op's init() made it empty
+            self.op.res.add(k.k.size.into(), self.index.opts.extra_replicas.into(), c::ReservationFlags::empty())?;
+        }
+
+        if self.index.opts.ptrs_kill != 0 && self.op.opts.data_checksum != 0 {
+            self.index.opts.checksummed_and_non_checksummed_handling(fs, k);
+        }
+
+        let mut buf_bytes = 0u32;
+        let mut unwritten = false;
+        let mut keeping = 0u32;
+        if let Some(kp) = k.arm::<Ptrs>() {
+            let mut bit = 1u32;
+            for d in kp.ptrs_decoded(fs) {
+                let p = &d.p;
+                if bit & u32::from(self.index.opts.ptrs_kill) == 0 {
+                    keeping += if bit & u32::from(self.index.opts.ptrs_kill_ec) != 0 {
+                        fs.dev_durability(p.ptr.dev().into(), &read_lock())
+                    } else {
+                        extent_ptr_durability(t, p)?
+                    };
+                    if !self.index.opts.bits.no_devs_have() && p.ptr.cached() == 0 {
+                        self.op.devs_have.add(p.ptr.dev());
+                    }
+                }
+
+                // An encrypted extent must stay encrypted - but only its class
+                // is forced, not its exact type: reconcile must be able to
+                // change the MAC width, or a wide_macs change livelocks it
+                let csum = p.crc.csum_type.get();
+                if csum.is_encryption() {
+                    self.op.nonce = (u32::from(p.crc.nonce) + u32::from(p.crc.offset)) as u16;
+                    if !self.op.bits.csum_type().is_encryption() {
+                        self.op.bits.set_csum_type(csum);
+                    }
+                }
+
+                if p.crc.compression_type == CompressionType::incompressible {
+                    self.op.bits.set_incompressible(1);
+                }
+
+                buf_bytes = buf_bytes.max(p.crc.uncompressed_size << 9);
+                unwritten |= p.ptr.unwritten() != 0;
+                bit <<= 1;
+            }
+        }
+
+        if !is_scrub(type_) {
+            // A move that only relocates keeps its old pointers if the write
+            // comes up short, so a short write isn't degraded; one restoring
+            // lost durability needs every copy it asks for
+            let d = k.durability(t)?;
+            if d.online >= io_opts.data_replicas {
+                self.op.set(c::WriteFlags::replicas_best_effort);
+            }
+
+            // Short of data_replicas, don't rereplicate up to it unless
+            // extra_replicas asks: rereplicating is an explicit operation, so
+            // users don't get an unexpected ENOSPC
+            let mut nr = (i32::from(io_opts.data_replicas) - keeping as i32).max(0) as u32 +
+                self.op.res.nr_replicas.get();
+            if keeping == 0 {
+                nr = nr.max(1);
+                self.op.clear(c::WriteFlags::cached);
+            }
+            self.op.bits.set_nr_replicas(nr as u8);
+
+            // A self-heal from the read path - no @iter - that kills only
+            // pointers without durability, a cached copy that failed its
+            // checksum, has nothing to write either; but those pointers still
+            // have to go. It runs, and read_done() drops them, through
+            // index_update_nowrite()
+            let drop_only = nr == 0 && iter.is_none() && type_ == Type::self_heal;
+
+            // No new replicas needed: the settings changed since it was
+            // written
+            if nr == 0 && !drop_only {
+                // without @iter, it's a promote
+                if let Some(iter) = iter {
+                    extent_drop_ptrs(t, iter, k, io_opts, &self.index.opts)?;
+                }
+                return fs.throw(Errcode::data_update_done_no_writes_needed);
+            }
+
+            // Check that the write can allocate, rather than failing in
+            // write() after a useless read: alloc_nowait (promotes), a
+            // full or offline target, too little durability on it. Not for a
+            // drop: it doesn't write.
+            if type_ != Type::copygc && !drop_only {
+                fs.data_update_write_feasible(io_opts, &self.index.opts, &self.op.devs_have, k, None)?;
+            }
+
+            match t.allocate_dropping_locks(|| {
+                fs.update_table.make_room().map_err(|_| BchError::from_raw(-(c::ENOMEM as c_int)))
+            }) {
+                Err(e) if !e.matches(c::ENOMEM) => return Err(e),
+                _ => {}
+            }
+            held.in_flight = fs.data_update_in_flight_add(self, pos)?;
+        } else if unwritten {
+            return fs.throw(Errcode::data_update_done_unwritten);
+        }
+
+        let k = BkeySC::from(self.index.k.key());
+        if let Some(kp) = k.arm::<Ptrs>() {
+            for (i, ptr) in kp.ptrs(fs).enumerate() {
+                // the error is a missing device's repair being scheduled
+                held.devs[i] = fs.dev_bkey_tryget(k, ptr.dev().into()).ok().flatten();
+            }
+        }
+
+        if fs.opts().nocow_enabled.get() != 0 {
+            let devs = &held.devs;
+            held.nocow = Some(match nocow_locking::bkey_trylock(fs, k, devs, NocowKind::Copy) {
+                Some(l) => l,
+                None => {
+                    let Some(moving) = self.index.moving() else {
+                        // a promote mustn't block, or they'd pile up
+                        return fs.throw(Errcode::nocow_lock_blocked);
+                    };
+                    // @t's transaction is the mover's own here. Wait for the
+                    // locks, or until nothing we have in flight could release
+                    // them - then block for them with the transaction unlocked
+                    let locked = moving.wait_until(|| match nocow_locking::bkey_trylock(fs, k, devs, NocowKind::Copy) {
+                        Some(l) => Some(Some(l)),
+                        None => moving.updates_idle().then_some(None),
+                    });
+                    locked.unwrap_or_else(|| {
+                        t.unlock();
+                        nocow_locking::bkey_lock(fs, Some(t), k, devs, NocowKind::Copy)
+                    })
+                }
+            });
+        }
+
+        if unwritten {
+            t.ignore_restarts(|trans| self.update_unwritten_extent(trans))?;
+            return fs.throw(Errcode::data_update_done_unwritten);
+        }
+
+        t.unlock();
+
+        self.bios_init(io_opts, buf_bytes)?;
+
+        Ok(held)
+    }
+
+    /// A failed read's error, recorded where the data is: at btree_id, not
+    /// the read path's read_pos, which for an indirect extent is a reflink
+    /// position. A scrub that can't repair queues it for the journal scrub,
+    /// which can't commit - see scrub_journal::queue().
+    #[cold]
+    #[inline(never)]
+    fn read_err_record(&self, e: BchError, pick: Option<&c::extent_ptr_decoded>) {
+        if read_err_benign(e) {
+            return;
+        }
+        let fs = self.fs();
+        if self.index.opts.type_ == Type::scrub_no_repair {
+            let bit = pick.map_or(0, |p| dev_ptr_bit(fs, self.key(), p.ptr.dev().into()));
+            self.found(scrub_journal::queue(fs, self.index.btree_id, 0, self.key(), bit, ret_to_c(Err(e))));
+        } else {
+            let err = crate::data::read::data_read_sb_err(e);
+            let (btree, pos) = (self.index.btree_id, self.key().k.p);
+            let r = trans_commit_do(fs, None, CommitFlags::NO_ENOSPC,
+                                    |t| crate::init::damage::record_key(t, btree, pos, err));
+            if let Err(e) = r {
+                if should_print_err(&e) {
+                    bch_err_ratelimited!(fs, "{}: error recording a data update's read error: {e}",
+                                         here_str!());
+                }
+            }
+        }
+    }
+
+    /// The pointers ptrs_io_error names, that failed to read, killed - their
+    /// durability made up by the write. False if that leaves nothing to
+    /// write: the index update done without one, its result in op.error.
+    #[cold]
+    #[inline(never)]
+    fn ptrs_io_error_kill(&mut self) -> bool {
+        let fs = self.fs();
+        let trans = crate::btree_trans!(fs);
+        let k = BkeySC::from(self.index.k.key());
+        if let Some(kp) = k.arm::<Ptrs>() {
+            let mut nr = u32::from(self.op.bits.nr_replicas());
+            let mut bit = 1u32;
+            for d in kp.ptrs_decoded(fs) {
+                if bit & u32::from(self.index.opts.ptrs_io_error) != 0 && bit & u32::from(self.index.opts.ptrs_kill) == 0 {
+                    if let Ok(dur) = lockrestart_do(&trans, |t| extent_ptr_durability(t, &d.p)) {
+                        nr += dur;
+                    }
+                    self.index.opts.ptrs_kill |= bit as u16;
+                    self.op.devs_have.drop(d.p.ptr.dev());
+                }
+                bit <<= 1;
+            }
+            self.op.bits.set_nr_replicas(nr as u8);
+        }
+
+        if self.op.bits.nr_replicas() == 0 {
+            self.op.error = ret_to_c(crate::data::update_index::index_update_nowrite(&trans, self)) as i16;
+            return false;
+        }
+        true
+    }
+
+    /// Takes @read into the update - the pointers that failed, the extent if
+    /// it was poisoned - and says whether there's a write for write() to
+    /// issue, of what it read, by its replica's crc. There isn't for a failed
+    /// read, a scrub with nothing to repair, or IO errors that leave nothing
+    /// to write: then op.error is the update's result.
+    pub fn read_done(&mut self, read: ReadDone) -> bool {
+        let fs = self.fs();
+        let ReadDone { mut ret, pick, ptrs_io_error, poisoned } = read;
+        let mut crc = pick.map(|p| p.crc);
+        let type_ = self.index.opts.type_;
+
+        self.index.opts.ptrs_io_error |= ptrs_io_error;
+        if let Some(k) = poisoned.as_deref() {
+            self.index.k.reassemble(BkeySC::from(k));
+        }
+
+        // before the bitrot fixup below, which clears ret
+        if let Err(e) = ret {
+            self.read_err_record(e, pick.as_ref());
+        }
+
+        // A bitrotted extent gets a new checksum so it can be moved; its
+        // poison bit keeps reads of it returning errors
+        if unlikely(ret == Err(Errcode::data_read_csum_err.into()) &&
+                    self.key().arm::<Ptrs>().is_some_and(|k| k.poisoned(fs))) {
+            if let Some(crc) = &mut crc {
+                let nonce = crate::data::ptrs::extent_nonce(self.key().k.bversion, crc);
+                // what was read is at the buffer's start, whatever the bio's
+                // iter was left at
+                let data = self.rbio.bio().range().take(crc.compressed_size << 9);
+                crc.csum = fs.checksum_range(crc.csum_type.get(), nonce, data);
+                ret = Ok(());
+            }
+        }
+
+        if let Err(e) = ret {
+            self.op.error = ret_to_c(Err(e)) as i16;
+            return false;
+        }
+        let crc = crc.expect("a data update's read that succeeded, of no replica");
+
+        if type_ == Type::scrub_no_repair {
+            if self.index.opts.ptrs_io_error != 0 {
+                self.found(scrub_journal::queue(fs, self.index.btree_id, 0, self.key(), self.index.opts.ptrs_io_error.into(), 0));
+            }
+            return false;
+        }
+
+        if type_ == Type::scrub && self.index.opts.ptrs_io_error == 0 {
+            return false;
+        }
+
+        if unlikely(self.index.opts.ptrs_io_error != 0) && !self.ptrs_io_error_kill() {
+            return false;
+        }
+
+        assert!(self.wbio.nr_vecs() != 0, "a data update's write bio must own its pages");
+
+        self.op.crc = crc;
+        self.wbio.raw_mut().bi_iter.bi_size = crc.compressed_size << 9;
+        true
+    }
+
+    /// Gives back what init() took: @held, the reservation, its place in its
+    /// moving context's counts - whose waiters are woken after the nocow locks
+    /// go - and the bios' memory.
+    pub(crate) fn exit(&mut self, held: Held, ret: c_int) {
+        self.trace(ret);
+        drop(held);
+        self.op.res.put();
+
+        if let Some(moving) = self.index.moving() {
+            moving.update_done(self.io_seq);
+            moving.wake();
+        }
+
+        self.bios_free();
+    }
+}
+

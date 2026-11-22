@@ -1,0 +1,1178 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! Recovery passes (init/passes.h): the table of them, what the superblock
+//! records of them, scheduling one - from the pass that finds it's needed,
+//! repair found anywhere - and running them, at mount and in the background.
+//!
+//! Each pass's function is defined with the pass, and given to the table by
+//! recovery_pass!().
+//!
+//! Passes are numbered in the order they run; the superblock records them by
+//! stable id, which never changes: in ext's recovery_passes_required, the
+//! passes it needs run, and in the recovery_passes section, when each last ran
+//! and for how long - which ratelimits expensive repairs.
+//!
+//! The runner's state is bch_fs_recovery's, its runs serialized by run_lock:
+//! recovery.runner, a spinlock - taken with interrupts off, as scheduling can
+//! come from where they are - over what only the runner reads, publishing
+//! what others read unlocked, a word at a time.
+
+#![allow(non_camel_case_types)]
+
+use crate::locking::{Locked, Mutex, SpinLockIrq};
+use crate::new_lock;
+use crate::published;
+use crate::util::projections::Volatile;
+use crate::os::workqueue::ReffedWork;
+use cstruct_macros::{placed, MaybeZeroable, Init, TypeInfo, bch_enum};
+use pin_init::pin_data;
+use crate::format::{Btree, SbFeature};
+
+#[bch_enum(flags)]
+#[repr(u32)]
+pub enum RunRecoveryPassFlags {
+    ratelimit = 1 << 0,
+    /*
+     * Schedule in memory only, without taking sb_lock, so it's safe from
+     * contexts that hold btree locks (e.g. triggers): the schedule touches
+     * only in-memory recovery state and never writes the superblock. The
+     * need is re-derivable, so persistence isn't required.
+     */
+    ephemeral = 1 << 1,
+    /*
+     * Don't schedule if the pass already completed successfully this
+     * instance: for callers that schedule cleanup passes on encountering
+     * damage those passes might not fix. If the pass ran and the damage is
+     * still here, rescheduling can't help - it just re-arms the pass in the
+     * superblock on every encounter, forcing fsck on every subsequent mount.
+     */
+    skip_if_complete = 1 << 2,
+}
+
+/// What the runner keeps under its lock - taken with interrupts off, as
+/// scheduling can come from where they are. Nothing else reads it.
+#[repr(C)]
+#[derive(Clone, Copy, MaybeZeroable, TypeInfo)]
+pub struct bch_recovery_runner {
+    /*
+     * When current_pass started, monotonic, for recovery_status to print
+     * how long it's been going. A poller can time passes by watching
+     * current_pass change; whoever cats the sysfs file once can't.
+     */
+    pub pass_start_time: u64,
+    pub rewound_from: RecoveryPass,
+    pub rewound_to: RecoveryPass,
+    /*
+     * Every pass this run dispatched, successful or not - the rewind
+     * gate: we never rewind to (or re-queue behind us) a pass that
+     * already ran this run. Gating on passes_complete alone looped: a
+     * pass that runs and fails never completes, so under
+     * errors=continue a later pass re-requesting it rewound forever
+     * (delete_dead_snapshots <-> check_subvols on an unrepairable
+     * snapshot/subvol edge).
+     */
+    pub passes_attempted: u64,
+    pub passes_failing: u64,
+    pub passes_ratelimiting: u64,
+    /*
+     * Cost-model retry ratelimit for the passes in passes_failing, kept in
+     * memory only: a failing pass must not write the sb recovery_pass_entry,
+     * but we still want the same last_run/last_runtime throttle so automatic
+     * recovery doesn't hammer a pass that keeps failing.
+     */
+    pub passes_failing_ratelimit: [c::recovery_pass_entry; c::RecoveryPass::NR as usize],
+    /* Consecutive failures, for exponential backoff; zeroed on success */
+    pub passes_failing_nr: [u8; c::RecoveryPass::NR as usize],
+}
+// rewound_from and rewound_to zeroed are pass 0, recovery_pass_empty: none
+
+published! {
+    /// What the runner publishes: read without its lock - by C, by the
+    /// allocator, a word at a time - and written by the runner under it.
+    #[derive(MaybeZeroable)]
+    pub struct RecoveryWords {
+        /* counterpart to c->sb.recovery_passes_required */
+        pub scheduled_passes_ephemeral: Volatile<u64>,
+        pub current_passes: Volatile<u64>,
+        pub current_pass: Volatile<RecoveryPass>,
+        /* never rewinds version of curr_pass */
+        pub pass_done: Volatile<RecoveryPass>,
+        /* bitmask of recovery passes that we actually ran */
+        pub passes_complete: Volatile<u64>,
+    }
+}
+
+#[placed(Fs.recovery)]
+#[pin_data]
+#[repr(C)]
+#[derive(MaybeZeroable, TypeInfo, Init)]
+pub struct bch_fs_recovery {
+    /*
+     * The running pass's progress, for recovery_status to read. One
+     * indicator rather than a stack because no pass has two live at once -
+     * which is what check_reconcile_work_data_btrees() exists to keep true.
+     */
+    pub progress: c::progress_indicator,
+
+    /* the runner's state, under its lock, and what it publishes */
+    #[pin]
+    #[init(new_lock!(::pin_init::zeroed(), ::pin_init::zeroed(), "&c->recovery.lock"))]
+    pub runner: Locked<SpinLockIrq, bch_recovery_runner, RecoveryWords>,
+
+    /* passes run under it - and what runs as a pass, it serializes */
+    #[pin]
+    #[init(new_lock!((), "&c->recovery.run_lock"))]
+    pub run_lock: Locked<Mutex>,
+
+    /* the async runner: run_async() */
+    #[pin]
+    pub(crate) work: ReffedWork<async_runner, crate::field!(super.writes)>,
+}
+
+/// @pass, a function or closure of `&Fs` returning `Result<(), E>` with E
+/// converting to BchError, as recovery pass @name's function:
+///
+/// `recovery_pass!(check_dirents => check_dirents);`
+/// `recovery_pass!(resume_logged_ops_early => |fs| resume_logged_ops(fs, true));`
+#[macro_export]
+macro_rules! recovery_pass {
+    ($name:ident => $pass:expr) => {
+        impl $crate::init::passes::Run for $crate::init::passes::pass::$name {
+            fn run(fs: &$crate::fs::Fs) -> Result<(), $crate::errcode::BchError> {
+                ($pass)(fs).map_err(Into::into)
+            }
+        }
+    };
+}
+
+/// A pass's function, implemented for its type in pass:: by recovery_pass!().
+pub trait Run {
+    fn run(fs: &Fs) -> Result<(), BchError>;
+}
+
+use crate::btree::iter::lockrestart_do;
+use crate::c;
+use self::bch_recovery_runner as Runner;
+use crate::errcode::{Errcode, BchError};
+use crate::fs::{Fs, SbLockGuard};
+use crate::locking::ExclusiveGuard;
+use crate::sb::io::{SbFieldOps, SbWrite};
+use crate::snapshots::subvolume;
+use crate::types::{Le32, Le64};
+use crate::data_structures::bitmap::LeBitmap;
+use crate::util::names;
+use crate::os::kernel::{ktime_get_ns, ktime_get_real_seconds, NSEC_PER_SEC};
+use crate::os::kthread::Kthread;
+use crate::util::log::{log_cont, log_start, LogLevel, LogMsg};
+use crate::util::projections::AtomicWord;
+use crate::util::vstructs::{Head, Validated, Unvalidated};
+use crate::util::place::Contained;
+use crate::os::workqueue::Queue;
+use crate::util::{DateTime, Nsecs, Printbuf};
+use crate::{bch_err, bch_info, here, inode, message, prt};
+use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+pub use crate::cstructs::init_passes_format::{PassFlags, RecoveryPass, RecoveryPassStable};
+
+type Pass = RecoveryPass;
+type Flags = c::RunRecoveryPassFlags;
+
+// ── The passes ───────────────────────────────────────────────────────────────
+
+const NR: usize = Pass::NR as usize;
+
+/// The last pass: once it's done, they all are.
+pub const LAST: Pass = Pass::from_bits(NR as u32 - 1);
+
+/// A type per pass, for its function to be implemented on. A module of their
+/// own: a unit struct's name is a value too, and two passes' functions here
+/// have theirs.
+pub mod pass {
+    macro_rules! pass_types {
+        ($(($name:ident, $($rest:tt)*)),* $(,)?) => {
+            $(pub struct $name;)*
+
+            /// Each pass's function, by pass.
+            pub(super) const RUN: [fn(&crate::fs::Fs) -> Result<(), crate::errcode::BchError>; super::NR] =
+                [$(<$name as super::Run>::run),*];
+        };
+    }
+    crate::c::RecoveryPass_arms!(pass_types);
+}
+use pass::RUN;
+use crate::sb::io::SbResize;
+
+/// Each pass's stable id, by pass.
+const TO_STABLE: [u8; NR] = {
+    let (mut t, mut i) = ([0; NR], 0);
+    while i < NR {
+        t[i] = Pass::from_bits(i as u32).stable().0 as u8;
+        i += 1;
+    }
+    t
+};
+
+// a mask of passes is a u64
+const _: () = assert!(NR <= 64);
+
+/// Pass 0, recovery_pass_empty: what current_pass, rewound_to and
+/// rewound_from hold for none.
+const NONE: Pass = Pass::recovery_pass_empty;
+
+pub(crate) fn bit(pass: Pass) -> u64 {
+    1 << pass as u32
+}
+
+/// Pass number @pass's name, if it's one this version has.
+pub fn name(pass: u32) -> Option<&'static str> {
+    names::name_of(<Pass as names::Names>::ENTRIES, pass.into())
+}
+
+/// The passes that run at any of @flags.
+pub fn passes_match(flags: PassFlags) -> u64 {
+    (0..NR).filter(|&p| Pass::from_bits(p as u32).when().intersects(flags)).fold(0, |m, p| m | 1 << p)
+}
+
+/// The passes an fsck runs.
+pub fn fsck_passes() -> u64 {
+    passes_match(PassFlags::FSCK)
+}
+
+/// A placeholder, so scan_for_btree_nodes isn't pass 0.
+fn recovery_pass_empty(_fs: &Fs) -> Result<(), BchError> {
+    Ok(())
+}
+crate::recovery_pass!(recovery_pass_empty => recovery_pass_empty);
+
+/// That the root inode can be read, while recovery can still rewind to
+/// repair it.
+fn lookup_root_inode(fs: &Fs) -> Result<(), BchError> {
+    let inum = c::subvol_inum { subvol: c::BCACHEFS_ROOT_SUBVOL.into(), inum: c::BCACHEFS_ROOT_INO.into() };
+    let trans = crate::btree_trans!(fs);
+    lockrestart_do(&trans, |t| {
+        subvolume::get(t, c::BCACHEFS_ROOT_SUBVOL, true)?;
+        inode::find_by_inum_trans(t, inum, here!()).map(drop)
+    })
+}
+crate::recovery_pass!(lookup_root_inode => lookup_root_inode);
+
+// ── Stable ids ───────────────────────────────────────────────────────────────
+//
+// What the superblock records passes by: a pass's number changes as passes
+// are added and reordered, its stable id never does. An id no pass has now -
+// a pass since removed - is pass 0, recovery_pass_empty, as in C.
+
+const STABLE_NR: usize = {
+    let (mut max, mut i) = (0, 0);
+    while i < NR {
+        if TO_STABLE[i] > max {
+            max = TO_STABLE[i];
+        }
+        i += 1;
+    }
+    max as usize + 1
+};
+
+/// Each stable id's pass, by id. Evaluated at build time, so an id two passes
+/// have fails the build.
+const FROM_STABLE: [u8; STABLE_NR] = {
+    let (mut map, mut seen, mut i) = ([0; STABLE_NR], [false; STABLE_NR], 0);
+    while i < NR {
+        let id = TO_STABLE[i] as usize;
+        assert!(!seen[id], "recovery pass stable id reused");
+        (map[id], seen[id]) = (i as u8, true);
+        i += 1;
+    }
+    map
+};
+
+// a mask of stable ids is a u64
+const _: () = assert!(STABLE_NR <= 64);
+
+/// Stable id @stable's pass, as an index.
+fn from_stable(stable: usize) -> usize {
+    FROM_STABLE.get(stable).map_or(0, |&p| p.into())
+}
+
+/// Mask @v, each bit @i moved to @map[i].
+fn map_bits(v: u64, map: &[u8]) -> u64 {
+    map.iter().enumerate().filter(|&(i, _)| v & 1 << i != 0).fold(0, |r, (_, &to)| r | 1 << to)
+}
+
+/// A mask of passes as their stable ids.
+pub fn passes_to_stable(v: u64) -> u64 {
+    map_bits(v, &TO_STABLE)
+}
+
+/// A mask of stable ids as the passes they are.
+pub fn passes_from_stable(v: u64) -> u64 {
+    map_bits(v, &FROM_STABLE)
+}
+
+/// The recovery passes in @stable - bits of their stable index, as the
+/// superblock stores them - by name.
+pub fn prt_stable(out: &mut Printbuf, stable: u64) {
+    names::prt_set::<Pass>(out, passes_from_stable(stable))
+}
+
+// ── The superblock section ───────────────────────────────────────────────────
+
+/// When each pass last ran and how long it took, by stable id: what
+/// ratelimiting a pass goes by.
+impl SbFieldOps for c::bch_sb_field_recovery_passes<Validated> {
+    fn to_text(out: &mut Printbuf, _fs: Option<&Fs>, _sb: &c::bch_sb<Unvalidated>,
+                r: &c::bch_sb_field_recovery_passes<Unvalidated>) {
+        while out.nr_tabstops() < 2 {
+            out.tabstop_push(32);
+        }
+
+        write!(out, "Pass\tLast run\tLast runtime\n");
+        for (stable, e) in r.start.iter().enumerate().filter(|(_, e)| e.last_run.get() != 0) {
+            names::prt_name(out, <Pass as names::Names>::ENTRIES, from_stable(stable) as u64);
+            prt!(out, "\t{}\t{}{}\n", DateTime(e.last_run.get() as i64),
+                 Nsecs(u64::from(e.last_runtime.get()) * NSEC_PER_SEC),
+                 if e.no_ratelimit() { " (no ratelimit)" } else { "" });
+        }
+    }
+}
+
+// ── Its entries ──────────────────────────────────────────────────────────────
+
+type Section = c::bch_sb_field_recovery_passes<Validated>;
+
+/// For self healing - e.g. missing backpointers - that would otherwise keep
+/// scheduling an expensive repair pass that can wait: run it at most once per
+/// this many times its last runtime. Not the failing-pass backoff, which is
+/// FAILING_RATELIMIT.
+const SELF_HEAL_RATELIMIT: u32 = 100;
+
+/// @pass's entry, if the section has one.
+fn entry(sb: &c::bch_sb, pass: Pass) -> Option<c::recovery_pass_entry> {
+    sb.field::<Section>()?.start.get(pass.stable().0 as usize).copied()
+}
+
+/// @pass's entry, the section made or grown to hold it: None if there's no
+/// room in the superblock.
+fn entry_mut<'a>(fs: &Fs, sb: &'a mut SbLockGuard<'_>, pass: Pass) -> Option<&'a mut c::recovery_pass_entry> {
+    let stable = pass.stable().0 as usize;
+    let bytes = size_of::<Head<Section>>() + (stable + 1) * size_of::<c::recovery_pass_entry>();
+    if fs.sb_resize(sb).field_get_minsize::<Section>((bytes / size_of::<u64>()) as u32).is_none() {
+        bch_err!(fs, "error creating recovery_passes sb section");
+        return None;
+    }
+    Some(&mut sb.field_mut::<Section>().expect("recovery_passes: just made").start[stable])
+}
+
+/// Whether a pass that last ran as @e says should hold off: its last runtime
+/// was more than 1/@runtime_fraction of the time since, and it isn't marked
+/// never to be. Both ratelimits go by it: the superblock's, of expensive
+/// passes, and the in-memory one of failing passes, each with its own entries.
+pub fn entry_ratelimited(e: &c::recovery_pass_entry, runtime_fraction: u32) -> bool {
+    let now = ktime_get_real_seconds() as u64;
+    !e.no_ratelimit() &&
+        u64::from(e.last_runtime.get()) * u64::from(runtime_fraction) > now.wrapping_sub(e.last_run.get())
+}
+
+fn want_ratelimit_locked(sb: &c::bch_sb, pass: Pass, runtime_fraction: u32) -> bool {
+    entry(sb, pass).is_some_and(|e| entry_ratelimited(&e, runtime_fraction))
+}
+
+/// Whether recovery pass @pass should hold off, by when it last ran and how
+/// long it took: entry_ratelimited().
+pub fn want_ratelimit(fs: &Fs, pass: Pass, runtime_fraction: u32) -> bool {
+    want_ratelimit_locked(fs.sb_lock().sb(), pass, runtime_fraction)
+}
+
+/// Have recovery pass @pass run when it's next wanted, however recently it
+/// ran: a repair that found more to do.
+pub fn set_no_ratelimit(fs: &Fs, pass: Pass) {
+    let mut sb = fs.sb_lock();
+    if let Some(e) = entry_mut(fs, &mut sb, pass).filter(|e| !e.no_ratelimit()) {
+        e.set_no_ratelimit(true);
+        fs.write_super(&mut sb);
+    }
+}
+
+/// Recovery pass @pass, started at @start_time, has completed: it's no
+/// longer required, and its entry says when it ran and for how long. If it
+/// was the last of this run's passes, the errors to fix silently - which came
+/// with the passes required - are done with too.
+fn pass_complete(fs: &Fs, pass: Pass, start_time: i64) {
+    let mut sb = fs.sb_lock();
+    let ext = sb.field_mut::<c::bch_sb_field_ext<Validated>>().expect("an ext section");
+    LeBitmap::from_words_mut(&mut ext.recovery_passes_required).clear(pass.stable().0 as usize);
+    // the runner takes each pass off current_passes before running it: none
+    // left, this was the last
+    if fs.recovery.runner.current_passes.get() == 0 {
+        ext.errors_silent.fill(Le64::new(0));
+    }
+
+    if let Some(e) = entry_mut(fs, &mut sb, pass) {
+        let end_time = ktime_get_real_seconds();
+        e.last_run = Le64::new(end_time as u64);
+        e.last_runtime = Le32::new((end_time - start_time).max(0) as u32);
+        e.set_no_ratelimit(false);
+    }
+    fs.write_super(&mut sb);
+}
+
+// ── Btrees checked clean ─────────────────────────────────────────────────────
+
+/// Whether btree @btree has been checked consistent and not changed since: as
+/// bch2_btree_is_clean().
+pub fn btree_is_clean(fs: &Fs, btree: Btree) -> bool {
+    fs.sb.btrees_clean.get() & (1u64 << btree.0) != 0
+}
+
+/// Record btree @btree as checked consistent: as bch2_set_btree_clean().
+pub fn set_btree_clean(fs: &Fs, btree: Btree) {
+    set_btree_clean_to(fs, btree, true)
+}
+
+/// Btree @btree is being changed, so no longer known consistent: as
+/// bch2_clear_btree_clean().
+pub fn clear_btree_clean(fs: &Fs, btree: Btree) {
+    set_btree_clean_to(fs, btree, false)
+}
+
+/// The ext section's bit, and the in-memory copy btree_is_clean() reads,
+/// written straight through: the superblock is current without a clean
+/// shutdown. Checked before sb_lock as well as under it, so the common case -
+/// already as wanted - doesn't take it.
+fn set_btree_clean_to(fs: &Fs, btree: Btree, clean: bool) {
+    if btree_is_clean(fs, btree) == clean {
+        return;
+    }
+    let mut w = fs.sb_write();
+    if btree_is_clean(fs, btree) == clean {
+        return;
+    }
+
+    let bit = 1u64 << btree.0;
+    let to = |v: u64| if clean { v | bit } else { v & !bit };
+    let ext = &mut w.ext_mut().btrees_clean;
+    ext.set(to(ext.get()));
+    let cpu = &w.published().btrees_clean;
+    cpu.set(to(cpu.get()));
+    w.dirty();
+}
+
+// ── The runner's state ───────────────────────────────────────────────────────
+
+/// The runner's lock, held: its state, and permission to write what of
+/// recovery's is published. Nothing sleeps while it's held.
+type Recovery<'a> = ExclusiveGuard<'a, SpinLockIrq, Runner, RecoveryWords>;
+
+fn lock(fs: &Fs) -> Recovery<'_> {
+    fs.recovery.runner.lock()
+}
+
+// SAFETY: C's enum, a u32; zeroes are pass 0, NONE - and it's only ever set()
+// to a Pass
+unsafe impl AtomicWord for Pass {
+    type Atomic = AtomicU32;
+
+    fn load(a: &AtomicU32) -> Pass {
+        Pass::from_bits(a.load(Ordering::Relaxed))
+    }
+
+    fn store(a: &AtomicU32, pass: Pass) {
+        a.store(pass as u32, Ordering::Relaxed)
+    }
+}
+
+/// Whether recovery has @pass still to run, or running: as
+/// recovery_pass_will_run(). Never true outside recovery.
+pub fn will_run(fs: &Fs, pass: Pass) -> bool {
+    fs.flags.get(c::FsFlag::in_recovery) && fs.recovery.runner.current_passes.get() & bit(pass) != 0
+}
+
+/// Whether recovery work should stop - the filesystem going read-only, or
+/// the kthread running it told to.
+pub fn cancelled(fs: &Fs) -> Result<(), BchError> {
+    if fs.flags.get(c::FsFlag::going_ro) {
+        return fs.throw(Errcode::erofs_recovery_cancelled);
+    }
+    if Kthread::should_stop() {
+        return fs.throw(Errcode::recovery_cancelled);
+    }
+    Ok(())
+}
+
+/// recovery.run_lock is held: passes run under it - and what runs as a pass,
+/// it serializes.
+pub fn assert_run_lock_held(fs: &Fs) {
+    fs.recovery.run_lock.assert_held()
+}
+
+/// recovery.run_lock, held: no recovery pass runs - to run one's work outside
+/// the pass framework.
+pub fn run_lock(fs: &Fs) -> ExclusiveGuard<'_, Mutex> {
+    fs.recovery.run_lock.lock()
+}
+
+/// Recovery done through @pass, without the runner: a new filesystem's,
+/// which has nothing to recover.
+pub(crate) fn set_pass_done(fs: &Fs, pass: Pass) {
+    lock(fs).published().pass_done.set(pass);
+}
+
+// ── Scheduling ───────────────────────────────────────────────────────────────
+
+/// Every pass that depends on @pass, transitively, and @pass.
+fn pass_dependents(pass: usize) -> u64 {
+    let mut passes = 1u64 << pass;
+    loop {
+        let more = (0..NR).filter(|&i| passes & 1 << i == 0 && passes & Pass::from_bits(i as u32).depends() != 0)
+                          .fold(0, |m, i| m | 1 << i);
+        if more == 0 {
+            return passes;
+        }
+        passes |= more;
+    }
+}
+
+/// Whether @pass, and those of @passes that depend on it, can all run online -
+/// in the background, after mount.
+fn should_defer(pass: usize, passes: u64) -> bool {
+    let passes = (passes & pass_dependents(pass)) | 1 << pass;
+    passes == passes & passes_match(PassFlags::ONLINE)
+}
+
+/// Whether this run may execute @pass, as opposed to only scheduling it: the
+/// mount path runs before BCH_FS_started and may run anything, the async
+/// runner and the online-fsck ioctl run after it against a live filesystem.
+/// Both bound their starting set, but a pass required mid-run goes straight
+/// into current_passes - which is how an offline pass reaches a live
+/// filesystem.
+fn may_run_now(fs: &Fs, pass: Pass) -> bool {
+    !fs.flags.get(c::FsFlag::started) || pass.when().intersects(PassFlags::ONLINE)
+}
+
+/// Whether running @pass means going back for it: the pass loop is running,
+/// is past it, and hasn't run it this run.
+fn needs_rewind(fs: &Fs, r: &Recovery<'_>, pass: Pass) -> bool {
+    fs.flags.get(c::FsFlag::running_recovery_passes) &&
+        fs.recovery.runner.current_pass.get() > pass &&
+        r.passes_attempted & bit(pass) == 0
+}
+
+/// Never record scan_for_btree_nodes in the superblock: check_topology runs it
+/// if required, so the requirement is always re-derivable.
+fn is_persistent(pass: Pass) -> bool {
+    pass != Pass::scan_for_btree_nodes
+}
+
+/// Whether scheduling @pass would do anything. With ratelimit
+/// in @flags, the superblock - @sb, under sb_lock - decides whether it's to be
+/// ratelimited, and if not it's taken out of @flags.
+fn needs_set(fs: &Fs, r: &Recovery<'_>, pass: Pass, flags: &mut Flags, sb: Option<&c::bch_sb>) -> bool {
+    if flags.contains(Flags::skip_if_complete) &&
+       fs.recovery.runner.passes_complete.get() & bit(pass) != 0 {
+        return false;
+    }
+
+    if flags.contains(Flags::ratelimit) &&
+       !want_ratelimit_locked(sb.expect("sb_lock, to ratelimit"), pass, SELF_HEAL_RATELIMIT) {
+        flags.remove(Flags::ratelimit);
+    }
+
+    /*
+     * For a non-persistent pass we don't want to do anything if the pass has
+     * already run: it means we need a prior pass to run before we continue
+     * to repair, and we don't expect that pass to fix the damage we
+     * encountered.
+     *
+     * Otherwise, we run run_explicit_recovery_pass when we find damage, so
+     * it should run again even if it's already run.
+     *
+     * XXX: the "!in_recovery ||" here has no counterpart in
+     * run_explicit_sb(), which routes to the ephemeral set on
+     * !is_persistent() alone. So an online request checks the superblock set
+     * while recording into the ephemeral one. Harmless today only because
+     * scan_for_btree_nodes can never reach the superblock set - so this arm
+     * always says "not already requested".
+     */
+    let in_recovery = fs.flags.get(c::FsFlag::in_recovery);
+    let already_running = if !in_recovery || is_persistent(pass) {
+        fs.sb.recovery_passes_required.get()
+    } else {
+        fs.recovery.runner.current_passes.get()
+    };
+
+    if already_running & bit(pass) == 0 {
+        return true;
+    }
+
+    if !flags.contains(Flags::ratelimit) && r.passes_ratelimiting & bit(pass) != 0 {
+        return true;
+    }
+
+    needs_rewind(fs, r, pass)
+}
+
+/// Schedule recovery pass @pass, saying so to @out - or, if recovery is past
+/// it, rewind to it: restart_recovery. @w is permission to persist, in the
+/// superblock - the caller's, under sb_lock - and None for an ephemeral
+/// schedule, which may come from a btree transaction commit, that can take
+/// neither: only in-memory scheduling is reachable then.
+pub(crate) fn run_explicit_sb(fs: &Fs, out: &mut Printbuf, pass: Pass, mut flags: Flags, w: Option<&mut SbWrite<'_>>)
+    -> Result<(), BchError>
+{
+    debug_assert_eq!(w.is_none(), flags.contains(Flags::ephemeral));
+
+    let opts = fs.opts();
+    if opts.norecovery.get() != 0 || opts.recovery_passes_exclude.get() & bit(pass) != 0 {
+        return Ok(());
+    }
+
+    out.make_room(1024);
+    let mut r = lock(fs);
+    let rec = &fs.recovery.runner;
+
+    if !needs_set(fs, &r, pass, &mut flags, w.as_ref().map(|w| w.sb())) {
+        return Ok(());
+    }
+
+    out.set_suppressed(false);
+
+    let running = fs.flags.get(c::FsFlag::running_recovery_passes);
+    let ratelimit = flags.contains(Flags::ratelimit);
+
+    if flags.contains(Flags::ephemeral) || !is_persistent(pass) {
+        *r.published().scheduled_passes_ephemeral.place() |= bit(pass);
+    } else {
+        let w = w.expect("not ephemeral: an sb_write");
+        let ext = w.field_mut::<c::bch_sb_field_ext<Validated>>().expect("an ext section");
+        let required = LeBitmap::from_words_mut(&mut ext.recovery_passes_required);
+        let new = !required.test_and_set(pass.stable().0 as usize);
+        w.record(new);
+    }
+
+    /*
+     * Recorded above, but not run: repair found mid-mount is still repair,
+     * and a tool that opened this filesystem to inspect it doesn't want a
+     * pass starting underneath it - accounting underflow scheduling
+     * check_allocations is the one that bites. The requirement stays in the
+     * superblock, so the next mount that isn't skipping does the work.
+     */
+    if opts.recovery_passes_skip_scheduled.get() != 0 {
+        return Ok(());
+    }
+
+    if pass < Pass::set_may_go_rw &&
+       fs.flags.get(c::FsFlag::may_go_rw) {
+        write!(out, "need recovery pass {} ({}), but already rw\n", pass.name(), pass as u32);
+        return fs.throw(Errcode::cannot_rewind_recovery);
+    }
+
+    if ratelimit {
+        r.passes_ratelimiting |= bit(pass);
+    } else {
+        r.passes_ratelimiting &= !bit(pass);
+    }
+
+    let rewind = needs_rewind(fs, &r, pass);
+
+    /*
+     * A pass that already ran this run - completed OR failed - must never
+     * be re-run in the same loop: that's the rewind invariant, which
+     * needs_rewind() enforces by gating on passes_attempted. (Gating on
+     * passes_complete looped: a failing pass never completes, so under
+     * errors=continue a later pass re-requesting it rewound forever.) The
+     * "run it now because it can't be deferred to the background" arm has to
+     * honor the same invariant: otherwise a pass that reschedules an earlier,
+     * already-run pass (check_key_has_snapshot scheduling
+     * check_inodes/check_extents while running check_xattrs, once the
+     * dead-snapshot keys those passes would clean are still present) injects
+     * it back into current_passes and we re-run the whole content-check range
+     * out of order, looping.
+     *
+     * A pass this run may not execute falls through to the schedule branch
+     * rather than erroring: the requirement still reaches the superblock, so
+     * the next mount does the work. Erroring would turn a repair request
+     * made from the IO path into a hard error.
+     */
+    let run_now = may_run_now(fs, pass) &&
+        (rewind ||
+         (!should_defer(pass as usize, rec.current_passes.get()) && r.passes_attempted & bit(pass) == 0));
+
+    /*
+     * Ephemeral scheduling is best-effort and must never rewind: the caller
+     * may be a BTREE_TRIGGER_atomic trigger committed to its commit, which
+     * can't restart recovery (and ignores our return). If the pass already
+     * ran, the scheduled_passes_ephemeral backstop reruns it via the async
+     * runner instead.
+     */
+    if running && !ratelimit && run_now && !(rewind && flags.contains(Flags::ephemeral)) {
+        write!(out, "running recovery pass {} ({}), currently at {} ({}){}\n",
+               pass.name(), pass as u32, rec.current_pass.get().name(), rec.current_pass.get() as u32,
+               if rewind { " - rewinding" } else { "" });
+
+        *r.published().current_passes.place() |= bit(pass);
+
+        if rewind {
+            let rewound_to = if r.rewound_to != NONE { r.rewound_to.min(pass) } else { pass };
+            let current = rec.current_pass.get();
+            /*
+             * Only log when the rewind target actually changes - the same
+             * rewind gets re-requested on every call that finds the same
+             * damage, and we don't want to spam for those. Logged unlocked:
+             * a message allocates.
+             */
+            let changed = rewound_to != r.rewound_to;
+            r.rewound_to = rewound_to;
+            drop(r);
+            if changed {
+                bch_info!(fs, "recovery: rewinding to {} ({}), currently running {} ({})",
+                          pass.name(), pass as u32, current.name(), current as u32);
+            }
+            return fs.throw(Errcode::restart_recovery);
+        }
+    } else {
+        write!(out, "scheduling recovery pass {} ({}){}\n", pass.name(), pass as u32,
+               if ratelimit { " - ratelimiting" } else { "" });
+
+        if !ratelimit && pass.when().intersects(PassFlags::ONLINE) {
+            run_async(fs);
+        }
+    }
+
+    Ok(())
+}
+
+/// Schedule recovery pass @pass, saying so to @out. An error - a restart of
+/// recovery - only if it has to go back to an earlier pass.
+pub fn run_explicit(fs: &Fs, out: &mut Printbuf, pass: Pass, mut flags: Flags) -> Result<(), BchError> {
+    // with ratelimit, needs_set() needs sb_lock
+    if !flags.contains(Flags::ratelimit) &&
+       !needs_set(fs, &lock(fs), pass, &mut flags, None) {
+        return Ok(());
+    }
+
+    /*
+     * An ephemeral schedule only touches in-memory recovery state under the
+     * runner's lock. Its callers may hold btree locks, so sb_lock is
+     * unavailable to them - and with no sb_lock there's no permission to
+     * persist:
+     */
+    if flags.contains(Flags::ephemeral) {
+        return run_explicit_sb(fs, out, pass, flags, None);
+    }
+
+    run_explicit_sb(fs, out, pass, flags, Some(&mut fs.sb_write()))
+}
+
+/// Have recovery pass @pass run before going on, if it hasn't recently: Ok
+/// if it has; restart_recovery if it's in recovery's past, which rewinds to
+/// it; else recovery_pass_will_run - it's scheduled, and runs later.
+pub fn require(fs: &Fs, out: &mut Printbuf, pass: Pass) -> Result<(), BchError> {
+    if fs.flags.get(c::FsFlag::running_recovery_passes) &&
+       fs.recovery.runner.passes_complete.get() & bit(pass) != 0 {
+        return Ok(());
+    }
+
+    let mut w = fs.sb_write();
+
+    if want_ratelimit_locked(w.sb(), pass, SELF_HEAL_RATELIMIT) {
+        return Ok(());
+    }
+
+    /*
+     * restart_recovery must only come from an actually-armed rewind, or the
+     * loop sees restart_recovery with rewound_to unset and fails.
+     */
+    run_explicit_sb(fs, out, pass, Flags::empty(), Some(&mut w))?;
+    fs.throw(Errcode::recovery_pass_will_run)
+}
+
+// ── Running ──────────────────────────────────────────────────────────────────
+
+/// Retry backoff for a failing pass, as a multiple of its last runtime (same
+/// units as want_ratelimit()'s fraction): a pass that ran for T before
+/// failing isn't retried by automatic recovery for 2^n * T after its nth
+/// consecutive failure, up to RATELIMIT * T. Exponential, not a fixed
+/// multiple: a transient failure - journal_res_blocked under a full journal -
+/// gets retried soon, while a pass that keeps failing still backs off to a
+/// small fraction of the time. A fixed 100x kept a pass that failed once after
+/// 766s unscheduled for 21 hours (tools#941). Separate from
+/// SELF_HEAL_RATELIMIT: that one throttles repairs that succeed.
+const FAILING_RATELIMIT: u32 = 20;
+
+fn failing_pass_backoff(r: &Runner, pass: usize) -> u32 {
+    match r.passes_failing_nr[pass] {
+        nr @ 0..5 => (1 << nr).min(FAILING_RATELIMIT),
+        _ => FAILING_RATELIMIT,
+    }
+}
+
+fn run_pass(fs: &Fs, pass: Pass) -> Result<(), BchError> {
+    let silent = pass.when().intersects(PassFlags::SILENT);
+    if !silent {
+        log_start(fs, LogLevel::INFO, message!("{}...", pass.name()));
+    }
+
+    let start_time = ktime_get_real_seconds();
+    let ret = RUN[pass as usize](fs);
+
+    if let Err(e) = &ret {
+        if !e.matches(Errcode::restart_recovery) {
+            let end_time = ktime_get_real_seconds();
+            let runtime = (end_time - start_time).max(0);
+
+            let mut r = lock(fs);
+            let p = pass as usize;
+            r.passes_failing |= bit(pass);
+            r.passes_failing_nr[p] = r.passes_failing_nr[p].saturating_add(1);
+            let (nr, backoff) = (r.passes_failing_nr[p], failing_pass_backoff(&r, p));
+            /*
+             * Ratelimit retries the same way the sb ratelimits expensive
+             * passes, but in memory - a failing pass doesn't get to write
+             * the superblock. flags stays 0, so this throttle applies even
+             * to passes the sb marks NO_RATELIMIT: that flag is about not
+             * throttling successful reruns, not about hammering failures.
+             */
+            r.passes_failing_ratelimit[p] = c::recovery_pass_entry {
+                last_run:     Le64::new(end_time as u64),
+                last_runtime: Le32::new(runtime as u32),
+                ..Default::default()
+            };
+            drop(r);
+
+            bch_err!(fs, "{}(): error {} - failure {}, not retried automatically for {}s",
+                     pass.name(), e, nr, runtime as u64 * u64::from(backoff));
+        }
+        return ret;
+    }
+
+    if !silent {
+        log_cont(fs, message!(" done ({} seconds)", ktime_get_real_seconds() - start_time));
+    }
+
+    let mut r = lock(fs);
+    r.passes_failing = 0;
+    r.passes_failing_nr[pass as usize] = 0;
+    drop(r);
+
+    if !fs.flags.get(c::FsFlag::error) {
+        pass_complete(fs, pass, start_time);
+    }
+    Ok(())
+}
+
+/// Run the passes in @passes, in order, and any scheduled as they run; going
+/// back for one in their past if a pass requires it. With @failfast, stop at
+/// the first that fails; else the last error is returned, after running the
+/// rest.
+pub fn run_passes(fs: &Fs, mut passes: u64, failfast: bool) -> Result<(), BchError> {
+    /*
+     * The rewind machinery (needs_rewind(), require(), run_explicit_sb())
+     * keys on this, not BCH_FS_in_recovery: we can rewind whenever the pass
+     * loop is running, which includes the async runner - not only during
+     * mount. BCH_FS_in_recovery is cleared before the async runner starts.
+     */
+    fs.flags.set(c::FsFlag::running_recovery_passes, true);
+
+    let rec = &fs.recovery.runner;
+    let mut r = lock(fs);
+
+    if fs.feature(SbFeature::no_alloc_info) {
+        passes &= !passes_match(PassFlags::ALLOC);
+    }
+
+    /*
+     * A failing pass is retried on a cost-model ratelimit: retry cadence
+     * scales with how long the pass ran, so automatic recovery doesn't
+     * hammer a pass that keeps failing - but, unlike waiting for some other
+     * pass to succeed, it isn't stuck forever if nothing else makes
+     * progress. (A success clears passes_failing wholesale below, so a pass
+     * that fixes a dependency still triggers an immediate retry.)
+     *
+     * An explicit fsck is different: the user asked for these passes, so
+     * run them even if they failed before, and let them fail loudly again
+     * rather than silently returning success having done nothing.
+     */
+    if !fs.flags.get(c::FsFlag::in_fsck) {
+        for p in (0..NR).filter(|&p| r.passes_failing & 1 << p != 0) {
+            if entry_ratelimited(&r.passes_failing_ratelimit[p], failing_pass_backoff(&r, p)) {
+                passes &= !(1 << p);
+            }
+        }
+    }
+
+    r.published().current_passes.set(passes);
+    /*
+     * Fresh attempt-epoch per run: a pass attempted in a previous (online)
+     * run is fair game again; within one run, attempted passes are never
+     * rewound to or re-queued behind current_pass.
+     */
+    r.passes_attempted = 0;
+
+    /*
+     * Passes scheduled ephemerally mid-run (e.g. delete_dead_snapshots via a
+     * trigger) land in current_passes but not @passes; accumulate everything
+     * that's actually been scheduled so a rewind restores those too -
+     * otherwise the pass that triggered the rewind is dropped from the run
+     * and never reruns.
+     */
+    let mut scheduled = passes;
+    let mut ret = Ok(());
+    let mut prev = NONE;
+
+    while rec.current_passes.get() != 0 {
+        scheduled |= rec.current_passes.get();
+
+        let pass = Pass::from_bits(rec.current_passes.get().trailing_zeros());
+
+        let (runner, w) = r.parts();
+        w.current_pass.set(pass);
+        runner.pass_start_time = ktime_get_ns();
+        *w.current_passes.place() &= !bit(pass);
+        *w.scheduled_passes_ephemeral.place() &= !bit(pass);
+        runner.passes_attempted |= bit(pass);
+
+        drop(r);
+        let ret2 = run_pass(fs, pass).and_then(|()| fs.journal_flush());
+        r = lock(fs);
+
+        if r.rewound_to != NONE {
+            r.rewound_from = r.rewound_from.max(pass);
+            // Restore current_passes up to and including rewound_to
+            let (runner, w) = r.parts();
+            *w.current_passes.place() |= scheduled & (!0u64 << runner.rewound_to as u32);
+            runner.rewound_to = NONE;
+        } else if ret2.is_ok() {
+            let w = r.published();
+            w.pass_done.set(w.pass_done.get().max(pass));
+            *w.passes_complete.place() |= bit(pass);
+        } else {
+            ret = ret2;
+        }
+
+        if ret.is_err() && failfast {
+            break;
+        }
+
+        // the point it waits for - see bch2_reconcile_thread()
+        if prev <= Pass::resume_logged_ops_early && pass > Pass::resume_logged_ops_early {
+            fs.reconcile_wakeup();
+        }
+
+        prev = pass;
+    }
+
+    r.published().current_pass.set(NONE);
+    drop(r);
+
+    fs.flags.set(c::FsFlag::running_recovery_passes, false);
+    ret
+}
+
+/// The async runner: the passes scheduled that can run online, unless a run
+/// is already going - then it picks them up. run_async() queues it, holding
+/// a write ref.
+pub(crate) fn async_runner(recovery: &c::bch_fs_recovery) {
+    let fs = recovery.container();
+    let Some(_run) = recovery.run_lock.try_lock() else { return };
+
+    /*
+     * A persistent pass is recorded by the same sb_lock section that kicks
+     * us, and only reaches c->sb when that superblock write finishes: read
+     * it under sb_lock, or we can run before the request is visible and
+     * never see it.
+     */
+    let required = {
+        let _sb = fs.sb_lock();
+        fs.sb.recovery_passes_required.get()
+    };
+
+    let ratelimiting = lock(fs).passes_ratelimiting;
+    let passes = (required | recovery.runner.scheduled_passes_ephemeral.get()) & !ratelimiting & passes_match(PassFlags::ONLINE);
+    let _ = run_passes(fs, passes, false);
+}
+
+/// Kick the async runner, if the filesystem is writable: for passes that can
+/// run online. Nothing in it sleeps.
+pub fn run_async(fs: &Fs) {
+    /*
+     * A nochanges mount goes fake-rw during recovery for fsck, then back to
+     * ro before completing (we can't hold fake-rw indefinitely - we'd oom),
+     * so a background pass would fire when we're no longer rw. Don't schedule
+     * them at all.
+     */
+    if fs.opts().nochanges.get() != 0 {
+        return;
+    }
+
+    fs.recovery.work.queue(Queue::system_long());
+}
+
+/// Recovery at mount: the passes this mount needs, from @from on - those that
+/// can, deferred to run in the background, after.
+pub fn run_passes_startup(fs: &Fs, from: Pass) -> Result<(), BchError> {
+    /*
+     * We can't allow set_may_go_rw to be excluded; that would cause us to
+     * use the journal replay keys for updates where it's not expected.
+     */
+    *fs.opts_writer(&mut fs.sb_lock()).recovery_passes_exclude.place() &= !bit(Pass::set_may_go_rw);
+    let opts = fs.opts();
+
+    lock(fs).published().scheduled_passes_ephemeral.set(opts.recovery_passes.get());
+
+    /*
+     * Scheduled passes are repair the superblock is asking for - an upgrade
+     * wanting accounting rebuilt, damage found on a previous mount. Skipping
+     * them doesn't clear them: they stay in the superblock and run at the
+     * next mount that doesn't skip. For tools that open a filesystem to look
+     * at it rather than fix it, where check_allocations rebuilding the world
+     * before the first command is the opposite of what was asked for.
+     */
+    let mut passes = passes_match(PassFlags::ALWAYS)
+        | if fs.sb.clean.get() == 0 { passes_match(PassFlags::UNCLEAN) } else { 0 }
+        | if opts.fsck.get() != 0 { fsck_passes() } else { 0 }
+        | opts.recovery_passes.get()
+        | if opts.recovery_passes_skip_scheduled.get() == 0 { fs.sb.recovery_passes_required.get() } else { 0 };
+
+    if opts.recovery_pass_last.get() != 0 {
+        passes &= 1u64.checked_shl(u32::from(opts.recovery_pass_last.get()) + 1).map_or(!0, |b| b - 1);
+    }
+
+    passes &= !opts.recovery_passes_exclude.get();
+
+    passes &= !(bit(from) - 1);
+
+    /*
+     * Defer passes that can be run online, and don't have dependents that
+     * can't be run online - except in debug builds, where a recovery that
+     * fixed errors is run a second time to check it left the filesystem
+     * clean (bch2_fs_recovery()): that check needs the run it's checking
+     * finished, and its own run finished before it judges it.
+     */
+    let mut defer = 0;
+    if opts.fsck.get() == 0 && !cfg!(CONFIG_BCACHEFS_DEBUG) {
+        for i in 0..NR {
+            if passes & 1 << i != 0 &&
+               opts.recovery_passes.get() & 1 << i == 0 &&
+               !Pass::from_bits(i as u32).when().intersects(PassFlags::NODEFER) &&
+               should_defer(i, passes) {
+                defer |= 1 << i;
+                passes &= !(1 << i);
+            }
+        }
+    }
+
+    {
+        let _run = run_lock(fs);
+        run_passes(fs, passes, true)?;
+    }
+
+    fs.flags.set(c::FsFlag::in_recovery, false);
+
+    if defer != 0 {
+        let mut msg = LogMsg::with_level(fs, LogLevel::NOTICE);
+        write!(msg, "Running the following recovery passes in the background:\n");
+        names::prt_set::<Pass>(&mut msg, defer);
+
+        *lock(fs).published().scheduled_passes_ephemeral.place() |= defer;
+    }
+
+    /*
+     * Kick the async runner for everything scheduled to run in the
+     * background: the defer passes above, and passes scheduled ephemerally
+     * during recovery (e.g. delete_dead_snapshots via a trigger), which land
+     * in scheduled_passes_ephemeral but not defer. They were scheduled before
+     * we went rw, so their own kick was a no-op. (Itself a no-op in
+     * nochanges - see run_async().)
+     */
+    if fs.recovery.runner.scheduled_passes_ephemeral.get() != 0 {
+        run_async(fs);
+    }
+
+    Ok(())
+}
+
+// ── Status ───────────────────────────────────────────────────────────────────
+
+/// Each pass's state - scheduled, completed, failing - and the running one's
+/// progress.
+#[cold]
+pub fn status_to_text(fs: &Fs, out: &mut Printbuf) {
+    let r = &fs.recovery;
+    // the runner's, copied out: printing allocates, which it can't under the lock
+    let (failing, start_time, rewound_from) = {
+        let runner = lock(fs);
+        (runner.passes_failing, runner.pass_start_time, runner.rewound_from)
+    };
+    let line = |out: &mut Printbuf, what: &str, passes: u64| {
+        write!(out, "{what}:\t");
+        names::prt_set::<Pass>(out, passes);
+        out.newline();
+    };
+
+    out.tabstop_push(32);
+    line(out, "Scheduled (superblock)", fs.sb.recovery_passes_required.get());
+    line(out, "Scheduled (ephemeral)", r.runner.scheduled_passes_ephemeral.get());
+
+    line(out, "Completed", r.runner.passes_complete.get());
+    line(out, "Failing", failing);
+
+    let current = r.runner.current_pass.get();
+    if current != NONE {
+        write!(out, "Currently running:\t{} ({})\n", current.name(), current as u32);
+
+        prt!(out, "Elapsed:\t{}\n", Nsecs(ktime_get_ns().wrapping_sub(start_time)));
+
+        // Nothing to show for a pass with no estimate of its own size
+        if r.progress.has_total() {
+            write!(out, "Progress:\t");
+            prt!(out, "{}", r.progress);
+            out.newline();
+        }
+
+        line(out, "Next", r.runner.current_passes.get());
+
+        if fs.flags.get(c::FsFlag::in_recovery) && rewound_from != NONE {
+            write!(out, "Rewound from:\t{} ({})\n", rewound_from.name(), rewound_from as u32);
+        }
+    }
+}
+
+/// A scheduled pass has work, and can't ask for writes later - it fails with
+/// erofs_trans_commit. opts.recovery_passes counts because Fs::start()
+/// asks before recovery schedules them.
+pub fn go_rw_in_recovery(fs: &Fs) -> bool {
+    fs.flags.get(c::FsFlag::may_upgrade_downgrade) &&
+        (fs.journal_keys_get().is_some_and(|jk| !jk.value().keys().is_empty()) ||
+         fs.opts().read_only.get() == 0 ||
+         fs.sb.clean.get() == 0 ||
+         fs.opts().recovery_passes.get() != 0 ||
+         fs.sb.recovery_passes_required.get() != 0 ||
+         fs.recovery.runner.scheduled_passes_ephemeral.get() != 0 ||
+         (fs.opts().fsck.get() != 0 && !fs.feature(SbFeature::no_alloc_info)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pass is its stable id's; an id no pass has is pass 0; and a mask
+    /// goes there and back.
+    #[test]
+    fn stable_ids() {
+        for p in 0..NR {
+            assert_eq!(from_stable(TO_STABLE[p].into()), p);
+        }
+        let unused = (0..STABLE_NR).find(|&id| !TO_STABLE.contains(&(id as u8)));
+        if let Some(id) = unused {
+            assert_eq!(from_stable(id), 0);
+        }
+        assert_eq!(from_stable(STABLE_NR), 0);
+
+        let all = u64::MAX >> (64 - NR);
+        assert_eq!(passes_from_stable(passes_to_stable(all)), all);
+
+        let pass = Pass::check_topology;
+        assert_eq!((pass.stable().0, pass.name()), (4, "check_topology"));
+    }
+}

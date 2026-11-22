@@ -5,13 +5,13 @@ use std::{
     os::fd::{AsFd, AsRawFd, OwnedFd},
     os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
-    ptr, str,
+    str,
 };
 
 use anyhow::{ensure, Result};
 use bcachefs_kernel::c::{bch_opts, bch_sb_handle};
 use bcachefs_kernel::errcode::BchError;
-use bcachefs_kernel::{c, opt_get, opt_set, path_to_cstr};
+use bcachefs_kernel::{c, path_to_cstr};
 use clap::Parser;
 use log::{debug, error, info, warn};
 use uuid::Uuid;
@@ -138,7 +138,7 @@ fn mount_fs_context(
     src: &str,
     target: &CStr,
     fstype: &str,
-    mountflags: libc::c_ulong,
+    mountflags: core::ffi::c_ulong,
     data: Option<&str>,
     devs: &[DevInfo],
     user_key: Option<&str>,
@@ -270,7 +270,7 @@ fn mount_fs_context(
 /// Best effort. The filesystem is mounted; failing to pick up a straggler is
 /// worth saying out loud but is not a reason to fail the mount.
 fn online_late_devices(uuid: Uuid, mounted: &HashSet<u8>, opts: &bch_opts) {
-    let use_udev = opt_get!(opts, mount_trusts_udev) != 0;
+    let use_udev = opts.mount_trusts_udev_or_default();
 
     let found = match device_scan::get_devices_by_uuid(uuid, opts, use_udev) {
         Ok(found) => found,
@@ -318,7 +318,7 @@ fn mount_inner(
     src: OsString,
     target: &std::path::Path,
     fstype: &str,
-    mountflags: libc::c_ulong,
+    mountflags: core::ffi::c_ulong,
     data: Option<String>,
     devs: Vec<DevInfo>,
     unlocked: Option<&Unlocked>,
@@ -370,53 +370,40 @@ fn mount_legacy(
     src: OsString,
     target: &std::path::Path,
     fstype: &str,
-    mut mountflags: libc::c_ulong,
+    mut mountflags: core::ffi::c_ulong,
     data: Option<String>,
 ) -> Result<(), MountError> {
     // An interior NUL can't be expressed in a C string at all. Nothing has been
     // attempted at this point, so the errno is ours rather than the kernel's.
     let bad_arg = |what: &str| MountError {
-        code: BchError::from_raw(libc::EINVAL),
+        code: libc::EINVAL.into(),
         text: format!("{what} contains a NUL byte"),
     };
 
-    // bind the CStrings to keep them alive
     let c_src = CString::new(src.clone().into_vec()).map_err(|_| bad_arg("device path"))?;
     let c_target = path_to_cstr(target);
     let data = data.map(CString::new).transpose().map_err(|_| bad_arg("mount options"))?;
     let fstype = CString::new(fstype).map_err(|_| bad_arg("filesystem type"))?;
 
-    // convert to pointers for ffi
-    let c_src = c_src.as_ptr();
-    let c_target = c_target.as_ptr();
-    let data_ptr = data.as_ref().map_or(ptr::null(), |data| data.as_ptr().cast());
-    let fstype = fstype.as_ptr();
+    let ret = loop {
+        info!("mounting filesystem");
+        // REQUIRES: CAP_SYS_ADMIN
+        let ret = rustix::mount::mount(c_src.as_c_str(), c_target.as_c_str(), fstype.as_c_str(),
+                                       rustix::mount::MountFlags::from_bits_retain(mountflags as _),
+                                       data.as_deref());
 
-    let mut ret;
-    loop {
-        ret = {
-            info!("mounting filesystem");
-            // REQUIRES: CAP_SYS_ADMIN
-            unsafe { libc::mount(c_src, c_target, fstype, mountflags, data_ptr) }
-        };
-
-        let err = errno::errno().0;
-
-        if ret == 0
-            || (err != libc::EACCES && err != libc::EROFS)
-            || (mountflags & libc::MS_RDONLY) != 0
-        {
-            break;
+        match ret {
+            Err(e) if (e == rustix::io::Errno::ACCESS || e == rustix::io::Errno::ROFS) &&
+                      mountflags & libc::MS_RDONLY == 0 => {
+                println!("mount: device write-protected, mounting read-only");
+                mountflags |= libc::MS_RDONLY;
+            }
+            ret => break ret,
         }
+    };
 
-        println!("mount: device write-protected, mounting read-only");
-        mountflags |= libc::MS_RDONLY;
-    }
-
-    drop(data);
-
-    if ret != 0 {
-        let err = errno::errno();
+    if let Err(e) = ret {
+        let err = errno::Errno(e.raw_os_error());
 
         // mount(2) has nowhere to put an explanation, so an errno is all there
         // is to report - which is the reason mount_fs_context() exists. EBUSY
@@ -446,7 +433,7 @@ pub(crate) struct ParsedMountOptions {
     /// Filesystem-specific options: everything not consumed as a kernel flag.
     pub fs_opts:      Option<String>,
     /// Kernel mount flags for mount(2).
-    pub flags:        libc::c_ulong,
+    pub flags:        core::ffi::c_ulong,
     /// `flags` expressed as fuser options, for the FUSE path. Flags with no
     /// fuser equivalent are omitted here but still apply via `flags`.
     #[cfg(feature = "fuse")]
@@ -524,12 +511,12 @@ mod tests {
     /// straight through `?`, and behind a context someone adds later.
     #[test]
     fn splitbrain_is_recognised_through_anyhow() {
-        let sb = || BchError::from_errcode(c::bch_errcode::BCH_ERR_device_splitbrain);
+        let sb = || BchError::from(c::Errcode::device_splitbrain);
 
         assert!(is_splitbrain(&anyhow::Error::from(sb())));
         assert!(is_splitbrain(&anyhow::Error::from(sb()).context("scanning for devices")));
 
-        let other = BchError::from_errcode(c::bch_errcode::BCH_ERR_device_has_been_removed);
+        let other = BchError::from(c::Errcode::device_has_been_removed);
         assert!(!is_splitbrain(&anyhow::Error::from(other)));
         assert!(!is_splitbrain(&anyhow::anyhow!("not a bcachefs error at all")));
     }
@@ -587,12 +574,12 @@ fn handle_unlock(cli: &Cli, sb: &bch_sb_handle) -> Result<Unlocked> {
 /// exactly as it does when there is no split brain.
 fn is_splitbrain(err: &anyhow::Error) -> bool {
     err.downcast_ref::<BchError>()
-        .is_some_and(|e| e.matches(c::bch_errcode::BCH_ERR_device_splitbrain))
+        .is_some_and(|e| e.matches(c::Errcode::device_splitbrain))
 }
 
 /// Scan for the filesystem's devices, and if its history has forked, ask.
 ///
-/// The check runs deep in the scan - it has to, before bch2_sbs_filter_dead()
+/// The check runs deep in the scan - it has to, before filter_dead()
 /// frees the divergent superblocks - but the *decision* cannot, because the
 /// scan re-runs on every device arrival while waiting for members: a question
 /// there would be asked repeatedly and the answer could not persist. So the
@@ -617,7 +604,7 @@ fn scan_or_ask_splitbrain(dev: &String, opts: &mut bch_opts)
     // both what to name in the question and what to mount if they say yes.
     // Not the waiting scan: the one above already waited, and everything it
     // is about to find is what that wait turned up.
-    opt_set!(opts, no_splitbrain_check, 1);
+    opts.set_no_splitbrain_check(true);
     let sbs = device_scan::scan_sbs(dev, opts)?;
 
     let Some((_, sb)) = sbs.first() else {
@@ -628,7 +615,7 @@ fn scan_or_ask_splitbrain(dev: &String, opts: &mut bch_opts)
         return Err(err);
     }
 
-    opt_set!(opts, degraded, c::bch_degraded_actions::BCH_DEGRADED_yes as u8);
+    opts.set_degraded(c::DegradedAction::yes);
     Ok(sbs)
 }
 
@@ -748,7 +735,7 @@ fn cmd_mount_inner(cli: &Cli) -> Result<()> {
     let devices = device_scan::joined_device_str(&sbs);
 
     let first_sb = &sbs[0].1;
-    let unlocked = if unsafe { bch_bindgen::c::bch2_sb_is_encrypted(first_sb.sb) } {
+    let unlocked = if crate::key::sb_is_encrypted(first_sb) {
         Some(handle_unlock(cli, first_sb)?)
     } else {
         None

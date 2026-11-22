@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! Static branches: static_branch_unlikely!(), for Rust - ours, not the kernel
+//! crate's. Its macro includes asm made during the kernel's own build,
+//! rust/kernel/generated_arch_static_branch_asm.rs, which a kernel's build
+//! tree for external modules needn't have: mainline's install-extmod-build
+//! ships nothing of rust/, Ubuntu has it in a package of its own, nixpkgs
+//! doesn't have it at all.
+//!
+//! As percpu.rs: on x86_64 and arm64, with CONFIG_JUMP_LABEL, it's
+//! inline, as C's is - the asm is the kernel's own, ARCH_STATIC_BRANCH_ASM()
+//! from the headers of the kernel being built against (jump_label_asm.rs.S,
+//! preprocessed by Makefile.rust): a NOP the kernel patches into a jump to the
+//! label when the key is enabled. Elsewhere it's C's static_branch_unlikely(),
+//! out of line.
+
+// C's static_branch_unlikely(), out of line, where Rust has no asm of its own.
+pub use crate::c::bch2_static_branch_unlikely;
+
+#[path = "../jump_label.rs"]
+mod common;
+pub use common::StaticKeyFalse;
+
+#[cfg(all(CONFIG_JUMP_LABEL, any(target_arch = "x86_64", target_arch = "aarch64")))]
+include!(concat!(env!("OUT_DIR"), "/jump_label_asm.rs"));
+
+#[cfg(all(CONFIG_JUMP_LABEL, any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) use static_branch_asm;
+
+/// Whether the static key at field @field of @key, a static laid out as a
+/// @keytyp, is enabled - unlikely, so the branch costs a NOP while it isn't:
+/// static_branch_unlikely(). As the kernel crate's macro takes it: a symbol, as
+/// the asm's __jump_table entry has to name one.
+///
+/// Given only @key, a StaticKeyFalse static, it's safe.
+///
+/// # Safety
+/// @key is a static, its @field a struct static_key_false - in an UnsafeCell, if
+/// Rust defines it - that only the static key API writes.
+#[macro_export]
+macro_rules! static_branch_unlikely {
+    ($key:path) => {{
+        let _: &'static $crate::os::jump_label::StaticKeyFalse = &$key;
+        // SAFETY: a StaticKeyFalse's key, which only the static key API writes
+        unsafe { $crate::static_branch_unlikely!($key, $crate::os::jump_label::StaticKeyFalse, 0) }
+    }};
+    ($key:path, $keytyp:ty, $field:tt) => {{
+        #[cfg(all(CONFIG_JUMP_LABEL, target_arch = "x86_64"))]
+        let enabled = 'enabled: {
+            ::core::arch::asm!(
+                $crate::os::jump_label::static_branch_asm!(),
+                l_yes = label { break 'enabled true; },
+                symb = sym $key,
+                off = const ::core::mem::offset_of!($keytyp, $field),
+                branch = const 0,
+                options(att_syntax),
+            );
+            false
+        };
+
+        #[cfg(all(CONFIG_JUMP_LABEL, target_arch = "aarch64"))]
+        let enabled = 'enabled: {
+            ::core::arch::asm!(
+                $crate::os::jump_label::static_branch_asm!(),
+                l_yes = label { break 'enabled true; },
+                symb = sym $key,
+                off = const ::core::mem::offset_of!($keytyp, $field),
+                branch = const 0,
+            );
+            false
+        };
+
+        #[cfg(not(all(CONFIG_JUMP_LABEL, any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        let enabled = $crate::os::jump_label::bch2_static_branch_unlikely(
+            ::core::ptr::addr_of!($key).cast::<u8>().cast_mut()
+                .add(::core::mem::offset_of!($keytyp, $field)).cast());
+
+        enabled
+    }};
+}

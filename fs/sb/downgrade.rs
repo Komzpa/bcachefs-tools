@@ -1,0 +1,369 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! The superblock's downgrade section: for each version a downgrade goes back
+//! past, the recovery passes to run and the errors to fix silently.
+//!
+//! It's written by the version that knows what downgrading from it costs, for
+//! an older one to read - sb_set_downgrade(), when an older version
+//! mounts a newer filesystem.
+
+use core::ffi::c_ulong;
+use core::mem::size_of;
+
+
+use crate::init::passes::RecoveryPass;
+use crate::btree::bkey::ValidateFlags;
+use crate::c;
+use crate::errcode::{Errcode, BchError};
+use crate::fs::{Fs, SbLockGuard};
+use crate::init::passes;
+use crate::{prt, sb_err_on};
+use crate::sb::errors::{prt_error_ids, SbErrorId};
+use crate::sb::io::{entries_end, SbFieldOps};
+use crate::types::Le64;
+use crate::util::alloc::{AllocError, KVVec};
+use crate::data_structures::bitmap::LeBitmap;
+use crate::util::vstructs::{bytes_of_mut, Head, Unvalidated, Validated};
+use crate::util::Printbuf;
+use crate::sb::io::SbResize;
+use crate::format::{Btree, MetadataVersion};
+
+type Section = c::bch_sb_field_downgrade<Validated>;
+
+const SECTION_HEAD: usize = size_of::<Head<Section>>();
+
+
+impl SbFieldOps for Section {
+    fn validate(sb: &c::bch_sb<Unvalidated>, f: &c::bch_sb_field_downgrade<Unvalidated>,
+                _flags: ValidateFlags, err: &mut Printbuf) -> Result<(), BchError> {
+        let sb_major = sb.version.get().major();
+        for e in f.entries().map_while(Result::ok) {
+            let major = e.version.get().major();
+            sb_err_on!(err, major != sb_major, invalid_sb_downgrade,
+                       "downgrade entry with mismatched major version ({major} != {sb_major})")?;
+        }
+        Ok(())
+    }
+
+    fn to_text(out: &mut Printbuf, _fs: Option<&Fs>, _sb: &c::bch_sb<Unvalidated>,
+                f: &c::bch_sb_field_downgrade<Unvalidated>) {
+        if out.nr_tabstops() <= 1 {
+            out.tabstop_push(16);
+        }
+
+        for e in f.entries().map_while(Result::ok) {
+            prt!(out, "version:\t{}\n", e.version.get());
+
+            write!(out, "recovery passes:\t");
+            passes::prt_stable(out, e.recovery_passes[0].get());
+            out.newline();
+
+            write!(out, "errors:\t");
+            prt_error_ids(out, e.errors.iter().map(|id| SbErrorId(id.get().into())));
+            out.newline();
+        }
+    }
+
+    fn entries_end(b: &[u8]) -> Option<usize> {
+        entries_end::<c::bch_sb_field_downgrade_entry<Unvalidated>>(b, SECTION_HEAD, |_| true)
+    }
+
+    /// downgrade_entries(): what this version knows. As C, failing leaves
+    /// the section as it was: the write goes on.
+    fn from_cpu(fs: &Fs, sb: &mut SbLockGuard<'_>) -> Result<(), BchError> {
+        // have_stripes() reads the btree roots
+        if !fs.flags.get(c::FsFlag::btree_running) {
+            return Ok(());
+        }
+
+        let Ok(table) = downgrade_entries(sb.sb().version.get().major(), fs.sb.version_incompat.get(),
+                                          fs.have_stripes()) else {
+            return Ok(());
+        };
+
+        let bytes = (SECTION_HEAD + table.len()).next_multiple_of(size_of::<u64>());
+
+        // Larger than ours, it's a newer version's: what downgrading from
+        // that version costs, which only it knows and an older version reads
+        // when it's downgraded to. Rewriting it from our smaller table would
+        // lose the entries for the versions past ours - so a table of ours
+        // that shrank isn't written either, until a new major empties it.
+        if sb.field::<Section>().is_some_and(|d| d.as_bytes().len() > bytes) {
+            return Ok(());
+        }
+
+        let mut sb = fs.sb_resize(sb);
+        let Some(d) = sb.field_resize::<Section>((bytes / size_of::<u64>()) as u32) else {
+            let _ = fs.err(Errcode::ENOSPC_sb_downgrade);
+            return Ok(());
+        };
+        let d = &mut bytes_of_mut(d)[SECTION_HEAD..];
+        d[..table.len()].copy_from_slice(&table);
+        d[table.len()..].fill(0);
+        Ok(())
+    }
+}
+
+// ── The upgrade and downgrade tables ─────────────────────────────────────────
+
+/// What upgrading to - or downgrading from - @version needs: recovery passes
+/// to run, and errors they'll find that are to be fixed silently.
+struct UpDown {
+    version:  MetadataVersion,
+    /// Every fsck pass, as well as @passes.
+    all_fsck: bool,
+    /// BCH_RECOVERY_PASS_* bits.
+    passes:   u64,
+    errors:   &'static [SbErrorId],
+}
+
+/// `version => [passes] (+ all_fsck), [errors];`
+macro_rules! table {
+    ($( $ver:ident => [$($pass:ident),*] $(+ $all:ident)?, [$($err:ident),*]; )*) => {
+        &[$(UpDown {
+            version:  MetadataVersion::$ver,
+            all_fsck: false $(|| table!(@$all))?,
+            passes:   0 $(| 1 << RecoveryPass::$pass as u64)*,
+            errors:   &[$(SbErrorId::$err),*],
+        }),*]
+    };
+    (@all_fsck) => { true };
+}
+
+const UPGRADE: &[UpDown] = table! {
+    snapshot_2                  => [] + all_fsck, [subvol_root_wrong_bi_subvol, subvol_not_master_and_not_snapshot];
+    backpointers                => [] + all_fsck, [];
+    inode_v3                    => [] + all_fsck, [];
+    unwritten_extents           => [] + all_fsck, [];
+    bucket_gens                 => [bucket_gens_init] + all_fsck, [];
+    lru_v2                      => [] + all_fsck, [];
+    fragmentation_lru           => [] + all_fsck, [];
+    no_bps_in_alloc_keys        => [] + all_fsck, [];
+    snapshot_trees              => [] + all_fsck, [];
+    snapshot_skiplists          => [check_snapshots], [snapshot_bad_depth, snapshot_bad_skiplist];
+    deleted_inodes              => [check_inodes], [unlinked_inode_not_on_deleted_list];
+    rebalance_work              => [set_fs_needs_reconcile], [];
+    subvolume_fs_parent         => [check_dirents], [subvol_fs_path_parent_wrong];
+    btree_subvolume_children    => [check_subvols], [subvol_children_not_set];
+    mi_btree_bitmap             => [check_allocations], [btree_bitmap_not_marked];
+    disk_accounting_v2          => [check_allocations],
+        [bkey_version_in_future, dev_usage_buckets_wrong, dev_usage_sectors_wrong,
+         dev_usage_fragmented_wrong, accounting_mismatch];
+    disk_accounting_v3          => [check_allocations],
+        [bkey_version_in_future, dev_usage_buckets_wrong, dev_usage_sectors_wrong,
+         dev_usage_fragmented_wrong, accounting_mismatch, accounting_key_replicas_nr_devs_0,
+         accounting_key_replicas_nr_required_bad, accounting_key_replicas_devs_unsorted,
+         accounting_key_junk_at_end];
+    disk_accounting_inum        => [check_allocations], [accounting_mismatch];
+    rebalance_work_acct_fix     => [check_allocations], [accounting_mismatch];
+    inode_has_child_snapshots   => [check_inodes], [inode_has_child_snapshots_wrong];
+    backpointer_bucket_gen      => [check_extents_to_backpointers],
+        [backpointer_to_missing_ptr, ptr_to_missing_backpointer];
+    disk_accounting_big_endian  => [check_allocations],
+        [accounting_mismatch, accounting_key_replicas_nr_devs_0, accounting_key_junk_at_end];
+    cached_backpointers         => [check_extents_to_backpointers], [ptr_to_missing_backpointer];
+    stripe_backpointers         => [check_extents_to_backpointers], [ptr_to_missing_backpointer];
+    inode_has_case_insensitive  => [check_inodes],
+        [inode_has_case_insensitive_not_set, inode_parent_has_case_insensitive_not_set];
+    btree_node_accounting       => [check_allocations], [accounting_mismatch];
+    reconcile                   => [check_reconcile_work], [accounting_mismatch, extent_io_opts_not_set];
+    bucket_stripe_index         => [check_alloc_info, check_alloc_to_lru_refs],
+        [alloc_key_stripe_refcount_wrong, stripe_to_missing_bucket_ref];
+    need_discard_by_journal_seq => [check_alloc_info],
+        [need_discard_freespace_key_bad, need_discard_key_wrong,
+         need_discard_freespace_key_to_invalid_dev_bucket];
+    per_dev_fragmentation_lru   => [check_allocations, check_lrus, check_alloc_to_lru_refs, check_inodes,
+                                    check_xattrs, check_snapshots, check_subvols, delete_dead_snapshots],
+        [accounting_mismatch, lru_entry_bad, alloc_key_to_missing_lru_entry,
+         inode_has_inode_opts_flag_wrong, inode_has_access_acl_flag_wrong,
+         inode_has_default_acl_flag_wrong, snapshot_state_bad, subvol_state_bad];
+};
+
+/// What only a filesystem with stripes needs, on top of the version's row:
+/// past bucket_stripe_sectors, check_allocations, and the bucket sector
+/// counts it fixes silently; past inline_data_csum, the passes that move
+/// stripe backpointers, and their reconcile phys entries, to and from the
+/// stripe index's key, and the lru checks, for the stripe lru's split into
+/// copygc's and reuse's.
+const UPGRADE_STRIPES: &[UpDown] = table! {
+    bucket_stripe_sectors  => [check_allocations], [alloc_key_dirty_sectors_wrong, alloc_key_stripe_sectors_wrong];
+    inline_data_csum       => [check_backpointers_to_extents, check_extents_to_backpointers, check_reconcile_work,
+                               check_lrus, check_alloc_to_lru_refs],
+        [backpointer_to_missing_ptr, ptr_to_missing_backpointer, reconcile_work_phys_incorrectly_set,
+         lru_entry_bad, alloc_key_to_missing_lru_entry];
+};
+
+/// For an incompatible upgrade: one past what version_incompat_allowed was.
+const UPGRADE_INCOMPAT: &[UpDown] = table! {
+    reconcile => [check_reconcile_work], [extent_io_opts_not_set];
+};
+
+const DOWNGRADE: &[UpDown] = table! {
+    bucket_stripe_sectors       => [], [];
+    disk_accounting_v2          => [check_allocations],
+        [dev_usage_buckets_wrong, dev_usage_sectors_wrong, dev_usage_fragmented_wrong,
+         fs_usage_hidden_wrong, fs_usage_btree_wrong, fs_usage_data_wrong, fs_usage_cached_wrong,
+         fs_usage_reserved_wrong, fs_usage_nr_inodes_wrong, fs_usage_persistent_reserved_wrong,
+         fs_usage_replicas_wrong, bkey_version_in_future];
+    disk_accounting_v3          => [check_allocations],
+        [dev_usage_buckets_wrong, dev_usage_sectors_wrong, dev_usage_fragmented_wrong,
+         fs_usage_hidden_wrong, fs_usage_btree_wrong, fs_usage_data_wrong, fs_usage_cached_wrong,
+         fs_usage_reserved_wrong, fs_usage_nr_inodes_wrong, fs_usage_persistent_reserved_wrong,
+         fs_usage_replicas_wrong, accounting_replicas_not_marked, bkey_version_in_future];
+    rebalance_work_acct_fix     => [check_allocations],
+        [accounting_mismatch, accounting_key_replicas_nr_devs_0, accounting_key_junk_at_end];
+    backpointer_bucket_gen      => [check_extents_to_backpointers],
+        [backpointer_bucket_offset_wrong, backpointer_to_missing_ptr, ptr_to_missing_backpointer];
+    disk_accounting_big_endian  => [check_allocations],
+        [accounting_mismatch, accounting_key_replicas_nr_devs_0, accounting_key_junk_at_end];
+    btree_node_accounting       => [check_allocations], [accounting_mismatch, accounting_key_nr_counters_wrong];
+    bucket_stripe_index         => [check_alloc_info, check_alloc_to_lru_refs], [];
+    need_discard_by_journal_seq => [check_alloc_info],
+        [need_discard_freespace_key_bad, need_discard_key_wrong,
+         need_discard_freespace_key_to_invalid_dev_bucket];
+    per_dev_fragmentation_lru   => [check_allocations, check_lrus, check_alloc_to_lru_refs],
+        [lru_entry_bad, alloc_key_to_missing_lru_entry, accounting_mismatch];
+    inline_data_csum            => [], [];
+};
+
+/// UPGRADE_STRIPES', for a downgrade: added to the version's DOWNGRADE row,
+/// which it needs - an empty one, if that's all.
+const DOWNGRADE_STRIPES: &[UpDown] = table! {
+    bucket_stripe_sectors  => [check_allocations], [alloc_key_dirty_sectors_wrong];
+    // older versions reject the keys with a stripe index, and have one stripe
+    // lru: they delete the reuse lru's entries, an id they don't know
+    inline_data_csum       => [check_backpointers_to_extents, check_extents_to_backpointers, check_reconcile_work,
+                               check_lrus, check_alloc_to_lru_refs],
+        [backpointer_to_missing_ptr, ptr_to_missing_backpointer, reconcile_work_phys_incorrectly_set,
+         bkey_snapshot_nonzero, lru_entry_bad, alloc_key_to_missing_lru_entry];
+};
+
+// ── Applying them ────────────────────────────────────────────────────────────
+
+/// Every superblock has one from mount on.
+pub(crate) fn ext(sb: &mut c::bch_sb_buf) -> &mut c::bch_sb_field_ext<Validated> {
+    sb.field_mut::<c::bch_sb_field_ext>().expect("an ext section")
+}
+
+/// Upgrading from @old to @new: what each version past @old, up to @new,
+/// needs, into the ext section's recovery_passes_required and errors_silent.
+fn set_upgrade(sb: &mut c::bch_sb_buf, table: &[UpDown], old: MetadataVersion, new: MetadataVersion) {
+    let ext = ext(sb);
+    for i in table.iter().filter(|i| old < i.version && i.version <= new) {
+        let fsck = if i.all_fsck { passes::fsck_passes() } else { 0 };
+        let passes = passes::passes_to_stable(i.passes | fsck);
+        ext.recovery_passes_required[0] |= passes;
+        for e in i.errors {
+            LeBitmap::from_words_mut(&mut ext.errors_silent).set(e.0 as usize);
+        }
+    }
+}
+
+/// set_upgrade(), by the table for upgrades.
+pub(crate) fn sb_set_upgrade(sb: &mut c::bch_sb_buf, old: MetadataVersion, new: MetadataVersion) {
+    set_upgrade(sb, UPGRADE, old, new)
+}
+
+/// set_upgrade(), by the table for allowing incompatible features.
+pub(crate) fn set_upgrade_incompat(sb: &mut c::bch_sb_buf, old: MetadataVersion, new: MetadataVersion) {
+    set_upgrade(sb, UPGRADE_INCOMPAT, old, new)
+}
+
+impl Fs {
+    /// Whether there's a stripes btree: a root read, not a fake one.
+    fn have_stripes(&self) -> bool {
+        // None, or the root: a failed read is the root's error, not its node
+        self.btree_id_root(Btree::stripes.0).is_some_and(|b| !b.is_fake())
+    }
+
+    /// What an upgrade needs on a filesystem with stripes: UPGRADE_STRIPES'.
+    pub fn sb_set_upgrade_extra(&self) {
+        let mut sb = self.sb_lock();
+        let new = self.sb.version.get();
+        let old = self.sb.version_upgrade_complete.get();
+        if !UPGRADE_STRIPES.iter().any(|i| old < i.version && i.version <= new) || !self.have_stripes() {
+            return;
+        }
+
+        set_upgrade(&mut sb, UPGRADE_STRIPES, old, new);
+        self.write_super(&mut sb);
+    }
+}
+
+/// Downgrading from minor version @old_minor to @new_minor: what the section
+/// says each minor version past @new_minor, up to @old_minor, needs - into
+/// the ext section, and errors_silent in memory, which recovery reads.
+pub(crate) fn sb_set_downgrade(sb: &mut SbLockGuard<'_>, new_minor: u32, old_minor: u32) {
+    let (handle, cpu) = sb.parts();
+    let Some(d) = handle.field::<Section>() else { return };
+
+    let mut passes = [0; 2];
+    let mut silent = [Le64::new(0); 8];
+    for e in d.entries() {
+        let minor = e.version.get().minor();
+        if !(new_minor < minor && minor <= old_minor) {
+            continue;
+        }
+
+        passes[0] |= e.recovery_passes[0].get();
+        passes[1] |= e.recovery_passes[1].get();
+        for id in e.errors.iter().map(|id| usize::from(id.get())) {
+            if id < c::SbErrorId::NR as usize {
+                let bits = c_ulong::BITS as usize;
+                *cpu.errors_silent[id / bits].place() |= 1 << (id % bits);
+            }
+            if id < silent.len() * 64 {
+                LeBitmap::from_words_mut(&mut silent).set(id);
+            }
+        }
+    }
+
+    let ext = ext(sb);
+    for (w, p) in ext.recovery_passes_required.iter_mut().zip(passes) {
+        *w |= p;
+    }
+    for (w, s) in ext.errors_silent.iter_mut().zip(silent) {
+        *w |= s.get();
+    }
+}
+
+// A DOWNGRADE_STRIPES row is written into its version's DOWNGRADE entry: one
+// without a DOWNGRADE row would never be written.
+const _: () = {
+    let mut i = 0;
+    while i < DOWNGRADE_STRIPES.len() {
+        let mut j = 0;
+        while j < DOWNGRADE.len() && DOWNGRADE[j].version.0 != DOWNGRADE_STRIPES[i].version.0 {
+            j += 1;
+        }
+        assert!(j < DOWNGRADE.len(), "a DOWNGRADE_STRIPES row needs a DOWNGRADE row");
+        i += 1;
+    }
+};
+
+/// The downgrade section's entries, from the downgrade table: for each
+/// version of @major from @version_incompat on, what downgrading past it
+/// needs - those that need nothing left out.
+fn downgrade_entries(major: u32, version_incompat: MetadataVersion, have_stripes: bool)
+        -> Result<KVVec<u8>, AllocError> {
+    let mut table = KVVec::<u8>::new();
+    for src in DOWNGRADE.iter().filter(|s| s.version.major() == major && s.version >= version_incompat) {
+        let stripes = DOWNGRADE_STRIPES.iter().find(|s| have_stripes && s.version == src.version);
+        let passes = passes::passes_to_stable(src.passes | stripes.map_or(0, |s| s.passes));
+        let errors = src.errors.iter().chain(stripes.into_iter().flat_map(|s| s.errors));
+        let nr_errors = errors.clone().count();
+        if passes == 0 && nr_errors == 0 {
+            continue;
+        }
+
+        table.extend_from_slice(&(src.version.0 as u16).to_le_bytes())?;
+        table.extend_from_slice(&passes.to_le_bytes())?;
+        table.extend_from_slice(&0u64.to_le_bytes())?;
+        table.extend_from_slice(&(nr_errors as u16).to_le_bytes())?;
+        for e in errors {
+            table.extend_from_slice(&(e.0 as u16).to_le_bytes())?;
+        }
+    }
+    Ok(table)
+}
+

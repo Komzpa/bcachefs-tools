@@ -1,0 +1,1372 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! The foreground allocator's core: open buckets - a pin on one, and the
+//! hash that says whether a bucket is open - and allocation requests, their
+//! trace, and waiting on the allocator. Which devices and buckets a request
+//! gets are dev_select.rs's and bucket_alloc.rs's, its set of buckets
+//! bucket_set.rs's; write points and the sector allocator are
+//! write_point.rs's and sector_alloc.rs's.
+//!
+//! An open bucket is a slot in the allocator's open_buckets[], named by its
+//! index: a bucket handed out to be written, kept open by its pins - ->pin, a
+//! refcount. The last put closes it: back on the freelist, or for a block of
+//! a stripe being made, its ->ec's io ref dropped. Pins move by index - an
+//! open_buckets list (a write point's, an alloc_request's) - and an
+//! OpenBucket is one Rust holds, a RefGuard on the bucket's pins: into_idx()
+//! hands it to such a list, from_idx() takes one back. While it's pinned, its
+//! identity - OpenBucketId: dev, generation, bucket - doesn't change;
+//! sectors_free is its writer's.
+//!
+//! A block of a stripe being made that a writer has claimed is open past its
+//! last put, for the stripe: an EcOpenBucket, the other owning handle, which
+//! closes it. Both deref to an OpenBucketRef, the bucket borrowed.
+//!
+//! What an open bucket is for: buckets partly written, for sub-bucket
+//! allocations - the sector allocator's write points and partial list - and
+//! a reference GC can find to buckets an allocation has but no key yet
+//! points to. So a writer puts its pin only after the index update that
+//! makes its allocation reachable.
+//!
+//! The hash is OPEN_BUCKETS_COUNT slots, each the head of a chain through
+//! the open buckets' ->hash, 0 ending it, a bucket's slot hash_64() of its
+//! (dev, bucket). It's written under freelist_lock and read without it -
+//! each slot and link once, volatile, and each bucket's identity whole. A
+//! bucket opened or closed while we look may be seen or missed: a caller for
+//! whom that matters looks again under the lock, bucket_is_open_safe().
+//!
+//! A request that finds nothing free waits - on freelist_events for buckets,
+//! open_buckets_events for open buckets - and retries when a wake may be for
+//! it: its trace records each attempt, with the device's wake counter as it
+//! was, and a wake is for it if one it tried has moved since.
+
+/* DOC(foreground-allocator)
+ *
+ * bcachefs automatically reduces fragmentation by segregating different types
+ * of IO into separate buckets. Data from different files, metadata, and
+ * internal bookkeeping each get their own write points (active allocation
+ * contexts). The key insight: data written at the same time by the same file
+ * tends to be deleted at the same time, so grouping it together means entire
+ * buckets become free at once rather than becoming fragmented.
+ *
+ * User data write points are hashed by inode number, so different files
+ * naturally land in different buckets without any user configuration. Separate
+ * write points also exist for btree nodes, copygc, and the reconcile
+ * subsystem, keeping internal IO from mixing with user data.
+ */
+
+#![allow(non_camel_case_types)]
+
+use crate::fs::Dev;
+use crate::alloc::discard::fast_discard_bucket_add;
+use crate::alloc::disk_groups::Target;
+use crate::data::ec::stripe_new::StripeNew;
+use crate::btree::iter::TransAttempt;
+use crate::c;
+use crate::c::Errcode;
+use crate::data::copygc::can_make_progress;
+use crate::errcode::{ret_to_c, BchError};
+use crate::format::DataType;
+use crate::fs::Fs;
+use crate::locking::{ExclusiveGuard, SpinLockIrq};
+use crate::opts::data_type_str;
+use crate::percpu_field;
+use crate::debug::trace::events;
+use crate::sb::members::data_types_to_text;
+use crate::util::alloc::init_at;
+use crate::util::futex::EventCount;
+use crate::util::hash::{hash_64, Fold};
+use crate::data_structures::inline_vec::InlineVec;
+use crate::os::kernel::{jiffies, time_after, unlikely, HZ};
+use crate::util::log::{print_str, LogLevel};
+use crate::util::place::Contained;
+use crate::util::projections::Volatile;
+use crate::util::rcu::read_lock;
+use crate::util::refcount::{RefBorrow, RefGuard, Refcount};
+use crate::util::task::Resume;
+use crate::util::{Printbuf, ToText};
+use core::ffi::{c_long, c_uint, c_ulong};
+use core::convert::Infallible;
+use core::ops::Deref;
+use core::ptr::NonNull;
+use core::sync::atomic::Ordering::{Relaxed, SeqCst};
+use cstruct_macros::{bitfield, bch_enum, MaybeZeroable, BitfieldMembers};
+use nestify::nest;
+
+#[repr(C)]
+#[derive(Clone, Copy, MaybeZeroable)]
+pub struct dev_alloc_list {
+    pub nr: c_uint,
+    pub data: [u8; c::BCH_SB_MEMBERS_MAX as usize],
+}
+
+nest! {
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, MaybeZeroable, BitfieldMembers)]
+    pub struct alloc_trace_entry {
+        pub dev: u8,
+        #[members]
+        #>[bitfield(u8)]
+        pub bits: pub struct alloc_trace_entry_bits {
+            new_stripe_alloc:          bool,
+            will_retry_all_devices:    bool,
+            will_retry_target_devices: bool,
+            will_retry_set_devices:    bool,
+            copygc_can_make_progress:  bool,
+            may_wait:                  bool,
+            __pad:                     u2,
+        },
+        pub err: i16,
+        pub wake_counter_snapshot: u32,
+        pub free_buckets: u64,
+    }
+}
+
+/// alloc_request's trace: room for 16 attempts in the request itself, as
+/// C's DARRAY_PREALLOCATED(, 16) had.
+pub(crate) type AllocTrace = InlineVec<c::alloc_trace_entry, 16>;
+
+/*
+ * alloc_request.btree_bitmap: whether the bucket must be in a region the
+ * device's btree bitmap marks (YES), must not be (NO), or may be either (ANY)
+ */
+#[bch_enum(closed)]
+#[repr(u32)]
+pub enum AllocBtreeBitmap {
+    BTREE_BITMAP_NO,
+    BTREE_BITMAP_YES,
+    BTREE_BITMAP_ANY,
+}
+
+/// How an allocation that can't be had now waits for one that can.
+#[derive(Clone, Copy)]
+pub enum AllocWait {
+    /// It doesn't: it fails.
+    Never,
+    /// Its caller's thread, in wait_on_allocator(): once it's blocked, on
+    /// what, and that count's snapshot from before the check that failed.
+    Sync(Option<(Blocked, u32)>),
+    /// Its caller's task, as Sync's: Blocked::wait_async() awaits it, the
+    /// transaction dropped first.
+    Async(Option<(Blocked, u32)>),
+}
+
+/// What a thread's allocation blocked on.
+#[derive(Clone, Copy)]
+pub enum Blocked {
+    Freelist,
+    OpenBuckets,
+    StripeBuf,
+}
+
+impl Blocked {
+    pub fn events(self, fs: &Fs) -> &EventCount {
+        match self {
+            Blocked::Freelist    => &fs.allocator.freelist_events,
+            Blocked::OpenBuckets => &fs.allocator.open_buckets_events,
+            Blocked::StripeBuf   => &fs.ec.stripe_buf_freed,
+        }
+    }
+
+    /// An AllocWait::Async request's wait, its task's locks dropped: till
+    /// any wake after @seen, resumed @at, to retry - true if none came in
+    /// allocator_stuck_timeout, for the retry to report as stuck if it
+    /// blocks again: the request is its. Or an error, if the filesystem's
+    /// gone emergency read-only and won't allocate again.
+    pub async fn wait_async(self, fs: &Fs, seen: u32, at: Resume<'_>) -> Result<bool, BchError> {
+        let timeout = c_ulong::from(fs.opts.allocator_stuck_timeout.get()) * HZ;
+        let stuck = match timeout {
+            0 => {
+                self.events(fs).wait_async(seen, at).await;
+                false
+            }
+            _ => self.events(fs).wait_async_timeout(seen, timeout, at).await.is_err(),
+        };
+        if fs.flags.get(c::FsFlag::emergency_ro) {
+            return fs.throw(c::Errcode::emergency_ro);
+        }
+        Ok(stuck)
+    }
+}
+
+nest! {
+    pub struct alloc_request<'r, 'f> {
+        pub wait: AllocWait,
+        pub wake_all_counter_snapshot: u32,
+        pub nr_replicas: u8,
+        pub ec_replicas: u8,
+        pub ec_max_data_blocks: u8, /* 0 = no cap */
+        pub target: c_uint,
+        #>[bitfield(u8)]
+        pub bits: pub struct alloc_request_bits {
+            ec:                        bool,
+            new_stripe_alloc:          bool,
+            will_retry_all_devices:    bool,
+            will_retry_target_devices: bool,
+            will_retry_set_devices:    bool,
+            copygc_can_make_progress:  bool,
+            trace_alloc_failed:        bool,
+            /* failure domains are a hard requirement, not a preference (erasure coding): */
+            failure_domains_required:  bool,
+        },
+        pub watermark: c::Watermark,
+        pub flags: c::WriteFlags,
+        pub data_type: DataType,
+        pub devs_have: Option<&'r c::bch_devs_list>,
+        pub wp: Option<&'f c::write_point>,
+
+        /* These fields are used primarily by open_bucket_add_buckets */
+        pub ptrs: c::open_buckets,
+        pub nr_effective: c_uint, /* sum of @ptrs durability */
+        pub devs_may_alloc: c::bch_devs_mask,
+
+        /*
+         * Devices already holding a replica of what we're allocating for -
+         * devs_have plus buckets allocated so far - for spreading replicas
+         * across failure domains, see bch2_dev_domain_key():
+         */
+        pub devs_chosen: c::bch_devs_mask,
+
+        /* devices this allocation should use first, see dev_alloc_required() */
+        pub devs_required: Option<&'f Volatile<c::DevsMask>>,
+
+        /* bch2_bucket_alloc_set_trans(): */
+        pub devs_sorted: c::dev_alloc_list,
+        pub domain_keys: [u64; c::BCH_SB_MEMBERS_MAX as usize],
+        pub usage: c::bch_dev_usage,
+
+        /*
+         * Allocate the free bucket nearest this device position (a 32.32
+         * fixed point fraction of the device, see dev_frac_to_offset()),
+         * instead of allocating from the device cursor; 0 = no target.
+         *
+         * A fraction rather than a sector offset so it means the same thing
+         * on devices of different sizes: erasure coding uses it to allocate
+         * a stripe's blocks at equivalent positions on each device, and the
+         * device is chosen after the target is set:
+         */
+        pub target_frac: u64,
+
+        pub btree_bitmap: c::AllocBtreeBitmap,
+
+        #>[derive(Clone, Copy, Default)]
+        pub counters: pub struct alloc_request_counters {
+            pub buckets_seen: u64,
+            pub skipped_open: u64,
+            pub skipped_need_journal_commit: u64,
+            pub need_journal_commit: u64,
+            pub skipped_nocow: u64,
+            pub skipped_nouse: u64,
+            pub skipped_mi_btree_bitmap: u64,
+        },
+
+        pub scratch_ptrs: c::open_buckets,
+
+        /* Allocation attempt trace — dumped on allocator stuck */
+        pub(crate) trace: AllocTrace,
+    }
+}
+
+const _: () = assert!(c::OPEN_BUCKETS_COUNT.is_power_of_two());
+
+// ── Open buckets ─────────────────────────────────────────────────────────
+
+/// An open bucket, borrowed while it's held open - by a pin, or its ->ec.
+/// Every field written meanwhile - by C, or another's Rust - is an atomic, a
+/// Volatile, or its lock; what's read when is open_bucket's (alloc/types.rs).
+#[repr(transparent)]
+pub struct OpenBucketRef(c::open_bucket);
+
+impl OpenBucketRef {
+    /// # Safety
+    /// @ob is open, and held open for 'a.
+    pub unsafe fn from_c<'a>(ob: *const c::open_bucket) -> &'a Self {
+        // SAFETY: a transparent open_bucket; the caller's
+        unsafe { &*ob.cast() }
+    }
+
+    /// # Safety
+    /// Open bucket @idx is open, and held open for 'a.
+    pub unsafe fn from_idx<'a>(fs: &'a Fs, idx: c::OpenBucketIdx) -> &'a Self {
+        // SAFETY: the caller's
+        unsafe { Self::from_c(&fs.allocator.open_buckets[idx.get()]) }
+    }
+
+    /// Its filesystem: its allocator's.
+    fn fs(&self) -> &Fs {
+        self.0.container().container()
+    }
+
+    /// Its device, which it keeps: device removal stops its open buckets
+    /// before the device goes.
+    pub fn ca(&self) -> &Dev {
+        let p = self.fs().devs[usize::from(self.id().dev())].as_ptr();
+        // SAFETY: an open bucket's device outlives it, as above
+        unsafe { p.as_ref() }.expect("an open bucket's device")
+    }
+
+    /// Where its free space starts.
+    pub fn ptr(&self) -> c::bch_extent_ptr {
+        let id = self.id();
+        let ca = self.ca();
+
+        c::bch_extent_ptr::new()
+            .with_generation(id.generation())
+            .with_dev(id.dev())
+            .with_offset(ca.bucket_to_sector(id.bucket()) + u64::from(ca.mi.get().bucket_size) -
+                         u64::from(self.sectors_free.get()))
+    }
+}
+
+impl Deref for OpenBucketRef {
+    type Target = c::open_bucket;
+
+    fn deref(&self) -> &c::open_bucket {
+        &self.0
+    }
+}
+
+// SAFETY: an OpenBucketRef is had only while it's held open - by a pin, or
+// its ->ec - so inc() is from a pin that's held; the last put closes it
+unsafe impl Refcount for OpenBucketRef {
+    type Target = Self;
+
+    fn target(&self) -> &Self {
+        self
+    }
+
+    unsafe fn inc(&self) {
+        self.pin.fetch_add(1, Relaxed);
+    }
+
+    unsafe fn dec(&self) {
+        // fully ordered, as atomic_dec_and_test()
+        if self.pin.fetch_sub(1, SeqCst) == 1 {
+            self.fs().open_bucket_close(self);
+        }
+    }
+}
+
+/// A pin on an open bucket: it's open while one's held.
+pub type OpenBucket = RefGuard<OpenBucketRef>;
+
+impl RefGuard<OpenBucketRef> {
+    /// # Safety
+    /// The caller holds a pin on open bucket @idx, and hands it over.
+    pub unsafe fn from_idx(fs: &Fs, idx: c::OpenBucketIdx) -> Self {
+        // SAFETY: the caller's
+        unsafe { RefGuard::adopt(OpenBucketRef::from_idx(fs, idx)) }
+    }
+
+    pub fn into_idx(self) -> c::OpenBucketIdx {
+        let idx = self.idx();
+        self.leak();
+        idx
+    }
+
+    /// Claimed by the writer of block @ec_idx of stripe @ec: its pin, given
+    /// back, the writer's - the bucket, for it - and its ->ec what keeps it
+    /// open for the stripe.
+    pub fn claim(self, ec: &StripeNew, ec_idx: u8) -> (EcOpenBucket, Self) {
+        // the pin's holder's to set, before the bucket's handed on
+        self.ec_idx.set(ec_idx);
+        self.ec.store(core::ptr::from_ref(ec).cast_mut(), Relaxed);
+        (EcOpenBucket { ob: NonNull::from(&**self) }, self)
+    }
+}
+
+/// A block of a stripe being made, claimed by a writer: open for the stripe,
+/// past its last pin, and closed when it's dropped - once the stripe's done
+/// with it.
+pub struct EcOpenBucket {
+    ob: NonNull<c::open_bucket>,
+}
+
+// SAFETY: as OpenBucket's: closing it takes the allocator's locks, and what's
+// read while it's open is fixed
+unsafe impl Send for EcOpenBucket {}
+unsafe impl Sync for EcOpenBucket {}
+
+impl Deref for EcOpenBucket {
+    type Target = OpenBucketRef;
+
+    fn deref(&self) -> &OpenBucketRef {
+        // SAFETY: it holds it open while it's borrowed
+        unsafe { OpenBucketRef::from_c(self.ob.as_ptr()) }
+    }
+}
+
+impl Drop for EcOpenBucket {
+    fn drop(&mut self) {
+        let ob: &c::open_bucket = self;
+        assert_eq!(ob.pin.load(SeqCst), 0,
+                   "closing open bucket {}, claimed by a writer still holding its pin", self.idx().get());
+        // open only for its stripe, which this ends
+        ob.ec.store(core::ptr::null_mut(), Relaxed);
+        self.fs().open_bucket_close(self);
+    }
+}
+
+impl c::open_buckets {
+    /// Its buckets, borrowed: the list's pins keep them open while it is.
+    pub fn iter<'a>(&'a self, fs: &'a Fs) -> impl Iterator<Item = RefBorrow<'a, OpenBucketRef>> + 'a {
+        self.v[..usize::from(self.nr)].iter().map(move |&i| {
+            // SAFETY: the list's pin, held while the list's borrowed
+            unsafe { RefBorrow::new(OpenBucketRef::from_idx(fs, i.expect("a bucket of the list"))) }
+        })
+    }
+
+    /// @ob added, the list holding its pin.
+    pub fn push(&mut self, ob: OpenBucket) {
+        let nr = usize::from(self.nr);
+        assert!(nr < self.v.len(), "open bucket list full");
+        self.v[nr] = Some(ob.into_idx());
+        self.nr += 1;
+    }
+
+    /// Its @i'th taken out, the rest moving down: its pin, which the list no
+    /// longer has.
+    pub fn remove(&mut self, fs: &Fs, i: usize) -> OpenBucket {
+        let nr = usize::from(self.nr);
+        let idx = self.v[..nr][i].expect("a bucket of the list");
+        self.v.copy_within(i + 1..nr, i);
+        self.nr -= 1;
+        // SAFETY: the list's pin, which it no longer has
+        unsafe { OpenBucket::from_idx(fs, idx) }
+    }
+
+    /// Its pins, taken one by one - a list holds one on each of its buckets -
+    /// leaving it empty: the rest put when the iterator's dropped. Not
+    /// collected: a list of them is a copy, on the stack, of what the list
+    /// already has.
+    pub fn drain<'f>(&mut self, fs: &'f Fs) -> OpenBucketsDrain<'f, '_> {
+        let nr = core::mem::take(&mut self.nr) as usize;
+        OpenBucketsDrain { fs, idxs: self.v[..nr].iter() }
+    }
+}
+
+/// open_buckets::drain()'s: pins the list no longer has.
+pub struct OpenBucketsDrain<'f, 'l> {
+    fs:   &'f Fs,
+    idxs: core::slice::Iter<'l, Option<c::OpenBucketIdx>>,
+}
+
+impl<'f> Iterator for OpenBucketsDrain<'f, '_> {
+    type Item = OpenBucket;
+
+    fn next(&mut self) -> Option<OpenBucket> {
+        let idx = self.idxs.next()?.expect("a bucket of the list");
+        // SAFETY: the list's pin, which it no longer has, handed out once
+        Some(unsafe { OpenBucket::from_idx(self.fs, idx) })
+    }
+}
+
+impl Drop for OpenBucketsDrain<'_, '_> {
+    fn drop(&mut self) {
+        self.for_each(drop);
+    }
+}
+
+/// freelist_lock, held.
+pub(crate) type FreelistGuard<'a> = ExclusiveGuard<'a, SpinLockIrq, c::OpenBucketsFree, c::OpenBucketsFreeNr>;
+
+/// An open bucket's lock, held.
+pub(crate) type ObGuard<'a> = ExclusiveGuard<'a, SpinLockIrq, (), c::OpenBucketIdentity>;
+
+impl c::open_bucket {
+    pub const ON_PARTIAL_LIST: u8  = 1 << 0;
+    pub const DO_DISCARDS_FAST: u8 = 1 << 1;
+
+    /// Which bucket it is, and whether it's open: read whole.
+    pub fn id(&self) -> c::OpenBucketId {
+        self.lock.id.get()
+    }
+
+    pub fn flag(&self, f: u8) -> bool {
+        self.flags.load(Relaxed) & f != 0
+    }
+
+    /// @f set if @v, else cleared: whether it was set.
+    pub fn set_flag(&self, f: u8, v: bool) -> bool {
+        let old = if v { self.flags.fetch_or(f, Relaxed) } else { self.flags.fetch_and(!f, Relaxed) };
+        old & f != 0
+    }
+
+    /// Its index, which the hash and the lists link it by.
+    pub fn idx(&self) -> c::OpenBucketIdx {
+        c::OpenBucketIdx::new(self.idx.get()).expect("an open bucket, not the sentinel")
+    }
+
+    /// The bucket, if it's open: valid, under its lock, which the close
+    /// clears.
+    pub fn open_ref<'a>(&'a self, _lock: &'a ObGuard<'_>) -> Option<&'a OpenBucketRef> {
+        // SAFETY: valid under its lock: open till the lock's dropped
+        self.id().valid().then(|| unsafe { OpenBucketRef::from_c(self) })
+    }
+}
+
+// ── The hash ─────────────────────────────────────────────────────────────
+
+impl c::bch_fs_allocator {
+    fn hash_slot(&self, dev: u32, bucket: u64) -> &Volatile<Option<c::OpenBucketIdx>> {
+        &self.open_buckets_hash[open_bucket_hash(dev, bucket)]
+    }
+
+    /// @ob into the hash, at its chain's head.
+    fn hash_add(&self, _g: &FreelistGuard<'_>, ob: &c::open_bucket) {
+        let id = ob.id();
+        let slot = self.hash_slot(id.dev().into(), id.bucket());
+        ob.hash.set(slot.get());
+        slot.set(Some(ob.idx()));
+    }
+
+    /// @ob out of the hash: its chain walked to the link to it.
+    fn hash_remove(&self, _g: &FreelistGuard<'_>, ob: &c::open_bucket) {
+        let me = Some(ob.idx());
+        let id = ob.id();
+        let mut slot = self.hash_slot(id.dev().into(), id.bucket());
+        while slot.get() != me {
+            slot = &self.open_buckets[slot.get().expect("an open bucket in its hash chain").get()].hash;
+        }
+        slot.set(ob.hash.get());
+        ob.hash.set(None);
+    }
+}
+
+impl Fs {
+    /// The open bucket @dev's @bucket is, if it's open - found racing the
+    /// allocator, so to be relied on only under freelist_lock, which opening
+    /// and closing hold.
+    pub fn open_bucket(&self, dev: u32, bucket: u64) -> Option<&c::open_bucket> {
+        let a = &self.allocator;
+        let mut i = a.hash_slot(dev, bucket).get();
+        while let Some(idx) = i {
+            let ob = &a.open_buckets[idx.get()];
+            let id = ob.id();
+            if u32::from(id.dev()) == dev && id.bucket() == bucket {
+                return Some(ob);
+            }
+            i = ob.hash.get();
+        }
+        None
+    }
+
+    /// Whether @dev's @bucket is open, as open_bucket() finds it.
+    pub fn bucket_is_open(&self, dev: u32, bucket: u64) -> bool {
+        self.open_bucket(dev, bucket).is_some()
+    }
+
+    /// @dev's open @bucket to be discarded as soon as it's freed - false if
+    /// it isn't open. Rechecked under the bucket's lock, which the close
+    /// takes: found without it, it may since have been reopened as another.
+    pub fn bucket_set_discard_fast(&self, dev: u32, bucket: u64) -> bool {
+        let Some(ob) = self.open_bucket(dev, bucket) else { return false };
+        let _l = ob.lock.lock();
+        let id = ob.id();
+        if u32::from(id.dev()) != dev || id.bucket() != bucket {
+            return false;
+        }
+        ob.set_flag(c::open_bucket::DO_DISCARDS_FAST, true);
+        true
+    }
+
+    /// bucket_is_open(), and if not, again under freelist_lock, which opening
+    /// a bucket holds.
+    pub fn bucket_is_open_safe(&self, dev: u32, bucket: u64) -> bool {
+        self.bucket_is_open(dev, bucket) || {
+            let _freelist = self.allocator.freelist_lock.lock();
+            self.bucket_is_open(dev, bucket)
+        }
+    }
+}
+
+// ── Opening and closing ──────────────────────────────────────────────────
+
+/// The open buckets kept back from allocations at @watermark: more, the lower
+/// it is, so what frees open buckets can still get them.
+pub(crate) fn open_buckets_reserved(watermark: c::Watermark) -> u32 {
+    use c::Watermark as w;
+    match watermark {
+        w::interior_updates        => 0,
+        w::reclaim                 => c::OPEN_BUCKETS_COUNT / 6,
+        w::btree | w::btree_copygc => c::OPEN_BUCKETS_COUNT / 4,
+        w::copygc                  => c::OPEN_BUCKETS_COUNT / 3,
+        _                          => c::OPEN_BUCKETS_COUNT / 2,
+    }
+}
+
+impl c::bch_fs_allocator {
+    /// The partial list's buckets, its pins held while @g is.
+    pub(crate) fn partial<'a>(&'a self, g: &'a FreelistGuard<'_>)
+        -> impl DoubleEndedIterator<Item = &'a OpenBucketRef> + ExactSizeIterator + 'a
+    {
+        let n = usize::from(self.freelist_lock.open_buckets_partial_nr.get());
+        g.open_buckets_partial[..n].iter().map(move |&i| {
+            // SAFETY: the partial list's pin, which it holds while the lock is
+            unsafe { OpenBucketRef::from_c(&self.open_buckets[i.expect("a bucket of the partial list").get()]) }
+        })
+    }
+}
+
+impl Fs {
+    /// The lowest watermark the open bucket pool can still serve - 0 if it
+    /// isn't starved: one short of the top, to leave interior updates a way.
+    pub(crate) fn open_buckets_starved_watermark(&self) -> u32 {
+        let nr_free = u32::from(self.allocator.freelist_lock.open_buckets_nr_free.get());
+        (0..c::Watermark::NR - 1).find(|&w| nr_free >= open_buckets_reserved(c::Watermark::from_bits(w)))
+            .unwrap_or(c::Watermark::NR - 1)
+    }
+
+    /// Bucket @bucket of @ca, of generation @generation, opened: None if it's
+    /// open already. Err with the pool down to @req's watermark's reserve -
+    /// blocked, on open_buckets_events.
+    pub(crate) fn try_alloc_bucket_locked(&self, ca: &Dev, req: &mut c::alloc_request, bucket: u64,
+                                          generation: u8) -> Result<Option<OpenBucket>, BchError>
+    {
+        let a = &self.allocator;
+        let times = |t: c::TimeStat| self.times.get(t as usize);
+        let dev = ca.dev_idx;
+
+        let mut g = a.freelist_lock.lock();
+
+        if unlikely(u32::from(a.freelist_lock.open_buckets_nr_free.get()) <= open_buckets_reserved(req.watermark)) {
+            times(c::TimeStat::blocked_allocate_open_bucket).track_event_change(true);
+            return Err(self.err(match req.block_on(self, Blocked::OpenBuckets) {
+                true  => Errcode::open_bucket_alloc_blocked,
+                false => Errcode::open_buckets_empty,
+            }));
+        }
+
+        // Recheck under lock:
+        if self.bucket_is_open(dev.into(), bucket) {
+            req.counters.skipped_open += 1;
+            return Ok(None);
+        }
+
+        // a slot off the freelist, with its first pin
+        let (free, nr) = g.parts();
+        let ob = &a.open_buckets[free.open_buckets_freelist.expect("a free open bucket").get()];
+        free.open_buckets_freelist = ob.freelist.get();
+        *nr.open_buckets_nr_free.place() -= 1;
+        ob.pin.store(1, Relaxed);
+        ob.data_type.set(0);
+        {
+            let mut l = ob.lock.lock();
+            ob.sectors_free.set(ca.mi.get().bucket_size.into());
+            ob.free_uncounted.set(false);
+            l.published().id.set(c::OpenBucketId::new()
+                .with_valid(true)
+                .with_dev(dev)
+                .with_generation(generation)
+                .with_bucket(bucket));
+        }
+
+        ca.nr_open_buckets.set(ca.nr_open_buckets.get().wrapping_add(1));
+        a.hash_add(&g, ob);
+
+        times(c::TimeStat::blocked_allocate_open_bucket).track_event_change(false);
+        times(c::TimeStat::blocked_allocate).track_event_change(false);
+        // SAFETY: the pin just taken, ours
+        Ok(Some(unsafe { OpenBucket::from_idx(self, ob.idx()) }))
+    }
+
+    /// Open bucket @ob closed, its last pin put: back on the freelist - or
+    /// for a block of a stripe being made, its io ref on the stripe put.
+    fn open_bucket_close(&self, ob: &OpenBucketRef) {
+        if let Some(s) = ob.stripe() {
+            // SAFETY: the io ref its ->ec has, which closing it gives up
+            unsafe { s.put_io() };
+            return;
+        }
+
+        let o: &c::open_bucket = ob;
+        {
+            let mut l = o.lock.lock();
+            l.published().id.set(o.id().with_valid(false));
+            o.data_type.set(0);
+        }
+
+        let ca = ob.ca();
+        if o.set_flag(c::open_bucket::DO_DISCARDS_FAST, false) {
+            fast_discard_bucket_add(ca, ob.id().bucket());
+        }
+
+        {
+            let a = &self.allocator;
+            let mut g = a.freelist_lock.lock();
+            a.hash_remove(&g, o);
+
+            let (free, nr) = g.parts();
+            o.freelist.set(free.open_buckets_freelist);
+            free.open_buckets_freelist = Some(o.idx());
+            *nr.open_buckets_nr_free.place() += 1;
+
+            if !o.free_uncounted.get() {
+                ca.nr_open_buckets.set(ca.nr_open_buckets.get().wrapping_sub(1));
+            }
+        }
+
+        // may lift the journal's throttle, which nothing else would notice;
+        // freelist_lock dropped, so j->lock doesn't nest under it
+        self.journal.set_open_buckets_watermark(self.open_buckets_starved_watermark());
+
+        self.allocator.open_buckets_events.wake();
+    }
+
+    /// Open bucket @ob, which its holder won't write to after all, onto the
+    /// partial list - its pin with it - for the next allocation to finish.
+    pub fn open_bucket_free_unused(&self, ob: OpenBucket) {
+        let a = &self.allocator;
+        let dev = ob.id().dev().into();
+        {
+            let mut g = a.freelist_lock.lock();
+            let (free, nr) = g.parts();
+            let n = usize::from(nr.open_buckets_partial_nr.get());
+            assert!(n < free.open_buckets_partial.len(), "the partial list overflowing");
+
+            let ca = ob.ca();
+            ca.nr_partial_buckets.set(ca.nr_partial_buckets.get() + 1);
+            ob.set_flag(c::open_bucket::ON_PARTIAL_LIST, true);
+            free.open_buckets_partial[n] = Some(ob.into_idx());
+            *nr.open_buckets_partial_nr.place() += 1;
+        }
+
+        a.open_buckets_events.wake();
+        if let Some(ca) = self.dev_rcu(dev, &read_lock()) {
+            ca.alloc_wake();
+        }
+    }
+
+    /// The partial list's @i'th bucket taken off it, the list's pin with it.
+    pub(crate) fn open_buckets_partial_take(&self, g: &mut FreelistGuard<'_>, i: usize) -> OpenBucket {
+        let (free, nr) = g.parts();
+        let n = usize::from(nr.open_buckets_partial_nr.get());
+        let idx = free.open_buckets_partial[..n][i].expect("a bucket of the partial list");
+        free.open_buckets_partial.copy_within(i + 1..n, i);
+        *nr.open_buckets_partial_nr.place() -= 1;
+
+        // SAFETY: the partial list's pin, which it no longer has
+        let ob = unsafe { OpenBucket::from_idx(self, idx) };
+        ob.set_flag(c::open_bucket::ON_PARTIAL_LIST, false);
+        let ca = ob.ca();
+        ca.nr_partial_buckets.set(ca.nr_partial_buckets.get() - 1);
+        ob
+    }
+
+    /// Whether @ob goes, stopping @ca - or with @ec, erasure coding - or the
+    /// whole filesystem, with neither.
+    pub(crate) fn open_bucket_should_drop(&self, ob: &OpenBucketRef, ca: Option<&Dev>, ec: bool) -> bool {
+        match ca {
+            _ if ec  => ob.stripe().is_some(),
+            Some(ca) => ob.id().dev() == ca.dev_idx ||
+                        ob.stripe().is_some_and(|s| s.has_dev(ca.dev_idx.into())),
+            None     => true,
+        }
+    }
+
+    /// The partial list's buckets that go - see open_bucket_should_drop() -
+    /// taken off it and put.
+    pub(crate) fn open_buckets_partial_stop(&self, ca: Option<&Dev>, ec: bool) {
+        let a = &self.allocator;
+        let mut i = 0;
+        loop {
+            // put without the lock, as the close takes it
+            let _put = {
+                let mut g = a.freelist_lock.lock();
+                let Some(j) = a.partial(&g).skip(i).position(|ob| self.open_bucket_should_drop(ob, ca, ec)) else { break };
+                i += j;
+
+                // the last into its place: the list's order doesn't matter
+                let (free, nr) = g.parts();
+                let n = usize::from(nr.open_buckets_partial_nr.get()) - 1;
+                free.open_buckets_partial.swap(i, n);
+                self.open_buckets_partial_take(&mut g, n)
+            };
+        }
+    }
+}
+
+// ── Waking allocations ───────────────────────────────────────────────────
+
+/*
+ * freelist_events wake helpers. Every wake of
+ * c->allocator.freelist_events should go through these so the wake counters
+ * are maintained in lockstep with its wakeups — they're the signal
+ * waiters use to filter spurious wakes they don't care about.
+ */
+
+impl Dev {
+    /// Wake what's waiting on the allocator for a bucket on it: its counter
+    /// bumped tells a waiter that tried it the wake is for it.
+    pub fn alloc_wake(&self) {
+        self.alloc_wake_counter.fetch_add(1, Relaxed);
+        let a = &self.fs().allocator;
+        a.freelist_events.wake();
+    }
+}
+
+impl Fs {
+    /// Wake everything waiting on the allocator, for a full retry: a device
+    /// in no waiter's trace may have changed - a new one.
+    pub fn alloc_wake_all(&self) {
+        self.allocator.wake_all_counter.fetch_add(1, Relaxed);
+        self.allocator.freelist_events.wake();
+    }
+
+    /// Wake the freelist's waiters with no counter bumped: the only way off a
+    /// waitlist for one giving up. The rest wait again.
+    pub fn alloc_waiters_unpark(&self) {
+        self.allocator.freelist_events.wake();
+    }
+}
+
+// ── Requests ─────────────────────────────────────────────────────────────
+
+/// An allocation request, in transaction memory - an attempt's - its trace
+/// emptied when it's dropped.
+pub struct AllocRequest<'a, 'f>(&'a mut c::alloc_request<'a, 'f>);
+
+impl<'a, 't> TransAttempt<'a, 't> {
+    /// A request for @nr_replicas copies - or erasure coded, if
+    /// @erasure_code and @ec_replicas is 2 or more - in the attempt's memory,
+    /// its trace emptied when it's dropped.
+    #[allow(clippy::too_many_arguments)]
+    pub fn alloc_request(&self, target: u32, erasure_code: bool, devs_have: Option<&'a c::bch_devs_list>,
+                         nr_replicas: u32, ec_replicas: u32, watermark: c::Watermark,
+                         flags: c::WriteFlags, wait: AllocWait)
+        -> Result<AllocRequest<'a, 't>, BchError>
+    {
+        let req = c::alloc_request::new(self.fs(), target, erasure_code, devs_have, nr_replicas, ec_replicas,
+                                        watermark, flags, wait);
+        Ok(AllocRequest(self.alloc_init(req)?))
+    }
+
+    /// After @req's allocation failed with @err: asleep until there's reason
+    /// to retry - if it blocked - then Ok, for the caller to retry, unless
+    /// the filesystem's gone emergency read-only, which won't allocate again.
+    pub fn wait_on_allocator(&self, req: &mut c::alloc_request, err: BchError) -> Result<(), BchError> {
+        if let AllocWait::Sync(Some((on, seen))) = req.wait {
+            req.wait = AllocWait::Sync(None);
+            self.sleep_on_allocator(req, err, on, seen);
+        }
+        let fs = self.fs();
+        if fs.flags.get(c::FsFlag::emergency_ro) {
+            return fs.throw(crate::c::Errcode::emergency_ro);
+        }
+        Ok(())
+    }
+}
+
+impl<'r, 'f> c::alloc_request<'r, 'f> {
+    /// alloc_request_get()'s: zeroed, but for what it's given, and its trace.
+    #[allow(clippy::too_many_arguments)]
+    fn new(fs: &Fs, target: u32, erasure_code: bool, devs_have: Option<&'r c::bch_devs_list>, nr_replicas: u32,
+           ec_replicas: u32, watermark: c::Watermark, flags: c::WriteFlags,
+           wait: AllocWait)
+        -> impl ::pin_init::Init<Self, Infallible>
+    {
+        // SAFETY: zeroed - each of its fields but the trace valid zeroed, its
+        // references None; the trace's storage, bytes - then each written in place,
+        // through the pointer: no reference to it till the trace is made
+        unsafe {
+            ::pin_init::init_from_closure(move |slot: *mut Self| {
+                slot.write_bytes(0, 1);
+                (&raw mut (*slot).wait).write(wait);
+                (&raw mut (*slot).wake_all_counter_snapshot).write(fs.allocator.wake_all_counter.load(Relaxed) as u32);
+                (&raw mut (*slot).nr_replicas).write(nr_replicas as u8);
+                (&raw mut (*slot).ec_replicas).write(ec_replicas as u8);
+                (&raw mut (*slot).bits).write(c::alloc_request_bits::new().with_ec(erasure_code && ec_replicas >= 2));
+                (&raw mut (*slot).target).write(target);
+                (&raw mut (*slot).watermark).write(watermark);
+                (&raw mut (*slot).flags).write(flags);
+                (&raw mut (*slot).devs_have).write(devs_have);
+                init_at(InlineVec::new(), &raw mut (*slot).trace)
+            })
+        }
+    }
+
+    /// Its trace emptied - its storage freed, if it spilled to the heap - for
+    /// a retry, and when its AllocRequest is dropped.
+    pub(crate) fn trace_reset(&mut self) {
+        drop(core::mem::take(&mut self.trace));
+    }
+
+    /// An attempt recorded in its trace - on @dev, BCH_SB_MEMBER_INVALID for
+    /// none, or U8_MAX for the open bucket pool - for the allocator stuck
+    /// dump, @err its error if it failed. @wake_counter_snapshot is the
+    /// device's wake counter as it was before the attempt waited, or a wake
+    /// racing the wait is lost. A trace that can't grow is marked.
+    pub fn trace_add(&mut self, dev: u8, err: Option<BchError>, wake_counter_snapshot: u32, free_buckets: u64,
+                     copygc_can_make_progress: bool) {
+        let b = self.bits;
+        let e = c::alloc_trace_entry {
+            dev,
+            bits: c::alloc_trace_entry_bits::new()
+                .with_new_stripe_alloc(b.new_stripe_alloc())
+                .with_will_retry_all_devices(b.will_retry_all_devices())
+                .with_will_retry_target_devices(b.will_retry_target_devices())
+                .with_will_retry_set_devices(b.will_retry_set_devices())
+                .with_copygc_can_make_progress(copygc_can_make_progress)
+                .with_may_wait(self.may_wait()),
+            err: err.map_or(0, |e| ret_to_c(Err(e)) as i16),
+            wake_counter_snapshot,
+            free_buckets,
+        };
+        if self.trace.push(e).is_err() {
+            self.bits.set_trace_alloc_failed(true);
+        }
+    }
+
+    #[cold]
+    fn trace_to_text(&self, out: &mut Printbuf) {
+        if self.trace.is_empty() {
+            return;
+        }
+
+        write!(out, "Allocation attempts ({} total):\n", self.trace.len());
+        let mut out = out.indent(2);
+        for e in self.trace.iter() {
+            let b = e.bits;
+            match e.dev {
+                u8::MAX => write!(out, "no dev"),
+                dev     => write!(out, "dev {dev}"),
+            };
+            for (set, name) in [(b.new_stripe_alloc(),          " new_stripe"),
+                                (b.will_retry_all_devices(),    " retry_all"),
+                                (b.will_retry_target_devices(), " retry_target"),
+                                (b.will_retry_set_devices(),    " retry_set"),
+                                (b.may_wait(),                  " may_wait")] {
+                if set {
+                    write!(out, "{name}");
+                }
+            }
+            write!(out, " free {} copygc_progress {}", e.free_buckets, u8::from(b.copygc_can_make_progress()));
+            match e.err {
+                0   => write!(out, " -> ok\n"),
+                err => write!(out, " -> {}\n", BchError::from_raw(-i32::from(err))),
+            };
+        }
+    }
+
+    pub fn may_wait(&self) -> bool {
+        !matches!(self.wait, AllocWait::Never)
+    }
+
+    /// Blocked on @on's count, to retry when it's woken: false if it's not to
+    /// block. Called under the lock the failed check was, or before a
+    /// recheck, so the snapshot is from before what would wake it.
+    pub fn block_on(&mut self, fs: &Fs, on: Blocked) -> bool {
+        match &mut self.wait {
+            AllocWait::Never => false,
+            AllocWait::Sync(blocked) | AllocWait::Async(blocked) => {
+                *blocked = Some((on, on.events(fs).snapshot()));
+                true
+            }
+        }
+    }
+}
+
+impl<'a, 'f> core::ops::Deref for AllocRequest<'a, 'f> {
+    type Target = c::alloc_request<'a, 'f>;
+
+    fn deref(&self) -> &c::alloc_request<'a, 'f> {
+        self.0
+    }
+}
+
+impl<'a, 'f> core::ops::DerefMut for AllocRequest<'a, 'f> {
+    fn deref_mut(&mut self) -> &mut c::alloc_request<'a, 'f> {
+        self.0
+    }
+}
+
+impl Drop for AllocRequest<'_, '_> {
+    fn drop(&mut self) {
+        self.0.trace_reset()
+    }
+}
+
+// ── Waiting on the allocator ─────────────────────────────────────────────
+
+impl Fs {
+    /// Whether a wake @req's waiter woke to may be for it, and it should
+    /// retry: a wake of everything, a trace that couldn't be kept, a device
+    /// it failed on gone - or woken with buckets now free, or nothing copygc
+    /// can do to free more. Woken with neither, copygc's kicked, and it
+    /// waits again.
+    fn alloc_wait_advanced(&self, req: &mut c::alloc_request) -> bool {
+        if self.allocator.wake_all_counter.load(Relaxed) as u32 != req.wake_all_counter_snapshot ||
+           req.bits.trace_alloc_failed() {
+            return true;
+        }
+
+        let mark = self.mark_lock().read();
+        let rcu = read_lock();
+        let mut found = false;
+
+        for e in req.trace.iter().filter(|e| e.err != 0 && u32::from(e.dev) != c::BCH_SB_MEMBER_INVALID) {
+            found = true;
+
+            let Some(ca) = self.dev_rcu(e.dev.into(), &rcu) else { return true };
+            if ca.alloc_wake_counter.load(Relaxed) as u32 != e.wake_counter_snapshot {
+                req.usage = ca.usage_read_fast();
+                if ca.free_buckets_at(&req.usage, req.watermark) > 1 || !can_make_progress(ca, &mark) {
+                    return true;
+                }
+                self.copygc_wakeup();
+            }
+        }
+        assert!(found, "waiting on the allocator with no device that failed in the trace");
+        false
+    }
+
+    /// Whether @req could allocate from @ca: a device in its target, if it may
+    /// only use those, read-write, online, and taking its data type.
+    fn dev_may_alloc(&self, ca: &Dev, req: &c::alloc_request) -> bool {
+        if req.flags.contains(c::WriteFlags::only_specified_devs) && req.target != 0 &&
+           !self.dev_in_target(ca.dev_idx.into(), Target::decode(req.target), &read_lock()) {
+            return false;
+        }
+        ca.is_rw() && ca.is_online() && ca.mi.get().data_allowed.contains(req.data_type.into())
+    }
+
+    #[cold]
+    fn alloc_request_to_text(&self, out: &mut Printbuf, req: &c::alloc_request) {
+        let b = req.bits;
+        write!(out, "nr_replicas:\t{}\n", req.nr_replicas);
+        write!(out, "target:\t");
+        self.target_to_text(out, Target::decode(req.target));
+        write!(out, "\nwatermark:\t{}\n", req.watermark.name());
+        write!(out, "data_type:\t{}\n", data_type_str(req.data_type));
+        write!(out, "flags:\t");
+        req.flags.to_text(out);
+        write!(out, "\nec:\t{}\n", u8::from(b.ec()));
+        write!(out, "will_retry_all_devices:\t{}\n", u8::from(b.will_retry_all_devices()));
+        write!(out, "will_retry_target_devices:\t{}\n", u8::from(b.will_retry_target_devices()));
+        write!(out, "will_retry_set_devices:\t{}\n", u8::from(b.will_retry_set_devices()));
+        write!(out, "copygc_can_make_progress:\t{}\n", u8::from(b.copygc_can_make_progress()));
+        write!(out, "may_wait:\t{}\n", u8::from(req.may_wait()));
+
+        if let Some(devs) = req.devs_have.filter(|d| d.nr != 0) {
+            write!(out, "devs_have:\t");
+            for (i, &dev) in devs.data[..devs.nr as usize].iter().enumerate() {
+                if i != 0 {
+                    write!(out, " ");
+                }
+                self.member_name_to_text(out, dev.into());
+            }
+            write!(out, "\n");
+        }
+
+        write!(out, "devs_may_alloc:\t");
+        for i in req.devs_may_alloc.d.iter() {
+            write!(out, "{i} ");
+        }
+        write!(out, "\ndevs_sorted:\t");
+        for i in &req.devs_sorted.data[..req.devs_sorted.nr as usize] {
+            write!(out, "{i} ");
+        }
+        write!(out, "\nallocated:\t{}\n", req.nr_effective);
+
+        req.trace_to_text(out);
+    }
+
+    fn dev_alloc_debug_header(out: &mut Printbuf, ca: &Dev) {
+        write!(out, "Dev {} ({}): {}", ca, ca.dev_idx, ca.mi.get().state);
+        if !ca.is_online() {
+            write!(out, " (offline)");
+        }
+        write!(out, "\nData allowed:\t");
+        data_types_to_text(out, ca.mi.get().data_allowed);
+        write!(out, "\n");
+        ca.alloc_debug_to_text(&mut out.indent(2));
+        write!(out, "\n");
+    }
+
+    /// The allocator stuck dump, for @req, waiting with @err past
+    /// allocator_stuck_timeout: what's blocking it - the devices and what
+    /// should be freeing buckets on them, or the open buckets - and the
+    /// journal, if it's throttled.
+    #[cold]
+    #[inline(never)]
+    fn print_allocator_stuck(&self, req: &c::alloc_request, err: BchError) {
+        let mut buf = Printbuf::new();
+        let out = &mut buf;
+
+        write!(out, "Allocator stuck? Waited for {} seconds, err {err}\n", self.opts.allocator_stuck_timeout.get());
+        out.tabstop_push(28);
+        write!(out, "Allocation:\n");
+        self.alloc_request_to_text(&mut out.indent(2), req);
+        write!(out, "\n");
+
+        if err.matches(Errcode::bucket_alloc_blocked) {
+            write!(out, "Allocator debug:\n");
+            self.alloc_debug_to_text(&mut out.indent(2));
+            write!(out, "\n");
+
+            out.make_room(4096);
+
+            let (mut free, mut need_discard, mut reserve) = (0u64, 0u64, 0u64);
+            {
+                let rcu = read_lock();
+
+                write!(out, "Devices eligible for allocation\n");
+                for ca in self.devs_rcu(&rcu).filter(|ca| self.dev_may_alloc(ca, req)) {
+                    Self::dev_alloc_debug_header(out, ca);
+                }
+                write!(out, "Devices ineligible for allocation\n");
+                for ca in self.devs_rcu(&rcu).filter(|ca| !self.dev_may_alloc(ca, req)) {
+                    Self::dev_alloc_debug_header(out, ca);
+                }
+
+                for ca in self.devs_rcu(&rcu) {
+                    let u = ca.usage_read_fast();
+                    let sectors = u64::from(ca.mi.get().bucket_size);
+                    need_discard += sectors * u.buckets[DataType::need_discard];
+                    free         += sectors * u.buckets[DataType::free];
+                    reserve      += sectors * ca.buckets_reserved(c::Watermark::stripe);
+                }
+            }
+
+            if need_discard > free.saturating_sub(reserve * 4) {
+                write!(out, "Discard debug:\n");
+                self.discards_to_text(&mut out.indent(2));
+            }
+
+            write!(out, "Copygc debug:\n");
+            self.copygc_wait_to_text(&mut out.indent(2));
+            write!(out, "\n");
+        }
+
+        if err.matches(Errcode::open_bucket_alloc_blocked) {
+            self.fs_open_buckets_to_text(out);
+        }
+
+        if self.journal.watermark() != c::Watermark::stripe {
+            write!(out, "Journal debug:\n");
+            self.journal.to_text(&mut out.indent(2));
+        }
+
+        print_str(self, LogLevel::ERR, &mut buf);
+    }
+}
+
+impl TransAttempt<'_, '_> {
+    /// Asleep - on @on's count, from @seen, for @req's allocation that failed
+    /// with @err - until there's reason to retry it: alloc_wait_advanced(),
+    /// or for any wait but the freelist's, woken at all. Past
+    /// allocator_stuck_timeout it's counted, and dumped - once in two minutes,
+    /// by whichever waiter claims the dump. Its locks dropped first.
+    fn sleep_on_allocator(&self, req: &mut c::alloc_request, err: BchError, on: Blocked, seen: u32) {
+        let fs = self.fs();
+        let ev = on.events(fs);
+
+        // freelist_events is every device's: a wake for none @req tried isn't
+        // for it, and it waits again - unless going emergency read-only, when
+        // a draining device may never have buckets free, and waiting could
+        // block read_only_work forever
+        let retry = |req: &mut c::alloc_request| match on {
+            Blocked::Freelist => (fs.flags.get(c::FsFlag::emergency_ro) || fs.alloc_wait_advanced(req)).then_some(()),
+            _                 => (ev.snapshot() != seen).then_some(()),
+        };
+
+        self.unlock();
+
+        let timeout = c_long::from(fs.opts.allocator_stuck_timeout.get()) * HZ as c_long;
+        if timeout > 0 {
+            if self.wait_until_timeout(ev, || retry(req), timeout).is_some() {
+                return;
+            }
+            fs.allocator_stuck(req, err);
+        }
+
+        self.wait_until(ev, || retry(req));
+    }
+}
+
+impl Fs {
+    /// @req's allocation, blocked with @err for allocator_stuck_timeout:
+    /// counted, and dumped - once in two minutes.
+    pub fn allocator_stuck(&self, req: &c::alloc_request, err: BchError) {
+        // every one, though the dump below is one in two minutes
+        self.event_inc_trace(events::allocator_stuck, |out| {
+            write!(out, "err {err}\n");
+            self.alloc_request_to_text(out, req);
+        });
+
+        let last = &self.allocator.last_stuck;
+        let old = last.load(Relaxed);
+        if (old == 0 || time_after(jiffies(), (old as c_ulong).wrapping_add(HZ * 60 * 2))) &&
+           last.compare_exchange(old, jiffies() as usize, Relaxed, Relaxed).is_ok() {
+            self.print_allocator_stuck(req, err);
+        }
+    }
+}
+
+// ── Debug ────────────────────────────────────────────────────────────────
+
+/// @v, a value per replica count from 1.
+fn per_replicas_to_text(out: &mut Printbuf, name: &str, v: impl IntoIterator<Item = u64>) {
+    write!(out, "{name}\n");
+    for (i, v) in v.into_iter().enumerate() {
+        write!(out, "  {}x\t{v}\n", i + 1);
+    }
+}
+
+impl Fs {
+    /// The open buckets allocated, by data type, and whether anything's
+    /// waiting for one.
+    #[cold]
+    pub fn fs_open_buckets_to_text(&self, out: &mut Printbuf) {
+        if out.nr_tabstops() == 0 {
+            out.tabstop_push(24);
+        }
+
+        let a = &self.allocator;
+        let mut nr = [0u32; c::DataType::NR as usize];
+        for ob in a.open_buckets.iter().filter(|ob| ob.pin.load(Relaxed) != 0) {
+            if let Some(n) = nr.get_mut(usize::from(ob.data_type.get())) {
+                *n += 1;
+            }
+        }
+
+        write!(out, "open buckets allocated\t{}\n",
+               c::OPEN_BUCKETS_COUNT - u32::from(a.freelist_lock.open_buckets_nr_free.get()));
+        write!(out, "open buckets total\t{}\n", c::OPEN_BUCKETS_COUNT);
+        for (i, n) in nr.into_iter().enumerate().filter(|&(_, n)| n != 0) {
+            write!(out, "open_buckets {}:\t{n}\n", data_type_str(DataType(i as u32)));
+        }
+    }
+
+    /// Capacity, usage and reservations, and the free space by the replica
+    /// count it's placeable at.
+    #[cold]
+    pub fn alloc_debug_to_text(&self, out: &mut Printbuf) {
+        if out.nr_tabstops() == 0 {
+            out.tabstop_push(24);
+        }
+
+        let b = percpu_field!(self.capacity.pcpu.get(), counters).sum_nonnegative();
+        write!(out, "capacity\t{}\n",   self.capacity.capacity.get());
+        write!(out, "used\t{}\n",       self.usage_read_short().used);
+        write!(out, "reserved\t{}\n",   self.capacity.reserved.get());
+        write!(out, "hidden\t{}\n",     b.usage.hidden);
+        write!(out, "btree\t{}\n",      b.usage.btree);
+        write!(out, "data\t{}\n",       b.usage.data);
+        write!(out, "cached\t{}\n",     b.usage.cached);
+        write!(out, "reserved\t{}\n",   b.usage.reserved);
+        // Per replica count: an ENOSPC at 3x with raw space free needs this
+        per_replicas_to_text(out, "online_reserved", b.online_reserved);
+
+        // Computed, not read back: "cached" below is only what the
+        // reservation fast path has left, and reads zero until a slot has run
+        // dry once.
+        let p = self.sectors_placeable();
+        per_replicas_to_text(out, "sectors_available placeable", p.eventual);
+        per_replicas_to_text(out, "sectors_available now", p.now);
+        // the exclusive partition underneath, which sums to the free space
+        per_replicas_to_text(out, "sectors_available slots",
+            p.eventual.iter().zip(p.eventual[1..].iter().chain([&0])).map(|(n, above)| n.wrapping_sub(*above)));
+        // what the pools hold, which lags until a recalc
+        per_replicas_to_text(out, "sectors_available cached",
+            self.capacity.sectors_available.iter().map(|s| s.load(Relaxed)));
+
+        writeln!(out);
+        write!(out, "btree reserve cache\t{}\n", self.btree.reserve_cache.lock.lock().nr);
+        writeln!(out);
+    }
+}
+
+impl Dev {
+    /// Its usage, its reserve at each watermark, and its open buckets and
+    /// buckets to invalidate.
+    #[cold]
+    pub fn alloc_debug_to_text(&self, out: &mut Printbuf) {
+        self.usage_to_text(out, &self.usage_full_read_fast());
+        writeln!(out);
+
+        write!(out, "reserves:\n");
+        for w in (0..c::Watermark::NR).map(c::Watermark::from_bits) {
+            write!(out, "{w}\t{}\r\n", self.buckets_reserved(w));
+        }
+        writeln!(out);
+
+        out.tabstops(&[12, 16]);
+        write!(out, "open buckets\t{}\r\n", self.nr_open_buckets.get() as i32);
+        write!(out, "buckets to invalidate\t{}\r\n", self.should_invalidate_buckets(&self.usage_read_fast()));
+    }
+}
+
+impl Fs {
+    /// The open buckets - on @ca, or all of them.
+    pub fn open_buckets_to_text(&self, out: &mut Printbuf, ca: Option<&Dev>) {
+        for ob in &self.allocator.open_buckets {
+            let l = ob.lock.lock();
+            if let Some(ob) = ob.open_ref(&l).filter(|ob| ca.is_none_or(|ca| ob.id().dev() == ca.dev_idx)) {
+                ob.to_text(out);
+            }
+        }
+    }
+
+    pub fn open_buckets_partial_to_text(&self, out: &mut Printbuf) {
+        let g = self.allocator.freelist_lock.lock();
+        self.allocator.partial(&g).for_each(|ob| ob.to_text(out));
+    }
+}
+
+impl ToText for OpenBucketRef {
+    fn to_text(&self, out: &mut Printbuf) {
+        let bucket_size = u32::from(self.ca().mi.get().bucket_size);
+        write!(out, "{} ref {} ", self.idx().get(), self.pin.load(Relaxed));
+        DataType(self.data_type.get().into()).to_text(out);
+        let id = self.id();
+        write!(out, " {}:{} gen {} allocated {}/{}", id.dev(), id.bucket(), id.generation(),
+               bucket_size.wrapping_sub(self.sectors_free.get()), bucket_size);
+        if let Some(s) = self.stripe() {
+            write!(out, " ec idx {}", s.idx.load(Relaxed));
+        }
+        if self.flag(c::open_bucket::ON_PARTIAL_LIST) {
+            write!(out, " partial");
+        }
+        writeln!(out);
+    }
+}
+
+// ── For C ────────────────────────────────────────────────────────────────
+
+/// What's built once the allocator is in place, before anything allocates:
+/// the open buckets' freelist - every one but slot 0, the sentinel, never
+/// handed out - and the write points' hash.
+pub fn allocator_foreground_init(fs: &Fs) {
+    let a = &fs.allocator;
+    {
+        let mut g = a.freelist_lock.lock();
+        let (free, nr) = g.parts();
+        for ob in &a.open_buckets[1..] {
+            ob.freelist.set(free.open_buckets_freelist);
+            free.open_buckets_freelist = Some(ob.idx());
+            *nr.open_buckets_nr_free.place() += 1;
+        }
+    }
+    fs.write_points_init();
+}
+
+impl c::open_buckets {
+    /// The stripes its buckets on each device of @failed are blocks of,
+    /// cancelled with its error: the writes to it failed.
+    pub fn write_errors(&self, fs: &Fs, failed: &c::bch_io_failures) {
+        for f in failed.devs() {
+            let err = if f.errcode != 0 {
+                BchError::from_raw(f.errcode.into())
+            } else {
+                Errcode::data_write_io.into()
+            };
+            self.iter(fs).filter(|ob| u32::from(ob.id().dev()) == u32::from(f.dev))
+                .filter_map(|ob| ob.into_ref().stripe()).for_each(|s| s.err.set(err));
+        }
+    }
+}
+
+/// @dev's @bucket's slot in the open buckets' hash.
+fn open_bucket_hash(dev: c_uint, bucket: u64) -> usize {
+    hash_64(Fold::of(&(dev, bucket)), c::OPEN_BUCKETS_COUNT.ilog2()) as usize
+}
