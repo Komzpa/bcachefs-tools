@@ -1,0 +1,208 @@
+// Bindgen for the userspace Linux kernel-compat layer (the in-tree `include/`
+// shim). Parses the same fs/ wrapper header as the bcachefs-kernel crate, but
+// emits only the symbols *defined under* include/ (plus the system primitives
+// they transitively reference, e.g. __u64/__le16). The bcachefs-kernel crate
+// blocklists this same set and imports it from here, so each C type is bound
+// exactly once.
+use std::path::PathBuf;
+
+include!("../../../clang_target.rs");
+include!("../../../fs/build_config.rs");
+
+/// Every struct and union is Zeroable when all its fields are, as the kernel's
+/// bindgen_parameters has it (os/linux_kernel/vendor): a C struct embedded in a
+/// Rust-initialized one can start zeroed, as C's kzalloc() would leave it.
+#[derive(Debug)]
+struct MaybeZeroable;
+
+impl bindgen::callbacks::ParseCallbacks for MaybeZeroable {
+    fn add_derives(&self, info: &bindgen::callbacks::DeriveInfo<'_>) -> Vec<String> {
+        use bindgen::callbacks::TypeKind;
+        match info.kind {
+            TypeKind::Struct | TypeKind::Union => vec!["::pin_init::MaybeZeroable".into()],
+            _ => vec![],
+        }
+    }
+}
+
+fn main() {
+    let out_dir: PathBuf = std::env::var_os("OUT_DIR")
+        .expect("ENV Var 'OUT_DIR' Expected")
+        .into();
+    let top_dir: PathBuf = std::env::var_os("CARGO_MANIFEST_DIR")
+        .expect("ENV Var 'CARGO_MANIFEST_DIR' Expected")
+        .into();
+    let root = top_dir
+        .ancestors()
+        .nth(3)
+        .expect("bcachefs-shim should be at os/linux_user/shim")
+        .to_path_buf();
+    let fs_dir = root.join("fs");
+    let include_dir = root.join("include");
+    let wrapper = top_dir
+        .join("src")
+        .join("wrapper.h");
+
+    println!("cargo:rerun-if-changed={}", wrapper.display());
+    // what it includes of fs/: the vendored C and the shims' headers
+    for h in ["vendor/closure.h"] {
+        println!("cargo:rerun-if-changed={}", fs_dir.join(h).display());
+    }
+    println!("cargo:rerun-if-changed=../../../clang_target.rs");
+    println!("cargo:rerun-if-changed=../../../fs/build_config.rs");
+    rerun_if_userspace_config_changed(&root);
+    println!("cargo:rerun-if-changed={}", include_dir.display());
+
+    // What os/linux_user/compress.rs calls: linked after this
+    // crate, as a link --as-needed only keeps a library that's needed by what
+    // comes before it
+    println!("cargo:rustc-link-lib=z");
+    println!("cargo:rustc-link-lib=lz4");
+
+    let urcu = pkg_config::probe_library("liburcu").expect("Failed to find urcu lib");
+    let target = std::env::var("TARGET").unwrap();
+    let clang_target = clang_target_for_rust_target(&target);
+
+    let bindings = bindgen::builder()
+        .formatter(bindgen::Formatter::Prettyplease)
+        .header(wrapper.display().to_string())
+        .clang_arg(format!("--target={}", clang_target))
+        .clang_args(
+            urcu.include_paths
+                .iter()
+                .map(|p| format!("-I{}", p.display())),
+        )
+        .clang_arg(format!("-I{}", root.display()))
+        .clang_arg(format!("-I{}", fs_dir.display()))
+        .clang_arg(format!("-I{}", root.join("c_src").display()))
+        .clang_arg(format!("-I{}", include_dir.display()))
+        .clang_args(userspace_config_args(&root))
+        .clang_arg("-DRUST_BINDGEN")
+        // as the kernel's bindgen: wrapper.h's consts are for it alone, not
+        // extern.c's compile
+        .clang_arg("-D__BINDGEN__")
+        .clang_arg("-fkeep-inline-functions")
+        .derive_debug(true)
+        .derive_default(true)
+        .parse_callbacks(Box::new(MaybeZeroable))
+        .layout_tests(true)
+        // Emit `::core::ffi` rather than `::std::os::raw`, so the bindings are
+        // valid in both std (userspace) and no_std.
+        .use_core()
+        .default_enum_style(bindgen::EnumVariation::Rust {
+            non_exhaustive: true,
+        })
+        // A zstd error a u32, as in-kernel: a code from a newer libzstd
+        // than these bindings would be no value of a Rust enum. Its parameter
+        // names and strategies the same, though only passed to it.
+        .constified_enum("ZSTD_ErrorCode|ZSTD_cParameter|ZSTD_ResetDirective|ZSTD_strategy")
+        // closure_state_CLOSURE_RUNNING, as in-kernel
+        .constified_enum("closure_state")
+        // Own only what's defined under include/ — the kernel-compat surface.
+        // allowlist_recursively (default) pulls in the system primitives these
+        // reference (__u64 etc.), so they're emitted here too.
+        .allowlist_file(format!("{}/.*", include_dir.display()))
+        // fs/ references a few system / urcu types directly that aren't
+        // reachable from include/ alone; own them here too so the bcachefs-kernel
+        // crate can import them rather than redefine them.
+        .allowlist_type("uid_t")
+        .allowlist_type("gid_t")
+        .allowlist_type("dev_t")
+        .allowlist_type("cds_.*")
+        // wrapper.h's consts: codegen.h's, in-kernel
+        .allowlist_var("RUST_CONST_HELPER_.*")
+        // and its functions named by macros: liburcu's flavour's
+        .allowlist_function("RUST_FN_HELPER_.*")
+        // File mode bits: the kernel crate's bindings have them in-kernel.
+        .allowlist_var("S_IF.*")
+        .allowlist_var("S_ISGID")
+        // errnos, for bch2_err_matches() against a bare errno, or returning
+        // one as C does (darray_push()'s -ENOMEM) - the kernel crate's
+        // bindings have them in-kernel; add as needed:
+        .allowlist_var("ENOENT|ENOMEM|EINVAL|ENAMETOOLONG|ERANGE|ENODATA|E2BIG|EACCES|EBUSY")
+        .allowlist_var("ECHILD|EROFS|EXDEV|ENOTDIR|EIO|ENOTEMPTY|EFBIG|ENOSPC|EINTR|EPERM|EFAULT|ENOKEY|EAGAIN")
+        // The vendored C fs/ uses - closures - is the shim's too: not
+        // bcachefs's, so not the fs crate's to define.
+        .allowlist_file(format!("{}/vendor/closure.h", fs_dir.display()))
+        .allowlist_function("snprintf")
+        // The raid library: userspace's stand-in for the kernel's raid6 and
+        // xor, as fs/util/raid.rs uses it.
+        .allowlist_function("raid_init|raid_zero|raid_gen|raid_rec")
+        // The compression libraries, what os/linux_user/compress.rs calls
+        .allowlist_function("LZ4_compress_destSize|LZ4_compress_HC|LZ4_decompress_safe_partial")
+        .allowlist_function("deflateInit2_|deflate|deflateEnd|inflateInit2_|inflate|inflateEnd")
+        .allowlist_function("ZSTD_maxCLevel|ZSTD_getParams|ZSTD_isError|ZSTD_getErrorCode")
+        .allowlist_function("ZSTD_estimateCCtxSize_usingCParams|ZSTD_initStaticCCtx|ZSTD_CCtx_reset")
+        .allowlist_function("ZSTD_CCtx_setPledgedSrcSize|ZSTD_CCtx_setParameter|ZSTD_compress2")
+        .allowlist_function("ZSTD_estimateDCtxSize|ZSTD_initStaticDCtx|ZSTD_decompressDCtx")
+        .allowlist_type("z_stream|ZSTD_ErrorCode|ZSTD_cParameter|ZSTD_ResetDirective")
+        .allowlist_var("ZLIB_VERSION|MAX_WBITS|Z_OK|Z_STREAM_END|Z_FINISH|Z_DEFLATED")
+        .allowlist_var("Z_DEFAULT_STRATEGY|Z_DEFAULT_COMPRESSION|Z_BEST_SPEED|Z_BEST_COMPRESSION")
+        // The kernel's DEFINE_LOCK_GUARD / DEFINE_CLASS cleanup machinery
+        // (class_*_constructor/destructor/lock_ptr) are never called from Rust,
+        // and wrap_static_fns can't emit valid C wrappers for them.
+        .blocklist_function("class_.*")
+        .blocklist_function("__class_.*")
+        // printbuf is an fs/ type owned by bcachefs-kernel; don't emit the
+        // userspace helpers that take it (they reference the blocklisted type
+        // and belong to bch_bindgen anyway).
+        .blocklist_function("prt_.*")
+        .blocklist_type("printbuf")
+        .blocklist_function("sysfs_.*")
+        // Empty opaque structs — only ever used behind pointers. As zero-field
+        // structs they make every extern fn that transitively embeds one trip
+        // improper_ctypes. opaque_type gives them a blob field so they're
+        // FFI-safe, without us inventing a layout.
+        .opaque_type("lock_class_key")
+        .opaque_type("lockdep_map")
+        .opaque_type("bch_ioctl_data_event")
+        .generate_inline_functions(true)
+        .wrap_static_fns(true)
+        .wrap_static_fns_path(out_dir.join("extern.c"))
+        .rust_edition(bindgen::RustEdition::Edition2024)
+        .generate()
+        .expect("BindGen Generation Failure: [bcachefs-shim]");
+
+    // wrapper.h's consts and functions, by the names of the macros they're of
+    std::fs::write(out_dir.join("bindings.rs"),
+                   bindings.to_string()
+                       .replace("pub const RUST_CONST_HELPER_", "pub const ")
+                       .replace("pub fn RUST_FN_HELPER_", "pub fn "))
+        .expect("Writing to output file failed for: `bindings.rs`");
+
+    // Compile the static-inline wrappers bindgen generated, matching the clang
+    // args the headers were parsed with.
+    let mut wrappers = cc::Build::new();
+    wrappers
+        .file(out_dir.join("extern.c"))
+        .include(&root)
+        .include(&fs_dir)
+        .include(root.join("c_src"))
+        .include(&include_dir)
+        .define("RUST_BINDGEN", None)
+        .flag("-fkeep-inline-functions")
+        .warnings(false);
+    for f in userspace_config_args(&root) {
+        wrappers.flag(f);
+    }
+    for p in &urcu.include_paths {
+        wrappers.include(p);
+    }
+    wrappers.compile("bcachefs_shim_static_wrappers");
+
+    // And what the wrappers call in libbcachefs.a: linked after them too, as
+    // ld.bfd takes an archive's member only for what comes before it.
+    // -bundle, as fs/build.rs links it.
+    println!("cargo:rustc-link-search={}", root.display());
+    println!("cargo:rustc-link-lib=static:-bundle=bcachefs");
+
+    // dh-cargo Built-Using (Debian): point at the workspace root (== the dpkg
+    // build's $PWD) so dh-cargo-built-using sees this lib as built from our own
+    // in-tree source and skips it, rather than aborting on a build path no
+    // Debian package owns. Mirrors the same declaration in fs/build.rs and
+    // bch_bindgen/build.rs. `root` is the workspace root.
+    println!(
+        "dh-cargo:deb-built-using=bcachefs_shim_static_wrappers=0={}",
+        root.display()
+    );
+}

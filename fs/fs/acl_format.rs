@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! POSIX ACLs on disk: an xattr of type POSIX_ACL_ACCESS or _DEFAULT, with an
+//! empty name, its value a bch_acl_header and then the entries - each as long
+//! as its tag says, a bch_acl_entry_short or, for ACL_USER and ACL_GROUP,
+//! which carry an id, a bch_acl_entry.
+
+#![allow(non_camel_case_types)]
+
+use crate::cstructs::c;
+use crate::types::{Le16, Le32};
+use cstruct_macros::{tagged_union, MaybeZeroable, Plain, TypeInfo};
+
+pub const BCH_ACL_VERSION: u32 = 0x0001;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, MaybeZeroable, Plain, TypeInfo)]
+pub struct bch_acl_entry {
+    pub e_tag: Le16,
+    pub e_perm: Le16,
+    pub e_id: Le32,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, MaybeZeroable, Plain, TypeInfo)]
+pub struct bch_acl_entry_short {
+    pub e_tag: Le16,
+    pub e_perm: Le16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, MaybeZeroable, Plain, TypeInfo)]
+pub struct bch_acl_header {
+    pub a_version: Le32,
+}
+
+/* The tags are <uapi/linux/posix_acl.h>'s ACL_*, which C has from there: */
+tagged_union! {
+    #[storage(c::bch_acl_entry_short)]
+    #[tag(e_tag: u16)]
+    #[size(arm)]
+    pub enum acl_entry {
+        user_obj(c::bch_acl_entry_short)  = 0x01,
+        user(c::bch_acl_entry)            = 0x02,
+        group_obj(c::bch_acl_entry_short) = 0x04,
+        group(c::bch_acl_entry)           = 0x08,
+        mask(c::bch_acl_entry_short)      = 0x10,
+        other(c::bch_acl_entry_short)     = 0x20,
+    }
+}
