@@ -1,16 +1,16 @@
 use std::ffi::CString;
-use std::fmt::Write;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
 use std::process;
 
 use anyhow::{anyhow, Result};
-use bch_bindgen::fs::FsExt;
+use crate::wrappers::fs::FsExt;
 use bcachefs_kernel::c;
+use bcachefs_kernel::errcode::BchError;
 use bcachefs_kernel::fs::Fs;
-use bcachefs_kernel::metadata_version;
-use bcachefs_kernel::opt_set;
+use bcachefs_kernel::format::MetadataVersion;
+use bcachefs_kernel::util::vstructs::Head;
 use clap::Parser;
 
 use crate::wrappers::handle::BcachefsHandle;
@@ -85,50 +85,42 @@ fn fsck_online(fs: &BcachefsHandle, opt_str: &str) -> Result<i32> {
 
     let fsck_fd = ioctl_w::<BCH_IOCTL_FSCK_ONLINE>(fs.ioctl_fd(), &fsck)
         .map_err(|e| anyhow!("BCH_IOCTL_FSCK_ONLINE error: {}",
-                             crate::wrappers::bch_err_str(e.raw_os_error().unwrap_or(0))))?;
+                             BchError::from_raw(e.raw_os_error().unwrap_or(0))))?;
 
     let fd = unsafe { BorrowedFd::borrow_raw(fsck_fd) };
     Ok(splice_fd_to_stdinout(fd))
 }
 
 fn should_use_kernel_fsck(devs: &[String]) -> bool {
-    let kernel_version = sysfs::bcachefs_kernel_version();
-    if kernel_version == 0 {
+    let Some(kernel_version) = sysfs::bcachefs_kernel_version() else {
         return false;
-    }
+    };
 
-    let current = u32::from(metadata_version::max) as u64 - 1;
+    let current = MetadataVersion::CURRENT;
     if kernel_version == current {
         return false;
     }
 
     let dev_paths: Vec<std::path::PathBuf> = devs.iter().map(|d| d.as_str().into()).collect();
     let mut opts = c::bch_opts::default();
-    opt_set!(opts, nostart, 1);
-    opt_set!(opts, noexcl, 1);
-    opt_set!(opts, nochanges, 1);
-    opt_set!(opts, read_only, 1);
+    opts.set_nostart(true);
+    opts.set_noexcl(true);
+    opts.set_nochanges(true);
+    opts.set_read_only(true);
 
     let fs = match Fs::open(&dev_paths, opts) {
         Ok(fs) => fs,
         Err(_) => return false,
     };
 
-    let sb_version = fs.sb().version as u64;
+    let sb_version = fs.sb_lock().sb().version.get();
 
     let ret = (current < kernel_version && kernel_version <= sb_version) ||
               (sb_version <= kernel_version && kernel_version < current);
 
     if ret {
-        let mut buf = Printbuf::new();
-        let _ = write!(buf, "fsck binary is version ");
-        buf.version(current as u32);
-        let _ = write!(buf, " but filesystem is ");
-        buf.version(sb_version as u32);
-        let _ = write!(buf, " and kernel is ");
-        buf.version(kernel_version as u32);
-        let _ = write!(buf, ", using kernel fsck");
-        println!("{}", buf);
+        println!("fsck binary is version {current} but filesystem is {sb_version} and kernel is {kernel_version}, \
+                  using kernel fsck");
     }
 
     ret
@@ -230,7 +222,7 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
 
     let opts_str = opts.join(",");
     let fs_opts = bcachefs_kernel::opts::parse_mount_opts_vec(&opts, false)
-        .map_err(|e| anyhow!("error parsing options: {}", crate::wrappers::bch_err_str(e.raw())))?;
+        .map_err(|e| anyhow!("error parsing options: {}", e))?;
 
     // If any path resolves to a mounted filesystem - mount point, member
     // block device, or UUID - fsck online:
@@ -297,12 +289,12 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
             }
         }
 
-        let mut buf = IoctlBuf::<c::bch_ioctl_fsck_offline>::new::<u64>(dev_ptrs.len());
+        let mut buf = IoctlBuf::<Head<c::bch_ioctl_fsck_offline>>::new(dev_ptrs.len());
         let c_opts = CString::new(opts_str.as_str())?;
         let hdr = buf.hdr_mut();
         hdr.opts = c_opts.as_ptr() as u64;
         hdr.nr_devs = dev_ptrs.len() as u64;
-        unsafe { hdr.devs.as_mut_slice(dev_ptrs.len()).copy_from_slice(&dev_ptrs) };
+        buf.get_mut()?.devs.copy_from_slice(&dev_ptrs);
 
         let fsck_fd = match std::fs::OpenOptions::new()
             .read(true).write(true)
@@ -322,7 +314,7 @@ fn cmd_fsck(cli: FsckCli) -> Result<()> {
                 return run_userspace_fsck(devices, fs_opts),
             Err(e) =>
                 return Err(anyhow!("BCH_IOCTL_FSCK_OFFLINE error: {}",
-                                   crate::wrappers::bch_err_str(e.raw_os_error().unwrap_or(0)))),
+                                   BchError::from_raw(e.raw_os_error().unwrap_or(0)))),
         };
 
         let fd = unsafe { BorrowedFd::borrow_raw(fsck_fd) };
@@ -341,15 +333,16 @@ fn run_userspace_fsck(devices: &[String], fs_opts: c::bch_opts) -> Result<()> {
     let fs = device_scan::open_scan(&dev_paths, fs_opts)?;
 
     let mut buf = Printbuf::new();
-    let ret = unsafe { c::bch2_fs_fsck_errcode(fs.raw, buf.as_raw()) };
+    let ret = fs.fsck_errcode(&mut buf);
     if ret != 0 {
         eprint!("{}", buf);
     }
 
+    // shutdown_with_errors reports the errors fsck_errcode() already counted:
+    // not a shutdown that failed
     let ret2 = fs.exit();
-
-    if ret2 != 0 {
-        eprintln!("error shutting down filesystem: {}", crate::wrappers::bch_err_str(ret2));
+    if ret2 != 0 && !BchError::from_raw(ret2).matches(c::Errcode::shutdown_with_errors) {
+        eprintln!("error shutting down filesystem: {}", BchError::from_raw(ret2));
         process::exit(ret | 8);
     }
 

@@ -1,0 +1,204 @@
+# bcachefs-tools
+
+bcachefs-tools is the userspace component of bcachefs, a modern
+copy-on-write filesystem for Linux. It provides formatting, mounting,
+fsck, and administrative commands. The codebase is a mix of Rust (command
+dispatch, argument parsing, most user-facing logic) and C (kernel-internal
+operations that use kernel data structures directly, plus the FUSE mount
+command).
+
+The primary maintainer is Kent Overstreet.
+
+## mem::forget is banned
+
+`mem::forget` is not used in this codebase unless something specifically
+requires it, and then it's treated as unsafe. It is not something we
+design around: a type whose drop finishes a wait - a Completion, a
+Gather, a bio in flight - is sound because nothing forgets it.
+`ManuallyDrop` or `into_raw()` say what's meant where ownership really
+does pass somewhere else.
+
+## Long-term direction
+
+The goal is to convert the entire bcachefs codebase — both userspace
+tools and the kernel filesystem — to Rust. bcachefs-tools is mostly
+converted already; the kernel codebase is next.
+
+**Why convert everything:** The intermediate state of a mixed Rust/C
+codebase has significant overhead: FFI glue, duplicated types, inability
+to use Rust's error handling across the boundary. Converting as one big
+project (rather than incrementally) avoids spending months maintaining
+intermediate glue that will disappear once the conversion is complete.
+
+**What we gain:**
+- Result-based error handling makes error paths explicit and
+  machine-checkable, reducing bugs in the field
+- Ownership and lifetime enforcement eliminates classes of memory safety
+  bugs at compile time
+- The codebase becomes easier to work on and refactor for both humans
+  and AI
+- Most importantly: a fully-Rust codebase is the stepping stone to
+  **formal verification**. A fully verified general-purpose filesystem
+  has never existed — Rust's type system makes it an achievable goal.
+
+**Conversion approach:** Get code into Rust with minimal semantic
+changes first, then polish thoroughly — keep going on interfaces and
+idioms until there's nothing more to improve. Take thorough notes
+during conversion — not just TODOs but analytical frameworks: safety
+properties, invariants, error handling patterns, ownership semantics.
+These notes are groundwork for subsequent verification work.
+
+**Autonomous work:** This long-term direction is context for independent
+action. When reading code for any reason, look for opportunities to
+advance these goals — especially note-taking. If you've just read a
+large chunk of code and can see what the plan for formal verification
+would look like, or what invariants a subsystem maintains, or where the
+safety boundaries are: write it down. Those observations are hard to
+reconstruct later.
+
+## Working approach
+
+### Research first, implement second
+
+Filesystem code demands a higher standard of correctness than typical
+software development. When approaching a new problem:
+
+1. **Research thoroughly.** Read the relevant code, understand the
+   existing patterns, explore all the options. Write up findings.
+2. **Design collaboratively.** Bring analysis back for discussion before
+   committing to an approach, especially for anything touching kernel
+   code or key interfaces.
+3. **Implement incrementally.** Break work into small, reviewable pieces
+   rather than planning and implementing entire features in one pass.
+
+Research and analysis notes are a first-class output, not just
+scaffolding for implementation. They go in `.claude/`, dated, so that
+later work can see what's been analyzed and what was decided.
+
+`.claude/` is deliberately untracked — these are working notes, not
+documentation for general consumption. Anything that belongs in the
+repository proper goes in `doc/`, written for that audience.
+
+Untracked means `make-release-tarball.sh`'s `git clean -xfd` deletes it,
+which it did, taking every note with it. So `.claude/` is a symlink out
+of the tree, to
+
+    ~/.claude/projects/-home-kent-ktest-tests-fs-bcachefs-bcachefs-tools/notes
+
+The symlink is untracked too and gets removed by the same clean — but
+only the symlink. Recreate it with `ln -sfn` after a release; the notes
+themselves are never in the worktree.
+
+### Calibrate to the risk
+
+- **Kernel code** (`fs/`): Go slow. Research thoroughly. Always discuss
+  design before implementing. Pay special attention to error paths,
+  transaction restart handling, and locking. `fs/` is the canonical
+  bcachefs source (dual-build: the userspace tools and the kernel
+  module). bcachefs ships DKMS-only and is not synced to any kernel
+  tree — changes land here, full stop.
+
+- **Tools leaf code** (Rust commands, argument parsing, display logic):
+  More autonomy is appropriate here. Use good judgment, make clean
+  commits, and keep things idiomatic.
+
+- **Interfaces and abstractions** (safe Rust APIs over unsafe C, the
+  tools' wrappers in `src/wrappers/`): These are in between. The design matters because it
+  affects everything built on top. Discuss the shape before building.
+
+## Code standards
+
+### Correctness
+
+This is filesystem code — the highest standards for correctness apply.
+Always research and/or ask if you're not sure. Special care must be taken
+with:
+- Error paths, including errors indicating filesystem consistency problems
+- Transaction restart handling (see memory notes for detailed patterns)
+- Locking and RCU patterns
+- Permissions checks
+
+### Error messages
+
+Error messages must be clear and thorough while being concise. We often
+debug in the field, so messages should include:
+- What happened
+- The operational context (what we were doing)
+- Relevant state information
+- What corrective action was taken (if any)
+
+### Comments
+
+You're writing code for the people who will have to work on it next -
+including yourself, months from now, with none of today's context. Write
+code that makes them happy, not code that stresses them out.
+
+Code that merely *looks* thorough is not good code. A doc comment on every
+function restating its name, a SAFETY line paraphrasing the unsafe block
+under it, a file that opens with forty lines of prose before the first line
+of code: that's coding for appearances, and the person who opens the file
+pays for it. They came to read the code, and they have to wade through you
+narrating it back to them. Do that to them and they'll hate you, and they'll
+be right.
+
+When something needs explaining, the problem is usually the code. Fix the
+code: name things for what they are, use types that carry the meaning, shape
+the control flow so it shows what's happening. Restructure until it reads;
+don't narrate it.
+
+What a comment is for is what the code can't tell you: *why*. Why does this
+exist? Why is it done this way and not the obvious way? What breaks if you
+change it? What context is the reader missing? That's what they'll actually
+want to know, and it's usually what's missing.
+
+- A conversion keeps the C's comments and adds none of its own.
+- Inline comments only for traps and contracts the code can't express.
+- No SAFETY comments.
+- No doc comments that restate a name or signature, no "as bch2_foo()"
+  breadcrumbs, no notes on what's still C or what changed - they're stale
+  by the next commit.
+- Before committing, compare the diff's comment lines with its code lines -
+  and in a conversion, with the C's. More than the C had means you explained
+  instead of fixing the code.
+
+Analysis and design notes go in `.claude/`, not in the code.
+
+### Code style
+
+- Review your code before showing it. Simplify. Keep patches clean and
+  orthogonal.
+- Check for extraneous leftovers in diffs.
+- Don't add unnecessary wrappers or abstractions — if something only has
+  one caller, inline it.
+- Don't over-engineer. Only make changes that are directly requested or
+  clearly necessary.
+- Use `out` (not `buf`) for printbuf parameters.
+- Use x-macros for enums that need string arrays.
+- Use `printbuf_tabstop_push()` for aligned output in to_text functions.
+
+### Commits
+
+Make commits that make sense without asking — clean, orthogonal commits
+are a good thing. Commit working code before refactoring to keep diffs
+clean and make it easy to compare old vs new or revert.
+
+## Architecture
+
+- **Rust**: Command dispatch (`src/bcachefs.rs`), all command
+  implementations (`src/commands/`), and the tools' userspace-only
+  wrappers (`src/wrappers/`): over the fs crate, and over a mounted
+  filesystem's ioctls and sysfs
+- **Commands**: All subcommands are now implemented in Rust.
+- `fs/` is the `bcachefs-kernel` crate, built into both the tools and the
+  module. Its C bindings are bindgen's: `os/linux_user/shim`'s build
+  script generates userspace's, `os/linux_kernel/codegen.rs` the module's
+- Typed bkey dispatch (`BkeyValSC`, `BkeyValS`) is code-generated from
+  the `KEY_TYPE_*` x-macro
+- Transaction restart handling uses `lockrestart_do` / `for_each`
+  patterns that retry on restart errors
+
+## Reference
+
+- [doc/build.md](doc/build.md) — build commands and tips
+- [doc/testing.md](doc/testing.md) — ktest usage
+- [doc/x-macro-mechanism.md](doc/x-macro-mechanism.md) — importing C x-macros into Rust

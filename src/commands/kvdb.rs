@@ -27,8 +27,9 @@
 //! makes that command raw again. Writes always target the exact key.
 //! Full semantics: doc/kvdb.md.
 //!
-//! Fixed-layout vals are fully editable; varint-packed (inode) and
-//! entry-stream (extent) vals only up to their fixed header. Updates run the
+//! Fields are set by the key type's set() (btree/bkey_methods.rs):
+//! fixed-layout vals and inodes (through bch_inode_unpacked) are fully
+//! editable, entry-stream (extent) vals only up to their fixed header. Updates run the
 //! normal triggers and key validation — per-key-invalid keys are (correctly)
 //! rejected; whether we want a validation-bypass mode for injecting those is
 //! an open question.
@@ -39,23 +40,28 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Result};
-use bcachefs_kernel::btree::bkey::{BkeyS, BkeySC, POS_MIN, SPOS_MAX};
+use bcachefs_kernel::init::passes::RecoveryPass;
+use bcachefs_kernel::btree::bkey::{AnyKeySC, BkeySC, BkeyVal, POS_MIN, SPOS_MAX};
+use bcachefs_kernel::btree::bkey::prelude::*;
+use bcachefs_kernel::btree::bkey_methods;
 use bcachefs_kernel::btree::iter::{
-    commit_do, lockrestart_do, BtreeIter, BtreeIterFlags, BtreeTrans, CommitFlags, CommitOpts,
-    TransError, UpdateTriggerFlags,
+    commit_do, lockrestart_do, BtreeIter, BtreeIterFlags, CommitFlags,
+    TransBkey, UpdateTriggerFlags,
 };
 use bcachefs_kernel::c;
-use bcachefs_kernel::errcode::{bch_errcode, BchError};
-use bcachefs_kernel::fs::Fs;
-use bcachefs_kernel::opt_set;
-use bcachefs_kernel::typeinfo;
-use bch_bindgen::c::bch_degraded_actions;
+use bcachefs_kernel::errcode::{Errcode, BchError};
+use bcachefs_kernel::fs::{Fs, OpenFs};
+use bcachefs_kernel::inode;
+use bcachefs_kernel::typeinfo::{self, StructInfo, TypeInfo};
+use bcachefs_kernel::util::vstructs::{Head, Unvalidated};
+use bcachefs_kernel::c::DegradedAction;
 use clap::Parser;
 
 use crate::device_scan::OpenedFs;
 use crate::logging;
 use crate::wrappers::handle::BcachefsHandle;
 use crate::wrappers::online_iter::{OnlineBtreeIter, OnlineIterFlags};
+use bcachefs_kernel::format::{Bpos, Btree, BkeyType};
 
 const BKEY_U64S: usize = size_of::<c::bkey>() / size_of::<u64>();
 
@@ -108,12 +114,14 @@ in memory: listings then show a root inode that does not exist on disk.
 
 Commands:
 
-    get       [-k] <btree> <pos>                   exact lookup (slot iteration)
+    get    [-k|-r] <btree> <pos>                   exact lookup (slot iteration)
     peek      [-k] <btree> <pos>                   first key >= pos
     peek_prev [-k] <btree> <pos>                   last key <= pos
     list      [-k] <btree> [start] [end]           keys in range
-    update    <btree> <pos> <field=val>...         modify fields of a key
-    set  [-s] <btree> <pos> <type> [field=val]...  insert a whole new key
+    update [-r] <btree> <pos> <field=val>...       modify fields of a key
+    set  [-s][-r] <btree> <pos> <type> [field=val]... insert a whole new key
+    copy [-r] <btree> <pos> <new_pos>              duplicate a key elsewhere
+    rewrite -L <level> <btree> <pos>               rewrite the node a pointer points to
     sb get [-d <dev>] <field>                      read a superblock field
     sb set [-d <dev>] <field=val>                  write one
     snapshot  [<id>|none]                          session snapshot context
@@ -122,15 +130,31 @@ Commands:
 
 Positions are inode:offset[:snapshot], or POS_MIN/POS_MAX/SPOS_MAX. `-k` on
 the read commands prints keys only - type, position, size - without
-rendering values; useful when mapping out what exists.
+rendering values; useful when mapping out what exists. `-L <level>` on get,
+list, update, set and copy works on the keys at that level of the btree
+instead of the leaves: the pointers to the nodes below, a btree node pointer
+at its node's max key. set and copy put one in its node raw, to break the
+btree's topology on purpose.
 
 Fields are value-struct fields addressed by path (parent, children[1],
 btime.hi). Declared flag bits (LE*_BITMASK) resolve by name, qualified as
 flags.subvol when a name collides, and fields holding enum codewords accept
-value names: state=will_delete. Values are decimal, 0x hex, or negative
-decimal. `set <btree> <pos> deleted` removes the exact key; with -s it
+value names: state=will_delete. A key's pointers - an extent's, a btree
+node pointer's, a stripe's - are set as ptrs[N].offset, .dev, .gen, .cached
+and .unwritten, N counting only the pointers. Values are decimal, 0x hex,
+or negative decimal. `set <btree> <pos> deleted` removes the exact key; with -s it
 deletes within pos's snapshot instead (inserting whiteouts, like a runtime
 delete).
+
+`copy <btree> <pos> <new_pos>` duplicates a key exactly as it is - for
+values set can't build, extents above all - at another position, which may
+be in another inode or another snapshot. The insert is raw: triggers run,
+but an extent copy overwrites nothing, so it can overlap the extents there;
+the destination slot must be empty. An extent's new_pos is its new end.
+
+`-r` on update, set and copy runs no triggers at all: nothing else is
+updated to match - not other btrees, not the accounting - for injecting a
+key the rest of the filesystem doesn't know about.
 
 The snapshot context. Snapshot visibility is the subtle dimension of every
 bcachefs lookup: a key at snapshot S is visible at S and its descendants
@@ -174,9 +198,16 @@ One editing trap: snapshot IDs allocate descending from U32_MAX and the
 in-memory snapshot table is id-indexed; inserting a snapshot key with an
 unrealistically low id asks the table to span billions of entries and fails
 with ENOMEM_mark_snapshot. Use realistic, near-U32_MAX ids when fabricating
-snapshots. Varint-packed values (inodes) and entry-stream values (extents)
-are editable only up to their fixed header; fixed-layout values are fully
-editable.
+snapshots.
+
+Fixed-layout values are fully editable. Inodes are too, by their unpacked
+field names (bi_dir, bi_nlink, ...): an edit unpacks, sets and repacks, so
+it rewrites the inode as inode_v3, and can only produce what the packer
+does. `update -r` writes the value as stored instead, by its own struct's
+fields (an inode's bi_flags, bi_journal_seq, ...), and runs no triggers:
+for states the packer or a trigger would correct, such as has_inode_opts
+or a bi_journal_seq in the future. Entry-stream values (extents) are
+editable only up to their fixed header.
 ";
 
 /// Btree read/write REPL (debug)
@@ -226,7 +257,7 @@ pub struct Cli {
 // ---------------------------------------------------------------------------
 // parsing helpers
 
-fn parse_btree(s: &str) -> Result<c::btree_id> {
+fn parse_btree(s: &str) -> Result<Btree> {
     s.parse()
         .map_err(|_| anyhow!("invalid btree '{s}' (try: snapshots, subvolumes, extents, ...)"))
 }
@@ -234,7 +265,7 @@ fn parse_btree(s: &str) -> Result<c::btree_id> {
 /// Position parse honoring the session snapshot context: a pos written
 /// without the :snapshot component picks it up from the context. Explicit
 /// :snapshot and the named positions (POS_MIN etc.) are left alone.
-fn parse_pos_ctx(s: &str, snapshot: Option<u32>) -> Result<c::bpos> {
+fn parse_pos_ctx(s: &str, snapshot: Option<u32>) -> Result<Bpos> {
     let mut pos = parse_pos(s)?;
     if let Some(snap) = snapshot {
         if s.matches(':').count() == 1 {
@@ -252,75 +283,28 @@ fn pos_has_explicit_snapshot(s: &str) -> bool {
     s.matches(':').count() >= 2
 }
 
-fn parse_pos(s: &str) -> Result<c::bpos> {
+fn parse_pos(s: &str) -> Result<Bpos> {
     s.parse()
         .map_err(|_| anyhow!("invalid pos '{s}' (inode:offset[:snapshot], POS_MIN, SPOS_MAX)"))
 }
 
 fn parse_int(s: &str) -> Result<u64> {
-    if let Some(h) = s.strip_prefix("0x") {
-        Ok(u64::from_str_radix(h, 16)?)
-    } else if s.starts_with('-') {
-        Ok(s.parse::<i64>()? as u64)
-    } else {
-        Ok(s.parse::<u64>()?)
-    }
+    bkey_methods::parse_int(s).ok_or_else(|| anyhow!("expected an integer, got '{s}'"))
 }
 
-/// An assignment value: numbers resolve immediately, anything else is an
-/// enum value name, resolved once the field (and so the key type) is known.
-enum FieldVal {
-    Int(u64),
-    Name(String),
-}
-
-fn parse_assign(s: &str) -> Result<(&str, FieldVal)> {
-    let (path, val) = s
-        .split_once('=')
-        .ok_or_else(|| anyhow!("expected field=value, got '{s}'"))?;
-    Ok((path, match parse_int(val) {
-        Ok(v) => FieldVal::Int(v),
-        Err(_) => FieldVal::Name(val.to_string()),
-    }))
-}
-
-/// The one piece of schema kvdb owns: which fields hold enum codewords. The
-/// name<->value tables come from the x-macro imports (fs/codegen.rs); this
-/// goes away when the format has a real schema:
-fn field_enum(type_: u8, path: &str) -> Option<&'static [(&'static str, u64)]> {
-    use bcachefs_kernel::snapshot_states::*;
-
-    match (type_ as u32, path) {
-        (t, "state") if t == c::bch_bkey_type::KEY_TYPE_snapshot.0 =>
-            Some(SNAPSHOT_STATE_VALUES),
-        (t, "state") if t == c::bch_bkey_type::KEY_TYPE_subvolume.0 =>
-            Some(SUBVOLUME_STATE_VALUES),
-        _ => None,
-    }
-}
-
-fn field_val(type_: u8, path: &str, v: &FieldVal) -> Result<u64> {
-    match v {
-        FieldVal::Int(v) => Ok(*v),
-        FieldVal::Name(n) => {
-            let vals = field_enum(type_, path)
-                .ok_or_else(|| anyhow!("{path}: expected integer, got '{n}'"))?;
-            vals.iter()
-                .find(|(name, _)| name == n)
-                .map(|(_, v)| *v)
-                .ok_or_else(|| anyhow!("{path}: unknown value '{n}' (valid: {})",
-                                       vals.iter().map(|(n, _)| *n)
-                                           .collect::<Vec<_>>().join(", ")))
-        }
-    }
+/// `field=value`, both as text: the value is parsed by the field's key type
+/// (TransBkey::set()).
+fn parse_assign(s: &str) -> Result<(&str, &str)> {
+    s.split_once('=')
+        .ok_or_else(|| anyhow!("expected field=value, got '{s}'"))
 }
 
 /// The bcachefs to_text methods are the faithful rendering of the on-disk
 /// structs - that is their purpose. The typeinfo field tables are for
 /// addressing fields on the write side (update/set), not for display.
-fn render_key(fs: &Fs, k: &BkeySC<'_>, key_only: bool) -> String {
+fn render_key(fs: &Fs, k: AnyKeySC<'_, Unvalidated>, key_only: bool) -> String {
     if key_only {
-        format!("{}\n", k.to_text_key())
+        format!("{}\n", k.k)
     } else {
         format!("{}\n", k.to_text(fs))
     }
@@ -332,11 +316,29 @@ fn render_key(fs: &Fs, k: &BkeySC<'_>, key_only: bool) -> String {
 /// human-oriented to_text display. Whole arrays print space-separated.
 /// A field beyond the end of a short (older-format) value reads as zero,
 /// mirroring update's grow-zero-filled write semantics.
-fn render_key_fields(k: &BkeySC<'_>, paths: &[&str]) -> Result<String> {
+///
+/// Inodes are read through the decoded form, bch_inode_unpacked, as update
+/// writes them: the varint-packed fields have no fixed position.
+fn render_key_fields(fs: &Fs, k: AnyKeySC<'_, Unvalidated>, paths: &[&str]) -> Result<String> {
+    if let Some(i) = k.arm::<inode::Inodes>() {
+        let u = inode::unpack(fs, i);
+        let mut bytes = [0u8; size_of::<c::bch_inode_unpacked>()];
+        typeinfo::field_bytes(&u, &mut bytes);
+        return render_fields(&bytes, <c::bch_inode_unpacked as TypeInfo>::INFO, paths);
+    }
+
+    render_raw_fields(k, paths)
+}
+
+/// Fields of the value as stored, by its own struct: get -r, for update -r.
+fn render_raw_fields(k: AnyKeySC<'_, Unvalidated>, paths: &[&str]) -> Result<String> {
+    let info = k.k.key_type().info().ok_or_else(|| anyhow!("unknown key type {}", k.k.type_))?;
+    render_fields(k.val_bytes(), info, paths)
+}
+
+fn render_fields(val: &[u8], info: &'static StructInfo, paths: &[&str]) -> Result<String> {
     use std::fmt::Write as _;
     use typeinfo::{AccessError, FieldKind, FieldRef};
-
-    let val = k.val_bytes();
 
     let read_int = |path: &str, r: &FieldRef| -> Result<String> {
         let v = match typeinfo::read_scalar(val, r) {
@@ -353,66 +355,61 @@ fn render_key_fields(k: &BkeySC<'_>, paths: &[&str]) -> Result<String> {
 
     let mut out = String::new();
     for path in paths {
-        let (r, bm) = resolve_field(k.k.type_, path)?;
-        let line = match bm {
-            Some(bm) => match typeinfo::read_bits(val, &r, bm) {
-                Ok(v) => v.to_string(),
-                Err(AccessError::OutOfBounds { .. }) => "0".to_string(),
-                Err(e) => bail!("{path}: {e}"),
-            },
-            None => match r.kind {
-                FieldKind::Int { .. } => read_int(path, &r)?,
-                FieldKind::Array { elem, n, stride }
-                        if matches!(elem, FieldKind::Int { .. }) => {
-                    (0..*n)
-                        .map(|i| read_int(path, &FieldRef {
-                            offset: r.offset + i * stride,
-                            kind: elem,
-                            len: *stride,
-                        }))
-                        .collect::<Result<Vec<_>>>()?
-                        .join(" ")
-                }
-                // A vartail's length is however much value remains:
-                FieldKind::VarTail { elem, stride }
-                        if matches!(elem, FieldKind::Int { .. }) => {
-                    (0..(val.len().saturating_sub(r.offset) / stride))
-                        .map(|i| read_int(path, &FieldRef {
-                            offset: r.offset + i * stride,
-                            kind: elem,
-                            len: *stride,
-                        }))
-                        .collect::<Result<Vec<_>>>()?
-                        .join(" ")
-                }
-                _ => bail!("{path}: not a scalar or integer-array field"),
-            },
+        let r = typeinfo::resolve_with_bits(info, path).map_err(|e| anyhow!("{e}"))?;
+        let line = match r.kind {
+            FieldKind::Int { .. } | FieldKind::Bits { .. } => read_int(path, &r)?,
+            // a #[bitfield]'s word, whole
+            FieldKind::Struct(w) if matches!(w.shape, typeinfo::Shape::Bitfield(_)) => read_int(path, &r)?,
+            FieldKind::Array { elem, n, stride }
+                    if matches!(elem, FieldKind::Int { .. }) => {
+                (0..*n)
+                    .map(|i| read_int(path, &FieldRef {
+                        offset: r.offset + i * stride,
+                        kind: elem,
+                        len: *stride,
+                    }))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(" ")
+            }
+            // A vartail's length is however much value remains:
+            FieldKind::VarTail { elem, stride }
+                    if matches!(elem, FieldKind::Int { .. }) => {
+                (0..(val.len().saturating_sub(r.offset) / stride))
+                    .map(|i| read_int(path, &FieldRef {
+                        offset: r.offset + i * stride,
+                        kind: elem,
+                        len: *stride,
+                    }))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(" ")
+            }
+            _ => bail!("{path}: not a scalar or integer-array field"),
         };
         writeln!(out, "{line}").unwrap();
     }
     Ok(out)
 }
 
-/// A resolved assignment target: a field, or a declared bit range within one
-/// (`no_keys`, `flags.subvol`).
-type FieldTarget = (typeinfo::FieldRef, Option<&'static typeinfo::BitmaskField>);
+/// Room for whatever set() grows a value to: the largest key there is.
+const BKEY_VAL_U64S_MAX: usize = u8::MAX as usize - BKEY_U64S;
 
-/// Resolve a field-or-bit path against a key type's val struct.
-fn resolve_field(type_: u8, path: &str) -> Result<FieldTarget> {
-    let info = typeinfo::bkey_val_info(type_ as u32)
-        .ok_or_else(|| anyhow!("unknown key type {type_}"))?;
-    typeinfo::resolve_with_bits(info, path).map_err(|e| anyhow!("{e}"))
-}
-
-fn write_field(
-    val: &mut [u8],
-    (r, bm): &FieldTarget,
-    v: u64,
-) -> std::result::Result<(), typeinfo::AccessError> {
-    match bm {
-        Some(bm) => typeinfo::write_bits(val, r, bm, v),
-        None => typeinfo::write_scalar(val, r, v),
+/// Apply @assigns to @k, reporting the first failure through @user_err. @raw:
+/// to the value as stored - see TransBkey::set_raw().
+fn set_fields(
+    fs:       &Fs,
+    k:        &mut TransBkey<'_, '_>,
+    assigns:  &[(&str, &str)],
+    raw:      bool,
+    user_err: &mut Option<anyhow::Error>,
+) -> Result<(), BchError> {
+    for (field, val) in assigns {
+        let ret = if raw { k.set_raw(fs, field, val) } else { k.set(fs, field, val) };
+        if let Err(e) = ret {
+            *user_err = Some(anyhow!("{e}"));
+            return Err(no_key_err());
+        }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -426,8 +423,8 @@ const RAW_EXACT: BtreeIterFlags = BtreeIterFlags::SLOTS.union(BtreeIterFlags::AL
 /// The snapshot context only applies to btrees whose keys are actually
 /// snapshotted - on anything else it would corrupt positions (snapshots
 /// btree keys live at snapshot 0) and filtering is meaningless.
-fn btree_uses_snapshots(btree: c::btree_id) -> bool {
-    bcachefs_kernel::BTREE_HAS_SNAPSHOTS_MASK & (1u64 << btree as u64) != 0
+fn btree_uses_snapshots(btree: Btree) -> bool {
+    bcachefs_kernel::BTREE_HAS_SNAPSHOTS_MASK & (1u64 << btree.0 as u64) != 0
 }
 
 /// With a snapshot context active, reads drop ALL_SNAPSHOTS - the iterator
@@ -448,23 +445,27 @@ fn iter_flags(base: BtreeIterFlags, filtered: bool) -> BtreeIterFlags {
 /// faithful display), the key alone (-k), or selected value fields as bare
 /// values (trailing field paths). A deleted slot is "no key" for a field
 /// read - scripts reading fields need the miss to fail, not to read zeros -
-/// while the display modes do show deleted slots and whiteouts.
+/// while the display modes do show deleted slots and whiteouts. RawFields
+/// (-r): the value as stored, by its own struct - what update -r writes.
 #[derive(Clone, Copy)]
 enum Render<'a> {
     Full,
     KeyOnly,
     Fields(&'a [&'a str]),
+    RawFields(&'a [&'a str]),
 }
 
-fn render_read(fs: &Fs, k: &BkeySC<'_>, how: Render<'_>) -> Result<String> {
+fn render_read<V: ?Sized + BkeyVal>(fs: &Fs, k: &BkeySC<'_, V>, how: Render<'_>) -> Result<String> {
+    let k = k.as_read();
     match how {
         Render::Full => Ok(render_key(fs, k, false)),
         Render::KeyOnly => Ok(render_key(fs, k, true)),
-        Render::Fields(_) if k.is_deleted() => {
+        Render::Fields(_) | Render::RawFields(_) if k.k.key_type().is_deleted() => {
             let (inode, offset, snapshot) = (k.k.p.inode, k.k.p.offset, k.k.p.snapshot);
             Err(anyhow!("no key at {inode}:{offset}:{snapshot}"))
         }
-        Render::Fields(paths) => render_key_fields(k, paths),
+        Render::Fields(paths) => render_key_fields(fs, k, paths),
+        Render::RawFields(paths) => render_raw_fields(k, paths),
     }
 }
 
@@ -478,32 +479,38 @@ enum ReadOp {
     PeekPrev,
 }
 
-fn cmd_read(fs: &Fs, op: ReadOp, btree: c::btree_id, pos: c::bpos, filtered: bool,
+fn cmd_read(fs: &Fs, op: ReadOp, btree: Btree, pos: Bpos, level: u32, filtered: bool,
             how: Render<'_>) -> Result<String> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut user_err: Option<anyhow::Error> = None;
     let out = lockrestart_do(&trans, |t| {
-        let base = match op {
-            ReadOp::Get => RAW_EXACT,
-            _ => BtreeIterFlags::ALL_SNAPSHOTS,
-        };
-        let mut iter = BtreeIter::new(t.trans(), btree, pos, iter_flags(base, filtered));
-        let out = match op {
-            ReadOp::Get => iter.peek_max_flags(SPOS_MAX, BtreeIterFlags::SLOTS),
-            ReadOp::Peek => iter.peek(),
-            ReadOp::PeekPrev => iter.peek_prev(),
-        }
-        .and_then(|k| match k {
+        let mut iter;
+        let out = if level > 0 {
+            // h_read() takes -L for get only
+            iter = BtreeIter::new_level(t, btree, pos, level, BtreeIterFlags::empty());
+            iter.peek_slot(t)
+        } else {
+            let base = match op {
+                ReadOp::Get => RAW_EXACT,
+                _ => BtreeIterFlags::ALL_SNAPSHOTS,
+            };
+            iter = BtreeIter::new(t, btree, pos, iter_flags(base, filtered));
+            match op {
+                ReadOp::Get => iter.peek_slot(t),
+                ReadOp::Peek => iter.peek(t),
+                ReadOp::PeekPrev => iter.peek_prev(t),
+            }
+        }?;
+        match out {
             Some(k) => render_read(fs, &k, how).map_err(|e| {
                 // Render errors (bad field path, no key for a field read)
                 // are the user's, not the transaction's: stash and abort
                 // the retry loop with a stand-in errcode.
                 user_err = Some(e);
-                BchError::from_errcode(bch_errcode::BCH_ERR_ENOENT_bkey_type_mismatch)
+                BchError::from(Errcode::ENOENT_bkey_type_mismatch)
             }),
             None => Ok("(no key)\n".to_string()),
-        });
-        t.result_value(out)
+        }
     });
     match user_err {
         Some(e) => Err(e),
@@ -563,7 +570,7 @@ impl rustyline::Helper for KvdbHelper {}
 /// returning what they've collected; the flag is cleared before each command.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn kvdb_sigint(_: libc::c_int) {
+extern "C" fn kvdb_sigint(_: core::ffi::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
 
@@ -571,27 +578,27 @@ fn take_interrupt() -> bool {
     INTERRUPTED.swap(false, Ordering::Relaxed)
 }
 
-fn cmd_list(fs: &Fs, btree: c::btree_id, start: c::bpos, end: c::bpos,
+fn cmd_list(fs: &Fs, btree: Btree, start: Bpos, end: Bpos, level: u32,
             filtered: bool, key_only: bool) -> Result<String> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut out = String::new();
-    let mut iter = BtreeIter::new(
-        &trans,
-        btree,
-        start,
-        iter_flags(BtreeIterFlags::ALL_SNAPSHOTS | BtreeIterFlags::PREFETCH, filtered),
-    );
-    iter.for_each_max(&trans, end, |k| {
+    let flags = iter_flags(BtreeIterFlags::ALL_SNAPSHOTS | BtreeIterFlags::PREFETCH, filtered);
+    let mut iter = if level > 0 {
+        BtreeIter::new_level(&trans, btree, start, level, flags)
+    } else {
+        BtreeIter::new(&trans, btree, start, flags)
+    };
+    iter.for_each_max(&trans, end, |_, _, k| {
         if take_interrupt() {
             out.push_str("(interrupted)\n");
-            return ControlFlow::Break(());
+            return Ok(ControlFlow::Break(()));
         }
         if key_only {
-            out.push_str(&format!("{}\n", k.to_text_key()));
+            out.push_str(&format!("{}\n", k.k));
         } else {
             out.push_str(&format!("{}\n", k.to_text(fs)));
         }
-        ControlFlow::Continue(())
+        Ok(ControlFlow::Continue(()))
     })?;
     Ok(out)
 }
@@ -599,11 +606,11 @@ fn cmd_list(fs: &Fs, btree: c::btree_id, start: c::bpos, end: c::bpos,
 /// One key from a mounted filesystem, or None. get: slot iteration at an
 /// exact pos; peek/peek_prev: first key at/after (at/before) pos.
 fn online_one_key(handle: &BcachefsHandle, fs: &Fs,
-		  btree: c::btree_id, pos: c::bpos,
+		  btree: Btree, pos: Bpos, level: u32,
 		  flags: OnlineIterFlags, how: Render<'_>) -> Result<String> {
     // Small buffer: the kernel fills the whole thing per call, and we only
     // want one key (it grows automatically if the key doesn't fit):
-    let mut iter = OnlineBtreeIter::with_buf_size(handle, btree, 0, pos,
+    let mut iter = OnlineBtreeIter::with_buf_size(handle, btree, level, pos,
 					if flags.0 & OnlineIterFlags::PREV.0 != 0 { POS_MIN } else { SPOS_MAX },
 					flags, 4096);
     match iter.next().map_err(|e| anyhow!("BCH_IOCTL_QUERY_BTREE_KEYS: {e}"))? {
@@ -625,21 +632,21 @@ fn online_snapshots_flag(filtered: bool) -> OnlineIterFlags {
 }
 
 fn cmd_read_online(handle: &BcachefsHandle, fs: &Fs, op: ReadOp,
-		   btree: c::btree_id, pos: c::bpos, filtered: bool,
+		   btree: Btree, pos: Bpos, level: u32, filtered: bool,
 		   how: Render<'_>) -> Result<String> {
     let flags = online_snapshots_flag(filtered) | match op {
         ReadOp::Get => OnlineIterFlags::SLOTS,
         ReadOp::Peek => OnlineIterFlags(0),
         ReadOp::PeekPrev => OnlineIterFlags::PREV,
     };
-    online_one_key(handle, fs, btree, pos, flags, how)
+    online_one_key(handle, fs, btree, pos, level, flags, how)
 }
 
 fn cmd_list_online(handle: &BcachefsHandle, fs: &Fs,
-		   btree: c::btree_id, start: c::bpos, end: c::bpos,
+		   btree: Btree, start: Bpos, end: Bpos, level: u32,
 		   filtered: bool, key_only: bool) -> Result<String> {
     let mut out = String::new();
-    let mut iter = OnlineBtreeIter::new(handle, btree, 0, start, end,
+    let mut iter = OnlineBtreeIter::new(handle, btree, level, start, end,
 					online_snapshots_flag(filtered));
     iter.for_each(|k| {
         if take_interrupt() {
@@ -647,7 +654,7 @@ fn cmd_list_online(handle: &BcachefsHandle, fs: &Fs,
             return ControlFlow::Break(());
         }
         if key_only {
-            out.push_str(&format!("{}\n", k.to_text_key()));
+            out.push_str(&format!("{}\n", k.k));
         } else {
             out.push_str(&format!("{}\n", k.to_text(fs)));
         }
@@ -656,80 +663,57 @@ fn cmd_list_online(handle: &BcachefsHandle, fs: &Fs,
     Ok(out)
 }
 
-fn no_key_err() -> TransError {
-    TransError::from(BchError::from_errcode(
-        bch_errcode::BCH_ERR_ENOENT_bkey_type_mismatch,
-    ))
+fn no_key_err() -> BchError {
+    Errcode::ENOENT_bkey_type_mismatch.into()
 }
 
 fn cmd_update(
     fs: &Fs,
-    btree: c::btree_id,
-    pos: c::bpos,
-    assigns: &[(&str, FieldVal)],
+    btree: Btree,
+    pos: Bpos,
+    level: u32,
+    assigns: &[(&str, &str)],
+    raw: bool,
 ) -> Result<String> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut user_err: Option<anyhow::Error> = None;
 
     let commit = commit_do(
         &trans,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
-            let mut iter = BtreeIter::new(
-                t.trans(),
-                btree,
-                pos,
-                RAW_EXACT | BtreeIterFlags::INTENT,
-            );
-            let k = iter
-                .peek_max_flags(SPOS_MAX, BtreeIterFlags::SLOTS)
-                .map_err(TransError::from)?;
-            let Some(k) = k.filter(|k| !k.is_deleted()) else {
+            let mut iter;
+            let k = if level > 0 {
+                iter = BtreeIter::new_level(t, btree, pos, level, BtreeIterFlags::INTENT);
+                iter.peek_slot(t)?
+            } else {
+                iter = BtreeIter::new(t, btree, pos, RAW_EXACT | BtreeIterFlags::INTENT);
+                iter.peek_slot(t)?
+            };
+            let Some(k) = k.filter(|k| !k.k.key_type().is_deleted()) else {
                 let (inode, offset, snapshot) = (pos.inode, pos.offset, pos.snapshot);
                 user_err = Some(anyhow!("no key at {inode}:{offset}:{snapshot}"));
                 return Err(no_key_err());
             };
 
-            // Byte extent the assignments need; the value may legally be
-            // shorter than the current struct (older format version) - grow
-            // it, zero-filled, if a written field lies beyond the end. The
-            // key type is known now, so enum value names resolve here too:
-            let mut need = 0usize;
-            let mut resolved = Vec::with_capacity(assigns.len());
-            for (path, fv) in assigns {
-                match resolve_field(k.k.type_, path) {
-                    Ok((r, _)) => need = need.max(r.offset + r.len),
-                    Err(e) => {
-                        user_err = Some(e);
-                        return Err(no_key_err());
-                    }
-                }
-                match field_val(k.k.type_, path, fv) {
-                    Ok(v) => resolved.push((*path, v)),
-                    Err(e) => {
-                        user_err = Some(e);
-                        return Err(no_key_err());
-                    }
-                }
+            // A copy of the key, as it is, in a buffer set() can grow it into:
+            let mut new = t.bkey_reassemble_resized(k, BKEY_VAL_U64S_MAX)?;
+            new.k_mut().u64s = k.k.u64s;
+
+            set_fields(fs, &mut new, assigns, raw, &mut user_err)?;
+
+            // A btree node pointer is its node's key, and updating it is an
+            // interior update, which commits itself
+            if level > 0 {
+                return if raw {
+                    t.btree_node_update_key_at_pos_raw(btree, level, new)
+                } else {
+                    t.btree_node_update_key_at_pos(btree, level, new)
+                };
             }
 
-            let val_u64s = (k.k.u64s as usize - BKEY_U64S).max(need.div_ceil(8));
-            let mut new = t.bkey_reassemble_resized(k, val_u64s)
-                .map_err(TransError::from)?;
-
-            let type_ = new.k().type_;
-            let mut val_view = BkeyS::from(new.k_i_mut());
-            let val = val_view.val_bytes_mut();
-            for (path, v) in &resolved {
-                let target = resolve_field(type_, path).expect("resolved above");
-                if let Err(e) = write_field(val, &target, *v) {
-                    user_err = Some(anyhow!("{path}: {e}"));
-                    return Err(no_key_err());
-                }
-            }
-
-            t.update(&mut iter, new, UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE)
+            t.update(&iter, &new, raw_flags(UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE, raw))
         },
     );
 
@@ -739,39 +723,137 @@ fn cmd_update(
     }
 }
 
-fn cmd_set(
-    fs: &Fs,
-    btree: c::btree_id,
-    pos: c::bpos,
-    type_name: &str,
-    assigns: &[(&str, FieldVal)],
-    in_snapshot: bool,
-) -> Result<String> {
-    let ti = typeinfo::bkey_type_info_by_name(type_name)
-        .ok_or_else(|| anyhow!("unknown key type '{type_name}'"))?;
+/// The -r writes: no triggers. They would restamp what was just set (an
+/// inode's bi_journal_seq), or update other btrees and the accounting to
+/// match - and a key the accounting doesn't know about is one of the states
+/// being injected.
+fn raw_flags(flags: UpdateTriggerFlags, raw: bool) -> UpdateTriggerFlags {
+    if raw { flags | UpdateTriggerFlags::NORUN } else { flags }
+}
 
-    // The value needs the struct's fixed size, extended by whatever the
-    // assignments reach - vartail elements (damage errors[n]) lie beyond it:
-    let mut need = ti.info.size;
-    for (path, _) in assigns {
-        let (r, _) = resolve_field(ti.type_ as u8, path)?;
-        need = need.max(r.offset + r.len);
-    }
-    let val_u64s = need.div_ceil(8);
-
-    let assigns = assigns
-        .iter()
-        .map(|(path, fv)| Ok((*path, field_val(ti.type_ as u8, path, fv)?)))
-        .collect::<Result<Vec<(&str, u64)>>>()?;
-
-    let trans = BtreeTrans::new(fs);
+/// Duplicate the key at @pos at @new_pos, exactly as it is: a raw insert -
+/// triggers run, but an extent overwrites nothing, so the copy can overlap
+/// what's there - into a slot that must be empty. For an extent, @new_pos is
+/// the copy's end, its size unchanged. @raw: no triggers - see raw_flags().
+/// A btree node pointer (@level > 0) may be copied over itself.
+fn cmd_copy(fs: &Fs, btree: Btree, pos: Bpos, new_pos: Bpos, level: u32, assigns: &[(&str, &str)],
+            raw: bool) -> Result<String>
+{
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut user_err: Option<anyhow::Error> = None;
 
     let commit = commit_do(
         &trans,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
+            if level > 0 {
+                let no_key = |p: Bpos| {
+                    let (inode, offset, snapshot) = (p.inode, p.offset, p.snapshot);
+                    anyhow!("no key at level {level}, {inode}:{offset}:{snapshot}")
+                };
+
+                let mut new_iter = BtreeIter::new_level(t, btree, new_pos, level, BtreeIterFlags::empty());
+                if new_pos != pos &&
+                   new_iter.peek_slot(t)?.is_some_and(|k| !k.k.key_type().is_deleted() && k.k.p == new_pos) {
+                    let (inode, offset, snapshot) = (new_pos.inode, new_pos.offset, new_pos.snapshot);
+                    user_err = Some(anyhow!("level {level}, {inode}:{offset}:{snapshot} is occupied"));
+                    return Err(no_key_err());
+                }
+
+                let mut iter = BtreeIter::new_level(t, btree, pos, level, BtreeIterFlags::empty());
+                let Some(k) = iter.peek_slot(t)?.filter(|k| !k.k.key_type().is_deleted()) else {
+                    user_err = Some(no_key(pos));
+                    return Err(no_key_err());
+                };
+
+                let mut new = t.bkey_reassemble_resized(k, BKEY_VAL_U64S_MAX)?;
+                new.k_mut().u64s = k.k.u64s;
+                new.k_mut().p = new_pos;
+                set_fields(fs, &mut new, assigns, true, &mut user_err)?;
+                return unsafe { t.btree_node_inject_key(btree, level, new) };
+            }
+
+            let mut iter = BtreeIter::new(t, btree, pos, RAW_EXACT);
+            let k = iter.peek_slot(t)?;
+            let Some(k) = k.filter(|k| !k.k.key_type().is_deleted()) else {
+                let (inode, offset, snapshot) = (pos.inode, pos.offset, pos.snapshot);
+                user_err = Some(anyhow!("no key at {inode}:{offset}:{snapshot}"));
+                return Err(no_key_err());
+            };
+
+            let mut new_iter = BtreeIter::new(t, btree, new_pos,
+                                              RAW_EXACT | BtreeIterFlags::INTENT);
+            let old = new_iter.peek_slot(t)?;
+            if old.is_some_and(|old| !old.k.key_type().is_deleted()) {
+                let (inode, offset, snapshot) = (new_pos.inode, new_pos.offset, new_pos.snapshot);
+                user_err = Some(anyhow!("{inode}:{offset}:{snapshot} is occupied"));
+                return Err(no_key_err());
+            }
+
+            let mut new = t.bkey_reassemble(k)?;
+            new.k_mut().p = new_pos;
+
+            t.update(&new_iter, &new, raw_flags(UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE, raw))
+        },
+    );
+
+    match commit {
+        Ok(()) => Ok(String::new()),
+        Err(e) => Err(user_err.unwrap_or_else(|| anyhow!("copy failed: {e}"))),
+    }
+}
+
+/// The node the pointer at @pos, at @level of @btree, points to, rewritten:
+/// an interior update, which commits itself.
+fn cmd_rewrite(fs: &Fs, btree: Btree, pos: Bpos, level: u32) -> Result<String> {
+    let trans = bcachefs_kernel::btree_trans!(fs);
+    lockrestart_do(&trans, |t| {
+        t.btree_node_rewrite_pos(btree, level, pos, 0, CommitFlags::NO_ENOSPC, c::WriteFlags::empty())
+    })
+    .map_err(|e| anyhow!("rewriting the node the level {level} pointer of {btree} at {pos} points to: {e}"))?;
+    Ok(String::new())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_set(
+    fs: &Fs,
+    btree: Btree,
+    pos: Bpos,
+    level: u32,
+    type_name: &str,
+    assigns: &[(&str, &str)],
+    in_snapshot: bool,
+    raw: bool,
+) -> Result<String> {
+    let ty: BkeyType = type_name.parse().map_err(|_| anyhow!("unknown key type '{type_name}'"))?;
+    let info = ty.info().expect("a key type by name is one this code knows");
+
+    let trans = bcachefs_kernel::btree_trans!(fs);
+    let mut user_err: Option<anyhow::Error> = None;
+
+    let commit = commit_do(
+        &trans,
+        None,
+        CommitFlags::NO_ENOSPC,
+        |t| {
+            if level > 0 {
+                if ty.is_deleted() {
+                    let mut iter = BtreeIter::new_level(t, btree, pos, level, BtreeIterFlags::empty());
+                    if iter.peek_slot(t)?.is_none_or(|k| k.k.key_type().is_deleted()) {
+                        let (inode, offset, snapshot) = (pos.inode, pos.offset, pos.snapshot);
+                        user_err = Some(anyhow!("no key at level {level}, {inode}:{offset}:{snapshot}"));
+                        return Err(no_key_err());
+                    }
+                }
+
+                let mut new: TransBkey<'_, '_> = t.bkey_alloc_init::<c::Deleted>(BKEY_VAL_U64S_MAX, pos)?.into();
+                new.k_mut().set_key_type(ty);
+                new.k_mut().u64s = (BKEY_U64S + info.size.div_ceil(8)) as u8;
+                set_fields(fs, &mut new, assigns, true, &mut user_err)?;
+                return unsafe { t.btree_node_inject_key(btree, level, new) };
+            }
+
             // Deletion has two meanings. Raw (the default): remove this
             // exact key - a filtered iter would have bch2_trans_update()
             // convert the deletion into a whiteout whenever the key is
@@ -786,35 +868,26 @@ fn cmd_set(
                 (RAW_EXACT | BtreeIterFlags::INTENT,
                  UpdateTriggerFlags::INTERNAL_SNAPSHOT_NODE)
             };
+            let update_flags = raw_flags(update_flags, raw);
             let mut iter = BtreeIter::new(
-                t.trans(),
+                t,
                 btree,
                 pos,
                 iter_flags,
             );
-            iter.peek_max_flags(SPOS_MAX, BtreeIterFlags::SLOTS)
-                .map_err(TransError::from)?;
+            iter.peek_slot(t)?;
 
-            let mut new = t.bkey_alloc_init(val_u64s, ti.type_ as u8, pos)
-                .map_err(TransError::from)?;
+            // A zeroed value of the struct's fixed size, in a buffer set()
+            // can grow it into - vartail elements (damage errors[n]) lie
+            // beyond the struct:
+            // of the type the user named: erased, then retyped
+            let mut new: TransBkey<'_, '_> = t.bkey_alloc_init::<c::Deleted>(BKEY_VAL_U64S_MAX, pos)?.into();
+            new.k_mut().set_key_type(ty);
+            new.k_mut().u64s = (BKEY_U64S + info.size.div_ceil(8)) as u8;
 
-            let mut val_view = BkeyS::from(new.k_i_mut());
-            let val = val_view.val_bytes_mut();
-            for (path, v) in &assigns {
-                let target = match typeinfo::resolve_with_bits(ti.info, path) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        user_err = Some(anyhow!("{e}"));
-                        return Err(no_key_err());
-                    }
-                };
-                if let Err(e) = write_field(val, &target, *v) {
-                    user_err = Some(anyhow!("{path}: {e}"));
-                    return Err(no_key_err());
-                }
-            }
+            set_fields(fs, &mut new, assigns, false, &mut user_err)?;
 
-            t.update(&mut iter, new, update_flags)
+            t.update(&iter, &new, update_flags)
         },
     );
 
@@ -826,11 +899,11 @@ fn cmd_set(
 
 // ---------------------------------------------------------------------------
 // superblock fields — same field engine as keys, anchored on bch_sb::INFO
-// (which carries the BCH_SB_* LE64_BITMASK fields), written back via
+// (which carries the BCH_SB_* flag words, #[bitfield]s), written back via
 // bch2_write_super so the csum is recomputed and every sb copy updated.
 
-fn sb_field(field: &str) -> Result<FieldTarget> {
-    typeinfo::resolve_with_bits(<c::bch_sb as typeinfo::TypeInfo>::INFO, field)
+fn sb_field(field: &str) -> Result<typeinfo::FieldRef> {
+    typeinfo::resolve_with_bits(<Head<c::bch_sb> as typeinfo::TypeInfo>::INFO, field)
         .map_err(|e| anyhow!("{e}"))
 }
 
@@ -843,16 +916,14 @@ fn sb_dev(fs: &Fs, dev: u32) -> Result<bcachefs_kernel::fs::DevRef> {
 }
 
 fn cmd_sb_get(fs: &Fs, dev: Option<u32>, field: &str) -> Result<String> {
-    let (r, bm) = sb_field(field)?;
+    let r = sb_field(field)?;
     let ca = dev.map(|d| sb_dev(fs, d)).transpose()?;
+    let sb = fs.sb_lock();
     let buf = match &ca {
-        Some(ca) => ca.disk_sb.sb_bytes(),
-        None     => fs.disk_sb().sb_bytes(),
+        Some(ca) => fs.dev_sb(&sb, ca).ok_or_else(|| anyhow!("device {} has no superblock", ca.dev_idx))?.sb_bytes(),
+        None     => sb.sb_bytes(),
     };
-    let v = match bm {
-        Some(bm) => typeinfo::read_bits(buf, &r, bm),
-        None => typeinfo::read_scalar(buf, &r),
-    }.map_err(|e| anyhow!("{field}: {e}"))?;
+    let v = typeinfo::read_scalar(buf, &r).map_err(|e| anyhow!("{field}: {e}"))?;
     Ok(format!("{field} = {v} (0x{v:x})\n"))
 }
 
@@ -860,19 +931,22 @@ fn cmd_sb_set(fs: &Fs, dev: Option<u32>, field: &str, v: u64) -> Result<String> 
     let target = sb_field(field)?;
     let ca = dev.map(|d| sb_dev(fs, d)).transpose()?;
 
-    let _lock = unsafe { crate::wrappers::sb_lock(fs.raw) };
+    let mut sb = fs.sb_lock();
 
-    /* sb_lock is held above - disk_sb_mut's contract, and ca->disk_sb's: */
-    let buf = match &ca {
-        Some(ca) => unsafe { &mut (*ca.as_mut_ptr()).disk_sb }.sb_bytes_mut(),
-        None     => unsafe { fs.disk_sb_mut() }.sb_bytes_mut(),
+    let edited = match &ca {
+        Some(ca) => fs.dev_sb_mut(&mut sb, ca)
+            .ok_or_else(|| anyhow!("device {} has no superblock", ca.dev_idx))?
+            .edit_header(|h| typeinfo::write_scalar(h, &target, v)),
+        None     => sb.edit_header(|h| typeinfo::write_scalar(h, &target, v)),
     };
-    write_field(buf, &target, v).map_err(|e| anyhow!("{field}: {e}"))?;
+    edited
+        .map_err(|e| anyhow!("{field}: {e}"))?
+        .map_err(|e| anyhow!("{field}: {e}"))?;
 
     // Only --rw (started) and --nostart (opened will_not_start, which makes
     // no version decisions to persist) get here - see the check in the
     // command loop.
-    fs.write_super_ret()
+    fs.write_super_ret(&mut sb)
         .map_err(|e| anyhow!("bch2_write_super failed: {e}"))?;
     Ok(String::new())
 }
@@ -881,7 +955,7 @@ fn cmd_sb_set(fs: &Fs, dev: Option<u32>, field: &str, v: u64) -> Result<String> 
 // command dispatch + REPL
 
 const HELP: &str = "\
-get  [-k] <btree> <pos> [<field>..]            exact lookup (slot iteration)
+get  [-k|-r] <btree> <pos> [<field>..]         exact lookup (slot iteration)
 peek [-k] <btree> <pos> [<field>..]            first key >= pos
 peek_prev <btree> <pos> [<field>..]            last key <= pos ([-k] too)
 list [-k] <btree> [start] [end]                keys in range
@@ -890,12 +964,37 @@ list [-k] <btree> [start] [end]                keys in range
           line, instead of the display rendering - the same paths update
           takes (depth, btime.lo, skip[1]); a whole array prints its
           elements space-separated
-update    <btree> <pos> <field=val>...         modify fields of an existing key
-set  [-s] <btree> <pos> <type> [field=val]...  insert a whole new key
+          -r reads fields of the value as stored, not an inode's unpacked
+          form - what update -r writes
+          -L <level>, before the other flags, on get and list: the keys at
+          that level, the pointers to the nodes below it
+update [-r] <btree> <pos> <field=val>...       modify fields of an existing key
+          -r writes the value as stored, by its own struct's fields, and
+          runs no triggers: states the inode packer or a trigger would
+          correct (has_inode_opts, a future bi_journal_seq)
+          -L <level>, before -r: a btree node pointer at that level, updated
+          as its node's key - with -r, its triggers not run
+set  [-s][-r] <btree> <pos> <type> [field=val]... insert a whole new key
           values are integers; fields holding enum codewords (snapshot/
           subvolume state) also accept the value name, e.g. state=will_delete
           `set <pos> deleted` removes the exact key; with -s it deletes
           within pos's snapshot instead (whiteouts, like a runtime delete)
+          -L <level>, first: a btree node pointer put straight into the
+          node at that level and the node written - no interior update, no
+          topology checked, the nodes below untouched: damage for
+          check_topology to find. `set -L 1 <btree> <pos> deleted` drops a
+          child's pointer
+copy [-r] <btree> <pos> <new_pos>              duplicate a key, as it is, elsewhere
+          raw: an extent copy can overlap what's there; new_pos may be in
+          another inode or snapshot, and must be empty. An extent's new_pos
+          is its end
+          -L <level>, first: a btree node pointer copied, as set -L puts one,
+          to new_pos - its node's new end - and field=val set on the copy
+          (min_key, flags): pointers that overlap. new_pos may be pos: the
+          pointer edited in place, its node not told
+rewrite -L <level> <btree> <pos>               the node the pointer at pos, at
+          level, points to, rewritten - an interior update, as any - into
+          one bset: room for set -L's keys in a node written many times
 sb get [-d <dev>] <field>                      read a superblock field/flag
 sb set [-d <dev>] <field=val>                  write one, then bch2_write_super
           -d: that device's own superblock - only its per-device parts
@@ -918,8 +1017,8 @@ quit                                           exit (also ^D)
 /// opened noexcl|nostart purely for key formatting - never started, journal
 /// never read - and writes are refused).
 enum KvdbFs {
-    Offline(Fs),
-    Online(BcachefsHandle, Fs),
+    Offline(OpenFs),
+    Online(BcachefsHandle, OpenFs),
 }
 
 impl KvdbFs {
@@ -944,21 +1043,21 @@ impl KvdbFs {
         }
     }
 
-    fn read(&self, op: ReadOp, btree: c::btree_id, pos: c::bpos, filtered: bool,
+    fn read(&self, op: ReadOp, btree: Btree, pos: Bpos, level: u32, filtered: bool,
             how: Render<'_>) -> Result<String> {
         match self {
-            KvdbFs::Offline(fs) => cmd_read(fs, op, btree, pos, filtered, how),
+            KvdbFs::Offline(fs) => cmd_read(fs, op, btree, pos, level, filtered, how),
             KvdbFs::Online(handle, fs) =>
-                cmd_read_online(handle, fs, op, btree, pos, filtered, how),
+                cmd_read_online(handle, fs, op, btree, pos, level, filtered, how),
         }
     }
 
-    fn list(&self, btree: c::btree_id, start: c::bpos, end: c::bpos, filtered: bool,
+    fn list(&self, btree: Btree, start: Bpos, end: Bpos, level: u32, filtered: bool,
             key_only: bool) -> Result<String> {
         match self {
-            KvdbFs::Offline(fs) => cmd_list(fs, btree, start, end, filtered, key_only),
+            KvdbFs::Offline(fs) => cmd_list(fs, btree, start, end, level, filtered, key_only),
             KvdbFs::Online(handle, fs) =>
-                cmd_list_online(handle, fs, btree, start, end, filtered, key_only),
+                cmd_list_online(handle, fs, btree, start, end, level, filtered, key_only),
         }
     }
 }
@@ -971,6 +1070,36 @@ struct Repl<'a> {
     journal: bool,
     rw: bool,
     snapshot: Option<u32>,
+    /// Where set -L and copy -L put keys, whose nodes aren't written yet
+    injected: Vec<(Btree, u32, Bpos)>,
+}
+
+impl Repl<'_> {
+    /// The nodes keys were injected into written: once each, after all of a
+    /// batch's keys, which share one bset - not one per key, each with a block
+    /// of the node to itself.
+    fn write_injected(&mut self) -> Result<()> {
+        if self.injected.is_empty() {
+            return Ok(());
+        }
+        let fs = self.fs.offline()?;
+        let trans = bcachefs_kernel::btree_trans!(fs);
+        for (btree, level, pos) in self.injected.drain(..) {
+            lockrestart_do(&trans, |t| t.btree_node_write_at(btree, level, pos))
+                .map_err(|e| anyhow!("writing the node at level {level} of {btree} at {pos}, keys injected into: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// An error out of the commands leaves the nodes to write: going read-only
+/// won't
+impl Drop for Repl<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.write_injected() {
+            eprintln!("{e}");
+        }
+    }
 }
 
 type CmdHandler = fn(&mut Repl, &Cmd, &[&str]) -> Result<ControlFlow<(), String>>;
@@ -995,7 +1124,7 @@ struct Cmd {
 }
 
 const COMMANDS: &[Cmd] = &[
-    Cmd { name: "get", aliases: &[], usage: "get [-k] <btree> <pos> [<field>..]",
+    Cmd { name: "get", aliases: &[], usage: "get [-L <level>] [-k|-r] <btree> <pos> [<field>..]",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: false, needs_journal: false, handler: h_read },
     Cmd { name: "peek", aliases: &[], usage: "peek [-k] <btree> <pos> [<field>..]",
@@ -1004,15 +1133,21 @@ const COMMANDS: &[Cmd] = &[
     Cmd { name: "peek_prev", aliases: &[], usage: "peek_prev [-k] <btree> <pos> [<field>..]",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: false, needs_journal: false, handler: h_read },
-    Cmd { name: "list", aliases: &[], usage: "list [-k] <btree> [start] [end]",
+    Cmd { name: "list", aliases: &[], usage: "list [-L <level>] [-k] <btree> [start] [end]",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: false, needs_journal: false, handler: h_list },
-    Cmd { name: "update", aliases: &[], usage: "update <btree> <pos> <field=val>...",
+    Cmd { name: "update", aliases: &[], usage: "update [-L <level>] [-r] <btree> <pos> <field=val>...",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: true, needs_journal: false, handler: h_update },
-    Cmd { name: "set", aliases: &[], usage: "set [-s] <btree> <pos> <type> [field=val]...",
+    Cmd { name: "set", aliases: &[], usage: "set [-L <level>] [-s] [-r] <btree> <pos> <type> [field=val]...",
           completes_btree: true, subcommands: &[],
           nostart_ok: false, needs_rw: true, needs_journal: false, handler: h_set },
+    Cmd { name: "copy", aliases: &[], usage: "copy [-L <level>] [-r] <btree> <pos> <new_pos> [field=val]...",
+          completes_btree: true, subcommands: &[],
+          nostart_ok: false, needs_rw: true, needs_journal: false, handler: h_copy },
+    Cmd { name: "rewrite", aliases: &[], usage: "rewrite -L <level> <btree> <pos>",
+          completes_btree: true, subcommands: &[],
+          nostart_ok: false, needs_rw: true, needs_journal: false, handler: h_rewrite },
     Cmd { name: "sb", aliases: &[], usage: "sb get [-d <dev>] <field> | sb set [-d <dev>] <field=val>",
           completes_btree: false, subcommands: &["get", "set"],
           nostart_ok: true, needs_rw: false, needs_journal: false, handler: h_sb },
@@ -1057,19 +1192,33 @@ fn h_snapshot(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(
     }))
 }
 
+/// A leading `-L <level>`: the btree level a key command works at - 0, the
+/// leaves, without one.
+fn take_level<'a, 'b>(args: &'a [&'b str]) -> Result<(u32, &'a [&'b str])> {
+    match args {
+        ["-L", level, rest @ ..] =>
+            Ok((level.parse().map_err(|_| anyhow!("-L: '{level}' isn't a btree level"))?, rest)),
+        _ => Ok((0, args)),
+    }
+}
+
 fn h_read(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
-    let (key_only, args) = match args {
-        ["-k", rest @ ..] => (true, rest),
-        _ => (false, args),
+    let (level, args) = take_level(args)?;
+    let (key_only, raw, args) = match args {
+        ["-k", rest @ ..] => (true, false, rest),
+        ["-r", rest @ ..] => (false, true, rest),
+        _ => (false, false, args),
     };
     let [btree, pos, fields @ ..] = args else {
         bail!("usage: {}", cmd.usage);
     };
-    let how = match (key_only, fields) {
-        (false, []) => Render::Full,
-        (true, []) => Render::KeyOnly,
-        (false, fields) => Render::Fields(fields),
-        (true, _) => bail!("-k and field selection are mutually exclusive"),
+    let how = match (key_only, raw, fields) {
+        (false, false, []) => Render::Full,
+        (true, _, []) => Render::KeyOnly,
+        (false, false, fields) => Render::Fields(fields),
+        (false, true, []) => bail!("-r reads fields: name them"),
+        (false, true, fields) => Render::RawFields(fields),
+        (true, _, _) => bail!("-k and field selection are mutually exclusive"),
     };
     let btree = parse_btree(btree)?;
     let ctx = repl.snapshot
@@ -1084,10 +1233,14 @@ fn h_read(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), S
         "peek" => ReadOp::Peek,
         _ => ReadOp::PeekPrev,
     };
-    Ok(ControlFlow::Continue(repl.fs.read(op, btree, pos, filtered, how)?))
+    if level > 0 && op != ReadOp::Get {
+        bail!("{}: -L is for get, list and update", cmd.name);
+    }
+    Ok(ControlFlow::Continue(repl.fs.read(op, btree, pos, level, filtered, how)?))
 }
 
 fn h_list(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
+    let (level, args) = take_level(args)?;
     let (key_only, args) = match args {
         ["-k", rest @ ..] => (true, rest),
         _ => (false, args),
@@ -1109,10 +1262,15 @@ fn h_list(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), S
         start.snapshot = snap;
     }
     let filtered = ctx.is_some();
-    Ok(ControlFlow::Continue(repl.fs.list(btree, start, end, filtered, key_only)?))
+    Ok(ControlFlow::Continue(repl.fs.list(btree, start, end, level, filtered, key_only)?))
 }
 
 fn h_update(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
+    let (level, args) = take_level(args)?;
+    let (raw, args) = match args {
+        ["-r", rest @ ..] => (true, rest),
+        _ => (false, args),
+    };
     let [btree, pos, assigns @ ..] = args else {
         bail!("usage: {}", cmd.usage);
     };
@@ -1126,19 +1284,27 @@ fn h_update(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(),
         .collect::<Result<Vec<_>>>()?;
     let btree = parse_btree(btree)?;
     let ctx = repl.snapshot.filter(|_| btree_uses_snapshots(btree));
-    Ok(ControlFlow::Continue(cmd_update(fs, btree, parse_pos_ctx(pos, ctx)?, &assigns)?))
+    Ok(ControlFlow::Continue(cmd_update(fs, btree, parse_pos_ctx(pos, ctx)?, level, &assigns, raw)?))
 }
 
 fn h_set(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
-    let (in_snapshot, args) = match args {
-        ["-s", rest @ ..] => (true, rest),
-        _ => (false, args),
-    };
+    let (level, args) = take_level(args)?;
+    let (mut in_snapshot, mut raw, mut args) = (false, false, args);
+    loop {
+        match args {
+            ["-s", rest @ ..] => { in_snapshot = true; args = rest; }
+            ["-r", rest @ ..] => { raw = true;         args = rest; }
+            _ => break,
+        }
+    }
     let [btree, pos, type_name, assigns @ ..] = args else {
         bail!("usage: {}", cmd.usage);
     };
     if in_snapshot && *type_name != "deleted" {
         bail!("-s (delete within pos's snapshot) only applies to deletions");
+    }
+    if in_snapshot && level > 0 {
+        bail!("-s: a btree node pointer isn't in a snapshot");
     }
     let fs = repl.fs.offline()?;
     let assigns = assigns
@@ -1147,9 +1313,52 @@ fn h_set(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), St
         .collect::<Result<Vec<_>>>()?;
     let btree = parse_btree(btree)?;
     let ctx = repl.snapshot.filter(|_| btree_uses_snapshots(btree));
-    Ok(ControlFlow::Continue(
-        cmd_set(fs, btree, parse_pos_ctx(pos, ctx)?, type_name, &assigns, in_snapshot)?,
-    ))
+    let pos = parse_pos_ctx(pos, ctx)?;
+    let out = cmd_set(fs, btree, pos, level, type_name, &assigns, in_snapshot, raw)?;
+    if level > 0 {
+        repl.injected.push((btree, level, pos));
+    }
+    Ok(ControlFlow::Continue(out))
+}
+
+fn h_copy(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
+    let (level, args) = take_level(args)?;
+    let (raw, args) = match args {
+        ["-r", rest @ ..] => (true, rest),
+        _ => (false, args),
+    };
+    let [btree, pos, new_pos, assigns @ ..] = args else {
+        bail!("usage: {}", cmd.usage);
+    };
+    if level == 0 && !assigns.is_empty() {
+        bail!("field=val on a copy only with -L: a btree node pointer's");
+    }
+    let fs = repl.fs.offline()?;
+    let assigns = assigns
+        .iter()
+        .map(|s| parse_assign(s))
+        .collect::<Result<Vec<_>>>()?;
+    let btree = parse_btree(btree)?;
+    let ctx = repl.snapshot.filter(|_| btree_uses_snapshots(btree));
+    let new_pos = parse_pos_ctx(new_pos, ctx)?;
+    let out = cmd_copy(fs, btree, parse_pos_ctx(pos, ctx)?, new_pos, level, &assigns, raw)?;
+    if level > 0 {
+        repl.injected.push((btree, level, new_pos));
+    }
+    Ok(ControlFlow::Continue(out))
+}
+
+fn h_rewrite(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
+    let (level, args) = take_level(args)?;
+    let [btree, pos] = args else {
+        bail!("usage: {}", cmd.usage);
+    };
+    if level == 0 {
+        bail!("rewrite: -L <level>, the level of the pointer to the node, is needed");
+    }
+    let fs = repl.fs.offline()?;
+    let btree = parse_btree(btree)?;
+    Ok(ControlFlow::Continue(cmd_rewrite(fs, btree, parse_pos(pos)?, level)?))
 }
 
 fn h_sb(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
@@ -1177,10 +1386,7 @@ fn h_sb(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), Str
                        reopen with --rw, or --nostart for sb-only edits");
             }
             let (field, val) = parse_assign(assign)?;
-            let FieldVal::Int(v) = val else {
-                bail!("sb set: expected an integer value");
-            };
-            cmd_sb_set(repl.fs.offline()?, dev, field, v)?
+            cmd_sb_set(repl.fs.offline()?, dev, field, parse_int(val)?)?
         }
         _ => bail!("usage: {}", cmd.usage),
     }))
@@ -1188,10 +1394,12 @@ fn h_sb(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), Str
 
 fn h_list_journal(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFlow<(), String>> {
     let fs = repl.fs.offline()?;
-    let mut f = super::list_journal::JournalFilter::default();
     // Searching the journal, not auditing it: gaps in the sequence aren't
     // what we're here for, and on a damaged fs they're endless spam.
-    f.print_missing = false;
+    let mut f = super::list_journal::JournalFilter {
+        print_missing: false,
+        ..Default::default()
+    };
     let mut args = args;
     while let Some((&flag, rest)) = args.split_first() {
         match flag {
@@ -1212,7 +1420,7 @@ fn h_list_journal(repl: &mut Repl, cmd: &Cmd, args: &[&str]) -> Result<ControlFl
         }
     }
     let interrupt: &dyn Fn() -> bool = &take_interrupt;
-    super::list_journal::list_journal_run(fs.raw, &f, false, 0, u64::MAX, None,
+    super::list_journal::list_journal_run(fs, &f, false, 0, u64::MAX, None,
                                           Some(interrupt))?;
     Ok(ControlFlow::Continue(String::new()))
 }
@@ -1251,7 +1459,7 @@ fn kvdb(cli: Cli) -> Result<()> {
     logging::setup(cli.verbose, cli.colorize);
 
     let mut fs_opts = c::bch_opts::default();
-    opt_set!(fs_opts, degraded, bch_degraded_actions::BCH_DEGRADED_very as u8);
+    fs_opts.set_degraded(DegradedAction::very);
     // An injection tool must not consume its own injections: background
     // workers in *this* fs instance would otherwise act on the state under
     // test the moment we go read-write. Snapshot deletion reaps a snapshot
@@ -1259,32 +1467,28 @@ fn kvdb(cli: Cli) -> Result<()> {
     // sees the image; copygc evacuates fragmented buckets, rewriting
     // backpointers a test just staged or is about to read; reconcile
     // consumes pending needs_reconcile state.
-    opt_set!(fs_opts, auto_snapshot_deletion, 0);
-    opt_set!(fs_opts, copygc_enabled, 0);
-    opt_set!(fs_opts, reconcile_enabled, 0);
+    fs_opts.set_auto_snapshot_deletion(false);
+    fs_opts.set_copygc_enabled(false);
+    fs_opts.set_reconcile_enabled(false);
     // ...and the write path must not refuse the states fsck is being tested
     // against: commit-only validation (invalid state codewords, subvolume ->
     // interior node references) stays off in this instance.
-    opt_set!(fs_opts, no_commit_validate, 1);
-    opt_set!(
-        fs_opts,
-        errors,
-        c::bch_error_actions::BCH_ON_ERROR_continue as u8
-    );
+    fs_opts.set_no_commit_validate(true);
+    fs_opts.set_errors(c::ErrorAction::continue_);
     if cli.verbose > 0 {
-        opt_set!(fs_opts, verbose, 1);
+        fs_opts.set_verbose(true);
     }
     // sb-only mode: open the sb but don't run recovery or touch the btree.
     if cli.nostart {
-        opt_set!(fs_opts, nostart, 1);
-        opt_set!(fs_opts, will_not_start, 1);
+        fs_opts.set_nostart(true);
+        fs_opts.set_will_not_start(true);
     }
     // Whatever repair the superblock has scheduled is not what we came for:
     // check_allocations is pass 5, so recovery_pass_last below is a ceiling it
     // sits under, not a filter that excludes it - a filesystem carrying an
     // upgrade's scheduled passes rebuilds accounting before the first command
     // runs. It stays scheduled, and runs at the next real mount.
-    opt_set!(fs_opts, recovery_passes_skip_scheduled, 1);
+    fs_opts.set_recovery_passes_skip_scheduled(true);
     if cli.rw && cli.norecovery {
         bail!("--rw and --norecovery are mutually exclusive");
     }
@@ -1293,7 +1497,7 @@ fn kvdb(cli: Cli) -> Result<()> {
     // nothing recovers there anyway, and the nochanges norecovery implies
     // would turn sb set into a silent no-op.
     if !cli.rw && !cli.nostart {
-        opt_set!(fs_opts, norecovery, 1);
+        fs_opts.set_norecovery(true);
     } else {
         // Go read-write, and stop there. Everything through journal_replay is
         // what makes the filesystem writable and consistent to write to -
@@ -1304,11 +1508,11 @@ fn kvdb(cli: Cli) -> Result<()> {
         // snapshot deletion that consumed the very node a test had staged is
         // what prompted this.) Whatever the superblock still requires stays
         // recorded and runs at the next real mount.
-        opt_set!(fs_opts, recovery_pass_last, c::bch_recovery_pass::BCH_RECOVERY_PASS_journal_replay as u8);
+        fs_opts.set_recovery_pass_last(RecoveryPass::journal_replay);
     }
     if cli.journal {
-        opt_set!(fs_opts, retain_recovery_info, 1);
-        opt_set!(fs_opts, read_entire_journal, 1);
+        fs_opts.set_retain_recovery_info(true);
+        fs_opts.set_read_entire_journal(true);
     }
 
     let kvdb_fs = match crate::device_scan::open_online_or_offline(&cli.devices, fs_opts)? {
@@ -1323,9 +1527,9 @@ fn kvdb(cli: Cli) -> Result<()> {
             let devs = handle.member_devices()
                 .map_err(|e| anyhow!("getting member devices from sysfs: {e}"))?;
 
-            opt_set!(fs_opts, noexcl, 1);
-            opt_set!(fs_opts, nostart, 1);
-            opt_set!(fs_opts, read_only, 1);
+            fs_opts.set_noexcl(true);
+            fs_opts.set_nostart(true);
+            fs_opts.set_read_only(true);
             let fs = crate::device_scan::open_scan(&devs, fs_opts)
                 .map_err(|e| anyhow!(
                     "opening {devs:?} (noexcl/nostart, for formatting keys): {e}"))?;
@@ -1340,6 +1544,7 @@ fn kvdb(cli: Cli) -> Result<()> {
         journal: cli.journal,
         rw: cli.rw,
         snapshot: None,
+        injected: Vec::new(),
     };
 
     if !cli.commands.is_empty() {
@@ -1348,7 +1553,7 @@ fn kvdb(cli: Cli) -> Result<()> {
                 break;
             }
         }
-        return Ok(());
+        return repl.write_injected();
     }
 
     // In a piped script an error must abort (a test's later commands likely
@@ -1359,7 +1564,7 @@ fn kvdb(cli: Cli) -> Result<()> {
                 break;
             }
         }
-        return Ok(());
+        return repl.write_injected();
     }
 
     unsafe {
@@ -1377,7 +1582,12 @@ fn kvdb(cli: Cli) -> Result<()> {
     let history = std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".cache/bcachefs-kvdb-history"));
     if let Some(h) = &history {
-        let _ = rl.load_history(h);
+        match rl.load_history(h) {
+            Err(rustyline::error::ReadlineError::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("loading history from {}: {e}", h.display()),
+            Ok(()) => {}
+        }
     }
     loop {
         let prompt = match repl.snapshot {
@@ -1387,10 +1597,12 @@ fn kvdb(cli: Cli) -> Result<()> {
         match rl.readline(&prompt) {
             Ok(line) => {
                 if !line.trim().is_empty() {
-                    let _ = rl.add_history_entry(&line);
+                    if let Err(e) = rl.add_history_entry(&line) {
+                        log::warn!("adding to history: {e}");
+                    }
                 }
                 INTERRUPTED.store(false, Ordering::Relaxed);
-                match run_line(&mut repl, &line) {
+                match run_line(&mut repl, &line).and_then(|r| repl.write_injected().map(|()| r)) {
                     Ok(ControlFlow::Break(())) => break,
                     Ok(ControlFlow::Continue(())) => {}
                     Err(e) => eprintln!("{e}"),
@@ -1402,10 +1614,12 @@ fn kvdb(cli: Cli) -> Result<()> {
         }
     }
     if let Some(h) = &history {
-        if let Some(dir) = h.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let saved = h.parent().map_or(Ok(()), std::fs::create_dir_all)
+            .map_err(rustyline::error::ReadlineError::from)
+            .and_then(|()| rl.save_history(h));
+        if let Err(e) = saved {
+            log::warn!("saving history to {}: {e}", h.display());
         }
-        let _ = rl.save_history(h);
     }
     Ok(())
 }

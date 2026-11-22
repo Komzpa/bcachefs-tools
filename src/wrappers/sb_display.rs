@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // Superblock display with device names — Rust replacement for the C
-// bch2_sb_to_text_with_names() in rust_shims.c.
+// bch2_sb_to_text_with_names().
 //
 // The C version called bch2_scan_device_sbs (Rust FFI) which returned
 // Vec-allocated memory via forget(), then freed it with darray_exit
@@ -9,29 +9,18 @@
 // keeps everything in Rust so the Vec is dropped with the correct
 // allocator.
 
-use std::fmt::Write;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
-use bch_bindgen::c;
+use bcachefs_kernel::c;
 use bcachefs_kernel::util::printbuf::Printbuf;
 use bcachefs_kernel::c::bch_sb_handle;
-use bcachefs_kernel::sb::{self, sb_field_type};
+use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::sb::{self, SbFieldType};
+use bcachefs_kernel::sb::io::SbState;
+use bcachefs_kernel::util::vstructs::Unvalidated;
 
 use crate::device_scan;
-
-/// UUID of a deleted member slot — all 0xff except the variant/clock_seq bytes.
-const BCH_SB_MEMBER_DELETED_UUID: [u8; 16] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xd9, 0x6a, 0x60, 0xcf, 0x80, 0x3d, 0xf7, 0xef,
-];
-
-/// Check if a member slot is alive (has a real device, not empty or deleted).
-///
-/// The Rust spelling of bch2_member_alive() (fs/sb/members.h).
-pub(crate) fn member_alive(m: &c::bch_member) -> bool {
-    let zero = [0u8; 16];
-    m.uuid.b != zero && m.uuid.b != BCH_SB_MEMBER_DELETED_UUID
-}
 
 /// Find a scanned device by its superblock dev_idx.
 fn find_dev(sbs: &[(PathBuf, bch_sb_handle)], idx: u32) -> Option<&(PathBuf, bch_sb_handle)> {
@@ -39,18 +28,14 @@ fn find_dev(sbs: &[(PathBuf, bch_sb_handle)], idx: u32) -> Option<&(PathBuf, bch
 }
 
 /// Print one member device's info: name, model, and detailed member text.
-///
-/// # Safety
-/// `sb` and `gi` must be valid pointers (gi may be null).
-unsafe fn print_one_member(
+fn print_one_member(
     out: &mut Printbuf,
     sbs: &[(PathBuf, bch_sb_handle)],
-    sb: *mut c::bch_sb,
-    gi: *mut c::bch_sb_field_disk_groups,
-    m: &mut c::bch_member,
+    sb: &c::bch_sb,
+    m: &c::bch_member,
     idx: u32,
 ) {
-    if !member_alive(m) {
+    if !m.alive() {
         return;
     }
 
@@ -59,41 +44,34 @@ unsafe fn print_one_member(
         .map(|(path, _)| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "(not found)".to_string());
 
-    write!(out, "Device {}:\t{}\t", idx, name_str).unwrap();
+    write!(out, "Device {}:\t{}\t", idx, name_str);
 
     if let Some((_, sb_handle)) = dev {
         use crate::wrappers::bdev;
-        let fd = sb_handle.bdev().bd_fd;
+        let fd = sb_handle.dev.bdev().fd().as_raw_fd();
         let model = bdev::fd_to_dev_model(fd);
-        write!(out, "{}", model).unwrap();
+        write!(out, "{}", model);
         if let Some(serial) = bdev::fd_to_dev_serial(fd) {
-            write!(out, "\tS/N: {}", serial).unwrap();
+            write!(out, "\tS/N: {}", serial);
         }
     }
     out.newline();
 
-    {
-        let mut indented = out.indent(2);
-        c::bch2_member_to_text(indented.as_raw(), m, gi, sb, idx);
-    }
+    sb::members::member_to_text(&mut out.indent(2), m, sb, idx);
 }
 
 /// Print superblock contents with device names.
 ///
 /// Scans for devices matching the superblock's UUID, then prints
 /// superblock fields and per-member details with device paths and
-/// hardware model names.
-///
-/// # Safety
-/// `fs` must be a valid pointer to a `bch_fs` or null.
-/// `sb` must point to a valid `bch_sb`.
-pub unsafe fn sb_to_text_with_names(
+/// hardware model names - or, with @field_only, that section alone.
+pub fn sb_to_text_with_names(
     out: &mut Printbuf,
-    fs: *mut c::bch_fs,
+    fs: Option<&Fs>,
     sb: &c::bch_sb,
     print_layout: bool,
     fields: u32,
-    field_only: i32,
+    field_only: Option<SbFieldType>,
 ) {
     // Build UUID= device string for scanning
     let uuid = uuid::Uuid::from_bytes(sb.user_uuid.b);
@@ -102,42 +80,36 @@ pub unsafe fn sb_to_text_with_names(
     let opts = bcachefs_kernel::opts::parse_mount_opts(None, None, true).unwrap_or_default();
     let sbs = device_scan::scan_sbs(&device_str, &opts).unwrap_or_default();
 
-    let sb_ptr = sb as *const c::bch_sb as *mut c::bch_sb;
+    let sb_as_read = sb.as_unvalidated();
 
-    if field_only >= 0 {
-        let f = c::bch2_sb_field_get_id(sb_ptr, c::bch_sb_field_type(field_only as u32));
-        if !f.is_null() {
-            c::__bch2_sb_field_to_text(out.as_raw(), fs, sb_ptr, f);
+    if let Some(ty) = field_only {
+        if let Some(f) = Unvalidated::field_by_type(sb_as_read, ty) {
+            sb::io::field_ops_to_text(out, fs, sb_as_read, f);
         }
     } else {
         out.tabstop_push(44);
 
-        let member_mask = sb_field_type::members_v1.bit()
-            | sb_field_type::members_v2.bit();
-        c::bch2_sb_to_text(out.as_raw(), fs, sb_ptr, print_layout, fields & !member_mask);
-
-        let gi: *mut c::bch_sb_field_disk_groups =
-            sb::io::sb_field_get::<c::bch_sb_field_disk_groups>(sb)
-                .map(|f| f as *const _ as *mut _)
-                .unwrap_or(std::ptr::null_mut());
+        let member_mask = SbFieldType::members_v1.bit()
+            | SbFieldType::members_v2.bit();
+        sb::io::sb_to_text(out, fs, sb_as_read, print_layout, fields & !member_mask);
 
         // members_v1
-        if (fields & sb_field_type::members_v1.bit()) != 0 {
+        if (fields & SbFieldType::members_v1.bit()) != 0 {
             if let Some(mi1) = sb::members::members_v1(sb) {
                 for i in 0..mi1.nr_devices() {
-                    if let Some(mut m) = mi1.get(i) {
-                        print_one_member(out, &sbs, sb_ptr, gi, &mut m, i);
+                    if let Some(m) = mi1.get(i) {
+                        print_one_member(out, &sbs, sb, &m, i);
                     }
                 }
             }
         }
 
         // members_v2
-        if (fields & sb_field_type::members_v2.bit()) != 0 {
+        if (fields & SbFieldType::members_v2.bit()) != 0 {
             if let Some(mi2) = sb::members::members_v2(sb) {
                 for i in 0..mi2.nr_devices() {
-                    if let Some(mut m) = mi2.get(i) {
-                        print_one_member(out, &sbs, sb_ptr, gi, &mut m, i);
+                    if let Some(m) = mi2.get(i) {
+                        print_one_member(out, &sbs, sb, &m, i);
                     }
                 }
             }

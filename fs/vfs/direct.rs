@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! O_DIRECT reads: into the user's buffer, a bio of its pages at a time, each
+//! through the read path. Each bio is the home of a task, in one allocation
+//! with the task and its bvecs, from a pool of the module's: a box is freed
+//! when its task is done, after the dio's ended - when the filesystem may be
+//! gone. The first bio's task is the dio's: it sets up the bios in order, and
+//! reads the first: started, then the rest started - each a split, that puts
+//! what it read in the dio's Gather - then the splits awaited, if there are
+//! any, then the first; and the dio's ended: the kiocb's completion, or the
+//! caller waiting for it.
+
+use crate::os::kiocb::{self, Kiocb};
+use super::file::InodeFile;
+use crate::c;
+use crate::data::read::{self, ReadErrReport, Rbio};
+use crate::errcode::{Errcode, BchError};
+use crate::fs::Fs;
+use crate::inode_opts::get_inode;
+use crate::util::alloc::Kmalloc;
+use crate::os::blkdev::plugged;
+use crate::util::bio::{Bio, BvecMempool, Holds};
+use crate::util::gather::{Gather, GatherRef};
+use crate::os::iov_iter::IovIter;
+use crate::os::user_pages::{Callers, Pinned, UserPage};
+use crate::os::kernel::unlikely;
+use crate::os::module::{Quiesced, ThisModule};
+use crate::util::mempool::Mempool;
+use crate::os::ops::IntoRaw;
+use crate::util::sleep::Sleep;
+use crate::util::task::{exclusive_size, waiter, CompletionReturn, DoneWith, Resume, Return, Spawn, TaskSlot,
+                        WaitSync};
+use crate::os::workqueue::Queue;
+use core::pin::{pin, Pin};
+use core::ptr::{self, NonNull};
+use cstruct_macros::{args_stored_once, in_place};
+use pin_init::{pin_data, pin_init, stack_pin_init};
+
+type F = c::ReadFlags;
+type Splits = Gather<Result<(), BchError>, waiter::Async>;
+type SplitRef = GatherRef<Result<(), BchError>, waiter::Async>;
+type Pool = &'static Mempool<Kmalloc>;
+
+static DIOS: Mempool<Kmalloc> = ::pin_init::zeroed();
+static SPLITS: Mempool<Kmalloc> = ::pin_init::zeroed();
+static DIO_BVECS: BvecMempool = ::pin_init::zeroed();
+static SPLIT_BVECS: BvecMempool = ::pin_init::zeroed();
+
+pub fn pools_init(m: &ThisModule) -> Result<(), BchError> {
+    let dio = exclusive_size::<DioBio<Pinned>, DioFut<'static, Pinned>, Pool>()
+        .max(exclusive_size::<DioBio<Callers>, DioFut<'static, Callers>, Pool>());
+    let split = exclusive_size::<DioBio<Pinned>, SplitFut<'static, Pinned>, Pool>()
+        .max(exclusive_size::<DioBio<Callers>, SplitFut<'static, Callers>, Pool>());
+    Mempool::init_static(&DIOS, Mempool::kmalloc(4, dio), m)?;
+    Mempool::init_static(&SPLITS, Mempool::kmalloc(1, split), m)?;
+    BvecMempool::init_static(&DIO_BVECS, 4, m)?;
+    BvecMempool::init_static(&SPLIT_BVECS, 1, m)
+}
+
+pub fn pools_exit(q: &Quiesced<'_>) {
+    SPLIT_BVECS.exit(q);
+    DIO_BVECS.exit(q);
+    SPLITS.exit(q);
+    DIOS.exit(q);
+}
+
+/// A dio's end: its kiocb's completion, or its caller waiting - the read's
+/// and the write's.
+pub(super) enum End {
+    Async(kiocb::Completion),
+    Sync(Return<Result<usize, BchError>, waiter::Sync>),
+}
+
+impl End {
+    pub(super) fn complete(self, ret: Result<usize, BchError>) {
+        match self {
+            End::Async(done) => done.complete(ret.into_raw()),
+            End::Sync(r) => r.complete(ret),
+        }
+    }
+}
+
+/// P is what its bio has of the user's pages: Pinned, a user-backed iter's,
+/// or the caller's.
+#[pin_data]
+#[repr(C)]
+struct DioBio<P: UserPage> {
+    #[pin]
+    rbio: Rbio<Holds<P>>,
+}
+crate::has_bio!(DioBio<P>, rbio.bio, owns Holds<P> where P: UserPage);
+
+impl<P: UserPage> DioBio<P> {
+    fn pages(self: Pin<&mut Self>) -> &mut Bio<Holds<P>> {
+        self.get_mut().rbio.bio.get_mut()
+    }
+}
+
+struct CallersIter(NonNull<IovIter<'static>>);
+
+unsafe impl Send for CallersIter {}
+
+impl CallersIter {
+    /// # Safety
+    /// For the dio's task, started inline: @iter is the caller's, gone once
+    /// start() returns - when the task first parks - so it's only got
+    /// from in the task's first poll.
+    unsafe fn new(iter: &mut IovIter<'_>) -> Self {
+        CallersIter(NonNull::from(iter).cast())
+    }
+
+    fn get(&mut self) -> &mut IovIter<'_> {
+        unsafe { self.0.cast().as_mut() }
+    }
+}
+
+fn set_up<P: UserPage>(b: &mut Bio<Holds<P>>, iter: &mut IovIter<'_>, offset: &mut u64, should_dirty: bool)
+    -> Result<(), BchError>
+{
+    b.set_opf(c::req_op_REQ_OP_READ | c::REQ_SYNC);
+    b.set_sector(*offset >> 9);
+    b.extract_pages(iter)?;
+
+    *offset += u64::from(b.range().len());
+
+    if should_dirty {
+        b.set_pages_dirty();
+    }
+    Ok(())
+}
+
+#[in_place(SplitFut)]
+async fn split_task<'h, P: UserPage>(mut split: Pin<&'h mut DioBio<P>>, fs: &'h Fs, r: SplitRef, inum: c::subvol_inum,
+                                     flags: F, should_dirty: bool) {
+    r.put(read::read(fs, split.rbio.erased(), inum, flags).await);
+    split.as_mut().pages().release_user_pages(should_dirty).await;
+}
+
+/// What's left of @iter past the dio's first bio, in splits.
+#[inline(never)]
+#[args_stored_once]
+async fn read_splits<P: UserPage>(fs: &Fs, rbio: &Rbio, iter: &mut CallersIter, mut offset: u64,
+                                  inum: c::subvol_inum, flags: F, should_dirty: bool) -> Result<(), BchError> {
+    stack_pin_init!(let splits = Splits::new());
+
+    // @iter is the caller's, and gone once this parks: it's walked before the
+    // wait, with nothing awaited till then - see CallersIter::new().
+    //
+    // A split takes as much of @iter as its pages pin into; one that fails
+    // pinned none, and has nothing to release
+    let started = {
+        let err_report = rbio.err_report.as_deref();
+        core::iter::from_fn(|| (iter.get().count() != 0).then(|| {
+            let mut split = TaskSlot::exclusive_bio_in(&SPLITS, &SPLIT_BVECS, ptr::null_mut(), iter.get().bio_pages(),
+                                                       c::req_op_REQ_OP_READ, |b| {
+                pin_init!(DioBio::<P> { rbio <- Rbio::new(rbio.opts, rbio.subvol, err_report, b.init()) }? BchError)
+            }).expect("a split's box: its pool waits for an element, and an Rbio's init can't fail");
+            set_up(split.home().pages(), iter.get(), &mut offset, should_dirty).map(|()| split)
+        }))
+        .try_for_each(|split| {
+            let r = splits.get();
+            unsafe {
+                split?.start(Spawn::Inline, fs.tasks(), move |s| split_task(s, fs, r, inum, flags, should_dirty))
+            };
+            Ok(())
+        })
+    };
+
+    splits.wait(Resume::INLINE).await.and(started)
+}
+
+#[in_place(DioFut)]
+#[allow(clippy::too_many_arguments)]
+async fn dio_task<'h, P: UserPage>(mut dio: Pin<&'h mut DioBio<P>>, fs: &'h Fs, end: End, mut iter: CallersIter,
+                                   mut offset: u64, inum: c::subvol_inum, flags: F, count: usize) {
+    let should_dirty = iter.get().user_backed();
+
+    let ret = match set_up(dio.as_mut().pages(), iter.get(), &mut offset, should_dirty) {
+        Err(e) => Err(e),
+        Ok(()) => {
+            let rbio = dio.rbio.erased();
+
+            let first = pin!(read::read(fs, rbio, inum, flags));
+            let first = crate::eager!(first);
+
+            let splits = if unlikely(iter.get().count() != 0) {
+                read_splits::<P>(fs, rbio, &mut iter, offset, inum, flags, should_dirty).await
+            } else {
+                Ok(())
+            };
+            first.await.and(splits)
+        }
+    };
+
+    /*
+     * no_poison_check asks for what is physically there. The read still
+     * failed, and said so - err_report carries which errors - but the bytes
+     * it got are in the caller's buffer, and replacing the count with the
+     * error is what throws them away.
+     */
+    end.complete(match ret {
+        Err(e) if !flags.contains(F::no_poison_check) => Err(e),
+        _ => Ok(count),
+    });
+    dio.as_mut().pages().release_user_pages(should_dirty).await;
+}
+
+fn read(req: &mut Kiocb<'_, InodeFile>, iter: &mut IovIter<'_>, flags: F, err_report: Option<&ReadErrReport>)
+    -> Result<usize, BchError>
+{
+    match iter.user_backed() {
+        true  => read_of::<Pinned>(req, iter, flags, err_report),
+        false => read_of::<Callers>(req, iter, flags, err_report),
+    }
+}
+
+fn read_of<P: UserPage>(req: &mut Kiocb<'_, InodeFile>, iter: &mut IovIter<'_>, flags: F,
+                        err_report: Option<&ReadErrReport>) -> Result<usize, BchError>
+{
+    let inode = req.inode();
+    let fs = inode.fs();
+    let offset = req.pos();
+    let opts = get_inode(fs, &inode.inode());
+
+    /* bios must be 512 byte aligned: */
+    if (offset | iter.count() as u64) & (c::SECTOR_SIZE as u64 - 1) != 0 {
+        return Err(fs.err(Errcode::EINVAL_unaligned_io));
+    }
+
+    let count = iter.count() as u64;
+    let len = count.min(inode.vfs().size().saturating_sub(offset));
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let rounded = len.next_multiple_of(u64::from(fs.opts().block_size.get()));
+    let mut iter = iter.hold_back(if rounded < count { (count - rounded) as usize } else { 0 });
+
+    let inum = inode.inum();
+    let subvol = inum.subvol as u32;
+
+    let dio = TaskSlot::exclusive_bio_in(&DIOS, &DIO_BVECS, ptr::null_mut(), iter.bio_pages(), c::req_op_REQ_OP_READ, |b| {
+        pin_init!(DioBio::<P> { rbio <- Rbio::new(opts, subvol, err_report, b.init()) }? BchError)
+    })?;
+    let flags = F::retry_if_stale | F::may_promote | F::user_mapped | flags;
+
+    let mut slot = DoneWith::new();
+    let (end, wait) = match unsafe { req.queued() } {
+        Some(done) => (End::Async(done), None),
+        None => {
+            let (wait, r) = CompletionReturn::new(&mut slot, waiter::Sync::current());
+            (End::Sync(r), Some(wait))
+        }
+    };
+
+    unsafe {
+        let callers = CallersIter::new(&mut iter);
+        dio.start(Spawn::Inline, fs.tasks(), move |d| dio_task(d, fs, end, callers, offset, inum, flags, len as usize))
+    };
+    drop(iter);
+
+    match wait {
+        None => Err(c::EIOCBQUEUED.into()),
+        Some(wait) => wait.wait_sync(Sleep::UNINTERRUPTIBLE).expect("a dio's task, ended with what it read"),
+    }
+}
+
+pub fn direct_io_read(req: &mut Kiocb<'_, InodeFile>, iter: &mut IovIter<'_>, flags: F,
+                      err_report: Option<&ReadErrReport>) -> Result<usize, BchError> {
+    let file = req.file();
+    if file.has_pagecache() {
+        let pos = req.pos();
+        if let Some(last) = (pos + iter.count() as u64).checked_sub(1) {
+            file.write_and_wait_range(pos, last)?;
+        }
+    }
+
+    file.accessed();
+
+    let ret = plugged(|| read(req, iter, flags, err_report))?;
+    req.advance(ret as u64);
+    Ok(ret)
+}
+
+pub(super) fn read_iter(req: &mut Kiocb<'_, InodeFile>, iter: &mut IovIter<'_>) -> isize {
+    if iter.count() == 0 {
+        return 0; /* skip atime */
+    }
+
+    if req.direct() {
+        direct_io_read(req, iter, F::empty(), None).into_raw()
+    } else {
+        let _add = req.inode().ei_pagecache_lock.lock::<c::PagecacheAdd>();
+        req.filemap_read(iter)
+    }
+}

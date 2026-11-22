@@ -9,7 +9,8 @@ use std::ops::Range;
 use std::os::fd::BorrowedFd;
 
 use anyhow::{anyhow, Result};
-use rustix::io::Errno;
+use bcachefs_kernel::os::blkdev;
+use crate::util::{read_exact_at, write_all_at};
 
 // ---- Ranges helpers ----
 
@@ -22,7 +23,7 @@ pub fn range_add(ranges: &mut Ranges, offset: u64, size: u64) {
 fn ranges_roundup(ranges: &mut Ranges, block_size: u64) {
     for r in ranges.iter_mut() {
         r.start = r.start / block_size * block_size;
-        r.end = round_up(r.end, block_size);
+        r.end = r.end.next_multiple_of(block_size);
     }
 }
 
@@ -44,40 +45,6 @@ fn ranges_sort_merge(ranges: &mut Ranges) {
 
 pub fn ranges_sort(ranges: &mut Ranges) {
     ranges.sort_by_key(|r| r.start);
-}
-
-// ---- I/O helpers ----
-
-pub fn pread_exact(fd: BorrowedFd<'_>, buf: &mut [u8], mut offset: u64) -> Result<()> {
-    let mut pos = 0;
-    while pos < buf.len() {
-        match rustix::io::pread(fd, &mut buf[pos..], offset) {
-            Ok(0) => return Err(anyhow!("read error: unexpected EOF")),
-            Ok(n) => {
-                pos += n;
-                offset += n as u64;
-            }
-            Err(Errno::INTR) => continue,
-            Err(e) => return Err(anyhow!("read error: {e}")),
-        }
-    }
-    Ok(())
-}
-
-fn pwrite_all(fd: BorrowedFd<'_>, buf: &[u8], mut offset: u64) -> Result<()> {
-    let mut pos = 0;
-    while pos < buf.len() {
-        match rustix::io::pwrite(fd, &buf[pos..], offset) {
-            Ok(0) => return Err(anyhow!("write error: no progress")),
-            Ok(n) => {
-                pos += n;
-                offset += n as u64;
-            }
-            Err(Errno::INTR) => continue,
-            Err(e) => return Err(anyhow!("write error: {e}")),
-        }
-    }
-    Ok(())
 }
 
 // ---- qcow2 format constants ----
@@ -144,7 +111,7 @@ impl<'fd> Qcow2Image<'fd> {
     pub fn new(infd: BorrowedFd<'fd>, outfd: BorrowedFd<'fd>, block_size: u32) -> Result<Self> {
         assert!(block_size.is_power_of_two());
 
-        let image_size = file_size_fd(infd)?;
+        let image_size = blkdev::size(infd)?;
         let l2_size = block_size as u64 / 8;
         let l1_size = image_size.div_ceil(block_size as u64 * l2_size) as usize;
 
@@ -156,7 +123,7 @@ impl<'fd> Qcow2Image<'fd> {
             l1_table:   vec![0u64; l1_size],
             l1_index:   None,
             l2_table:   vec![0u64; l2_size as usize],
-            offset:     round_up(QCOW2_HDR_BYTES as u64, block_size as u64),
+            offset:     (QCOW2_HDR_BYTES as u64).next_multiple_of(block_size as u64),
         })
     }
 
@@ -168,7 +135,7 @@ impl<'fd> Qcow2Image<'fd> {
 
     fn write_raw(&mut self, buf: &[u8]) -> Result<()> {
         assert!(buf.len() as u64 % self.block_size as u64 == 0);
-        pwrite_all(self.outfd, buf, self.offset)?;
+        write_all_at(self.outfd, buf, self.offset)?;
         self.offset += buf.len() as u64;
         Ok(())
     }
@@ -229,7 +196,7 @@ impl<'fd> Qcow2Image<'fd> {
         for r in ranges.iter() {
             let mut src_offset = r.start;
             while src_offset < r.end {
-                pread_exact(self.infd, &mut buf, src_offset)?;
+                read_exact_at(self.infd, &mut buf, src_offset)?;
                 self.write_buf(&buf, src_offset)?;
                 src_offset += bs as u64;
             }
@@ -247,8 +214,8 @@ impl<'fd> Qcow2Image<'fd> {
         let l1_bytes: Vec<u8> = self.l1_table.iter()
             .flat_map(|v| v.to_be_bytes())
             .collect();
-        self.offset += round_up(l1_bytes.len() as u64, self.block_size as u64);
-        pwrite_all(self.outfd, &l1_bytes, l1_offset)?;
+        self.offset += (l1_bytes.len() as u64).next_multiple_of(self.block_size as u64);
+        write_all_at(self.outfd, &l1_bytes, l1_offset)?;
 
         // Write header
         let mut header_buf = vec![0u8; self.block_size as usize];
@@ -261,7 +228,7 @@ impl<'fd> Qcow2Image<'fd> {
             self.l1_table.len() as u32,
             l1_offset,
         );
-        pwrite_all(self.outfd, &header_buf, 0)?;
+        write_all_at(self.outfd, &header_buf, 0)?;
 
         Ok(())
     }
@@ -270,7 +237,7 @@ impl<'fd> Qcow2Image<'fd> {
 /// Convert a qcow2 image back to a raw device image.
 pub fn qcow2_to_raw(infd: BorrowedFd<'_>, outfd: BorrowedFd<'_>) -> Result<()> {
     let mut hdr_buf = [0u8; QCOW2_HDR_BYTES];
-    pread_exact(infd, &mut hdr_buf, 0)?;
+    read_exact_at(infd, &mut hdr_buf, 0)?;
 
     let magic = read_be_u32(&hdr_buf, 0);
     let version = read_be_u32(&hdr_buf, 4);
@@ -291,7 +258,7 @@ pub fn qcow2_to_raw(infd: BorrowedFd<'_>, outfd: BorrowedFd<'_>) -> Result<()> {
     // Read L1 table
     let l1_offset = read_be_u64(&hdr_buf, 40);
     let mut l1_buf = vec![0u8; l1_size * 8];
-    pread_exact(infd, &mut l1_buf, l1_offset)?;
+    read_exact_at(infd, &mut l1_buf, l1_offset)?;
 
     let mut l2_buf = vec![0u8; block_size as usize];
     let mut data_buf = vec![0u8; block_size as usize];
@@ -302,7 +269,7 @@ pub fn qcow2_to_raw(infd: BorrowedFd<'_>, outfd: BorrowedFd<'_>) -> Result<()> {
             continue;
         }
 
-        pread_exact(infd, &mut l2_buf, l1_entry & !QCOW_OFLAG_COPIED)?;
+        read_exact_at(infd, &mut l2_buf, l1_entry & !QCOW_OFLAG_COPIED)?;
 
         for j in 0..l2_size {
             let l2_entry = read_be_u64(&l2_buf, j * 8);
@@ -312,28 +279,10 @@ pub fn qcow2_to_raw(infd: BorrowedFd<'_>, outfd: BorrowedFd<'_>) -> Result<()> {
             }
 
             let dst_offset = (i as u64 * l2_size as u64 + j as u64) * block_size as u64;
-            pread_exact(infd, &mut data_buf, src_offset)?;
-            pwrite_all(outfd, &data_buf, dst_offset)?;
+            read_exact_at(infd, &mut data_buf, src_offset)?;
+            write_all_at(outfd, &data_buf, dst_offset)?;
         }
     }
 
     Ok(())
-}
-
-fn round_up(v: u64, align: u64) -> u64 {
-    v.div_ceil(align) * align
-}
-
-/// Get the size of a file or block device given a borrowed fd.
-fn file_size_fd(fd: BorrowedFd<'_>) -> Result<u64> {
-    use rustix::fs::{fstat, FileType};
-    use rustix::ioctl::{self, Getter};
-
-    let stat = fstat(fd)?;
-    if FileType::from_raw_mode(stat.st_mode) == FileType::BlockDevice {
-        const BLKGETSIZE64: ioctl::Opcode = bch_bindgen::c::BCH_BLKGETSIZE64 as ioctl::Opcode;
-        Ok(unsafe { rustix::ioctl::ioctl(fd, Getter::<BLKGETSIZE64, u64>::new()) }?)
-    } else {
-        Ok(stat.st_size as u64)
-    }
 }
