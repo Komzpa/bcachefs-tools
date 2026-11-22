@@ -1,0 +1,403 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! The lru btree: per-device read and fragmentation lrus, and the stripe lru.
+//!
+//! An entry is a set bit at an LruPos: which lru, a time, and the entry's
+//! target - a bucket (bucket_to_u64()) for the read and fragmentation lrus, a
+//! stripe index for the stripe lru. It's encoded into a bpos as inode = id <<
+//! LRU_TIME_BITS | time, offset = target, so the bpos order is (id, time,
+//! target): an lru is one contiguous range, oldest first. LruPos is that
+//! position, its own type rather than a bpos, converted only at the btree.
+//!
+//! What an id means - LruId - is a function of the id: ranges of it are the
+//! per-device lrus, the device a part of the id. The raw id is what's stored
+//! and ordered by, never the decoded LruId.
+//!
+//! lru.h's inlines are the same encoding, for C's callers.
+
+use crate::fs::Dev;
+use crate::alloc::background::alloc_to_v4;
+use crate::alloc::buckets::u64_to_bucket;
+use crate::btree::bkey::prelude::*;
+use crate::btree::bkey::AnyKeySC;
+use crate::util::vstructs::Unvalidated;
+use crate::btree::bkey::{pos, spos, BkeySC, POS_MIN, SPOS_MAX, BkeyOps};
+use crate::btree::cache::BtreeCachePins;
+use crate::btree::iter::{lockrestart_do, BtreeIter, BtreeIterFlags, CommitFlags,
+                         TransAttempt, UpdateTriggerFlags};
+use crate::btree::trans::TransGuard;
+use crate::btree::write_buffer::{WbFlush, WbMaybeFlush};
+use crate::c;
+use crate::errcode::BchError;
+use crate::fs::Fs;
+use crate::init::error::{id, BkeyValidate};
+use crate::init::progress::Progress;
+use crate::util::rcu::read_lock;
+use crate::util::Printbuf;
+use crate::{bkey_fsck_err_on, fsck_err};
+use core::ops::RangeInclusive;
+use crate::format::{Bpos, Btree, BkeyType, MetadataVersion};
+
+/// What an lru id says: which lru, and for a per-device one, the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LruId {
+    Read { dev: u32 },
+    Fragmentation { dev: u32 },
+    /// Before per_dev_fragmentation_lru: one lru for every device's buckets
+    FragmentationOld,
+    Stripes,
+    /// None of ours: check_lrus() deletes its entries
+    Unknown(u16),
+}
+
+impl From<u16> for LruId {
+    fn from(id: u16) -> Self {
+        let id32 = u32::from(id);
+
+        if id32 < c::BCH_LRU_READ_MAX {
+            Self::Read { dev: id32 }
+        } else if (c::BCH_LRU_BUCKET_FRAGMENTATION_START..c::BCH_LRU_BUCKET_FRAGMENTATION_END).contains(&id32) {
+            Self::Fragmentation { dev: id32 - c::BCH_LRU_BUCKET_FRAGMENTATION_START }
+        } else if id32 == c::BCH_LRU_BUCKET_FRAGMENTATION_OLD {
+            Self::FragmentationOld
+        } else if id32 == c::BCH_LRU_STRIPE_FRAGMENTATION {
+            Self::Stripes
+        } else {
+            Self::Unknown(id)
+        }
+    }
+}
+
+impl LruId {
+    /// The inverse of From<u16>: a device past its lru's id range is a bug.
+    pub fn id(self) -> u16 {
+        let id = match self {
+            Self::Read { dev }          => dev,
+            Self::Fragmentation { dev } => c::BCH_LRU_BUCKET_FRAGMENTATION_START + dev,
+            Self::FragmentationOld      => c::BCH_LRU_BUCKET_FRAGMENTATION_OLD,
+            Self::Stripes               => c::BCH_LRU_STRIPE_FRAGMENTATION,
+            Self::Unknown(id)           => u32::from(id),
+        } as u16;
+
+        debug_assert_eq!(Self::from(id), self);
+        id
+    }
+
+    /// Its type, an unknown id's being read, as lru_type() has it: its
+    /// entries' targets are read as buckets.
+    pub fn lru_type(self) -> c::LruType {
+        use c::LruType as T;
+
+        match self {
+            Self::Read { .. } | Self::Unknown(_)           => T::read,
+            Self::Fragmentation { .. } | Self::FragmentationOld => T::fragmentation,
+            Self::Stripes                                  => T::stripes,
+        }
+    }
+}
+
+/// A position in the lru btree. Ordered as the bpos it's encoded in -
+/// (id, time, target) - so an lru is one contiguous range, oldest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LruPos {
+    pub id:     u16,
+    /// LRU_TIME_BITS wide
+    pub time:   u64,
+    pub target: u64,
+}
+
+impl LruPos {
+    pub fn new(id: u16, time: u64, target: u64) -> Self {
+        debug_assert!(time <= c::LRU_TIME_MAX);
+        Self { id, time, target }
+    }
+
+    /// Any position in the lru btree decodes: an id is all of inode's top
+    /// bits.
+    pub fn from_bpos(p: Bpos) -> Self {
+        Self {
+            id:     (p.inode >> c::LRU_TIME_BITS) as u16,
+            time:   p.inode & c::LRU_TIME_MAX,
+            target: p.offset,
+        }
+    }
+
+    pub fn to_bpos(self) -> Bpos {
+        pos(u64::from(self.id) << c::LRU_TIME_BITS | self.time, self.target)
+    }
+
+    /// Every position of lru @id: lru_start()..=lru_end().
+    pub fn range(id: LruId) -> RangeInclusive<Self> {
+        Self::new(id.id(), 0, 0)..=Self::new(id.id(), c::LRU_TIME_MAX, u64::MAX)
+    }
+
+    pub fn lru_id(self) -> LruId {
+        LruId::from(self.id)
+    }
+
+    /// The key the entry is for: lru_pos_to_bp().
+    pub fn backing(self) -> c::bbpos {
+        match self.lru_id().lru_type() {
+            c::LruType::stripes => c::bbpos {
+                btree: Btree::stripes,
+                pos:   pos(0, self.target),
+            },
+            _ => c::bbpos {
+                btree: Btree::alloc,
+                pos:   u64_to_bucket(self.target),
+            },
+        }
+    }
+}
+
+// ── The key type ─────────────────────────────────────────────────────────
+//
+// An lru entry is a KEY_TYPE_set; KEY_TYPE_lru, with an idx, is obsolete.
+
+impl BkeyOps for c::Lru {
+    fn validate(v: &BkeyValidate<'_, '_>) -> Result<(), BchError> {
+        bkey_fsck_err_on!(v, LruPos::from_bpos(v.k.k.p).time == 0, id::lru_entry_at_time_0,
+                          "lru entry at time=0")
+    }
+
+    #[cold]
+    fn to_text(out: &mut Printbuf, _fs: Option<&Fs>, k: AnyKeySC<'_, Unvalidated>) {
+        write!(out, "idx {}", k.arm::<c::Lru>().expect("an lru key").v().idx.get());
+    }
+}
+
+// ── Setting entries ──────────────────────────────────────────────────────
+
+/// Set or clear @pos's bit - there's none at time 0: nothing to do.
+pub(crate) fn lru_mod(t: &TransAttempt<'_, '_>, pos: LruPos, set: bool) -> Result<(), BchError> {
+    if pos.time == 0 {
+        return Ok(());
+    }
+    t.bit_mod_buffered(Btree::lru, pos.to_bpos(), set)
+}
+
+/// Move @target's entry in lru @id from @old_time to @new_time:
+/// bch2_lru_change().
+pub fn lru_change(t: &TransAttempt<'_, '_>, id: LruId, target: u64, old_time: u64, new_time: u64)
+    -> Result<(), BchError>
+{
+    if old_time == new_time {
+        return Ok(());
+    }
+    let pos = |time| LruPos::new(id.id(), time, target);
+    lru_mod(t, pos(old_time), false)?;
+    lru_mod(t, pos(new_time), true)
+}
+
+// ── Removing a device ────────────────────────────────────────────────────
+
+/// Every entry of device @dev's buckets, wherever they are - the old
+/// fs-wide fragmentation lru's are mixed in with every device's.
+fn dev_remove_lrus_scan(fs: &Fs, dev: u32) -> Result<(), BchError> {
+    let trans = crate::btree_trans!(fs);
+    let mut iter = BtreeIter::new(&trans, Btree::lru, POS_MIN, BtreeIterFlags::PREFETCH);
+
+    iter.for_each_commit(&trans, None, CommitFlags::empty(), |t, iter, k| {
+        let bp = LruPos::from_bpos(k.k.p).backing();
+        if bp.btree == Btree::alloc && bp.pos.inode == u64::from(dev) {
+            t.delete_at(iter, UpdateTriggerFlags::empty())?;
+        }
+        Ok(())
+    })
+}
+
+/// Lru @id's entries, all of it.
+fn dev_remove_lru_range(fs: &Fs, id: LruId) -> Result<(), BchError> {
+    let range = LruPos::range(id);
+    // In a transaction of its own, not the trans's delete_range(), whose
+    // transaction_restart_nested this has no attempt to begin again for. The
+    // end is inclusive: lru_end(), not the next lru's start.
+    fs.btree_delete_range(Btree::lru, range.start().to_bpos(), range.end().to_bpos(),
+                          BtreeIterFlags::empty(), UpdateTriggerFlags::empty())
+}
+
+/// The entries of device @ca's buckets, as it's removed: its own lrus, if it
+/// has them - a device past the per-device lrus' ids has its entries found
+/// by scanning - and before per_dev_fragmentation_lru, the fs-wide
+/// fragmentation lru's, found by scanning.
+pub(crate) fn dev_remove_lrus(fs: &Fs, ca: &Dev) -> Result<(), BchError> {
+    crate::btree_trans!(fs).write_buffer_flush_sync()?;
+
+    let dev = u32::from(ca.dev_idx);
+    if dev < c::BCH_LRU_READ_MAX {
+        dev_remove_lru_range(fs, LruId::Read { dev })?;
+        dev_remove_lru_range(fs, LruId::Fragmentation { dev })?;
+    } else {
+        dev_remove_lrus_scan(fs, dev)?;
+    }
+
+    if !per_dev_fragmentation_lru(fs) {
+        dev_remove_lrus_scan(fs, dev)?;
+    }
+    Ok(())
+}
+
+/// Whether the upgrade to the per-device fragmentation lrus is done: before
+/// it, entries can be in the old fs-wide one.
+pub(crate) fn per_dev_fragmentation_lru(fs: &Fs) -> bool {
+    fs.version_upgrade_complete() >=
+        MetadataVersion::per_dev_fragmentation_lru
+}
+
+// ── fsck ─────────────────────────────────────────────────────────────────
+
+/// That the entry at @pos, which @referring_k - an alloc or stripe key - says
+/// it has, is there: set it if not, as fsck says. The write buffer is flushed
+/// first, in case it's there, once per referring key - @last_flushed's.
+pub(crate) fn lru_check_set(
+    t:                &TransAttempt<'_, '_>,
+    pos:              LruPos,
+    referring_k:      BkeySC<'_>,
+    mut last_flushed: WbFlush<'_>,
+) -> Result<(), BchError> {
+    let fs = t.fs();
+    let mut iter = BtreeIter::new(t, Btree::lru, pos.to_bpos(), BtreeIterFlags::empty());
+    let lru_k = iter.peek_slot(t)?.expect("a slot always has a key");
+
+    if lru_k.k.key_type() != BkeyType::set {
+        last_flushed.maybe_flush(t, referring_k)?;
+
+        if fsck_err!(t, id::alloc_key_to_missing_lru_entry, "missing {} lru entry at pos {}\n{}",
+                     pos.lru_id().lru_type(), iter.pos(), referring_k.to_text(fs))? {
+            lru_mod(t, pos, true)?;
+        }
+    }
+    Ok(())
+}
+
+/// The time @k says its entry in an lru of type @ty is at - 0, none:
+/// bkey_lru_type_idx().
+fn expected_time(fs: &Fs, ty: c::LruType, k: BkeySC<'_>) -> u64 {
+    use c::LruType as T;
+
+    match ty {
+        T::read => alloc_to_v4(k).lru_idx_read(),
+        T::fragmentation => {
+            let a = alloc_to_v4(k);
+            let rcu = read_lock();
+            fs.dev_rcu(k.k.p.inode as u32, &rcu).map_or(0, |ca| a.lru_idx_fragmentation(ca))
+        }
+        T::stripes => k.arm::<c::Stripe>().map_or(0, |s| s.v().lru_pos()),
+        t => unreachable!("lru type {}", t.0),
+    }
+}
+
+/// That the entry at @lru_k is in the lru its target's key says, at the time
+/// it says - deleting it if not, as fsck says.
+fn check_lru_key(
+    t:            &TransAttempt<'_, '_>,
+    lru_iter:     &BtreeIter<'_>,
+    lru_k:        BkeySC<'_>,
+    last_flushed: &mut WbMaybeFlush,
+) -> Result<(), BchError> {
+    let fs = t.fs();
+    let pos = LruPos::from_bpos(lru_k.k.p);
+    let lru = pos.lru_id();
+
+    // per_dev_fragmentation_lru upgrade: the old fs-wide fragmentation lru is
+    // deleted, its entries not checked - check_alloc_to_lru_refs recreates
+    // them in the per-device lrus, from the alloc btree
+    if lru == LruId::FragmentationOld && !per_dev_fragmentation_lru(fs) {
+        return t.bit_mod_buffered(Btree::lru, lru_iter.pos(), false);
+    }
+
+    let bp = pos.backing();
+    let mut iter = BtreeIter::new(t, bp.btree, bp.pos, BtreeIterFlags::empty());
+    let k = iter.peek_slot(t)?.expect("a slot always has a key");
+
+    let ty = lru.lru_type();
+    let time = expected_time(fs, ty, k);
+
+    // The read and bucket fragmentation lrus are per-device: the lru its
+    // bucket's device says, by the raw id - a corrupt target's device needn't
+    // be one an lru id can name. That's also what deletes stragglers in the old
+    // fs-wide fragmentation lru after the upgrade.
+    let bucket_dev = u64_to_bucket(pos.target).inode as u16;
+    let want_id = match ty {
+        c::LruType::read          => bucket_dev,
+        c::LruType::fragmentation => (c::BCH_LRU_BUCKET_FRAGMENTATION_START as u16).wrapping_add(bucket_dev),
+        _                         => pos.id,
+    };
+
+    if pos.id != want_id || pos.time != time {
+        last_flushed.maybe_flush(t, lru_k)?;
+
+        if fsck_err!(t, id::lru_entry_bad,
+                     "incorrect lru entry: lru {}, expected id {} time {}\n{}\nfor {}",
+                     ty, want_id, time, lru_k.to_text(fs), k.to_text(fs))? {
+            return t.bit_mod_buffered(Btree::lru, lru_iter.pos(), false);
+        }
+    }
+    Ok(())
+}
+
+/// Pin lru @lru's backing keys in the btree node cache: a per-device lru's
+/// are its device's slice of the alloc btree, the stripe lru's the stripes
+/// btree. The others' entries - the old fs-wide fragmentation lru, ids nothing
+/// uses - are scattered or bogus, stragglers to be deleted: no pin.
+fn pin_backing(trans: &TransGuard<'_>, pins: &BtreeCachePins<'_>, lru: LruId) -> Result<(), BchError> {
+    let (btree, start, end) = match lru {
+        LruId::Read { dev } | LruId::Fragmentation { dev } =>
+            (Btree::alloc, pos(dev.into(), 0), spos(dev.into(), u64::MAX, u32::MAX)),
+        LruId::Stripes =>
+            (Btree::stripes, POS_MIN, SPOS_MAX),
+        LruId::FragmentationOld | LruId::Unknown(_) => {
+            pins.unpin();
+            return Ok(());
+        }
+    };
+    let mask = 1 << btree.0;
+    let end = c::bbpos { btree, pos: end };
+    let pinned_end = pins.pin(trans, mask, mask, c::bbpos { btree, pos: start }..=end)?;
+
+    if pinned_end != end {
+        let fs = trans.fs();
+        crate::bch_warn_ratelimited!(fs,
+            "memory budget ({}% of ram) exhausted pinning btree {btree} at {}, requested range end {}; \
+             continuing, lookups past this point will be uncached",
+            fs.opts.fsck_memory_usage_percent.get(), pinned_end.pos, end.pos);
+    }
+    Ok(())
+}
+
+/// Every lru entry, an lru at a time, its backing keys pinned in the btree
+/// node cache: the lookups are random-order, so on a cold cache that turns a
+/// read per key into cache hits.
+fn check_lrus(fs: &Fs) -> Result<(), BchError> {
+    let trans = &crate::btree_trans!(fs);
+    let pins = fs.btree_cache_pins();
+    let mut last_flushed = WbMaybeFlush::new();
+    let progress = Progress::recovery(fs, c"bch2_check_lrus", &[Btree::lru], &[]);
+    let mut next = POS_MIN;
+
+    loop {
+        // The next lru with entries
+        let Some(id) = lockrestart_do(trans, |t| {
+            let mut iter = BtreeIter::new(t, Btree::lru, next, BtreeIterFlags::empty());
+            Ok(iter.peek(t)?.map(|k| LruPos::from_bpos(k.k.p).id))
+        })? else { return Ok(()) };
+
+        let lru = LruId::from(id);
+        pin_backing(trans, &pins, lru)?;
+
+        let range = LruPos::range(lru);
+        let mut iter = BtreeIter::new(trans, Btree::lru, range.start().to_bpos(),
+                                      BtreeIterFlags::PREFETCH);
+        iter.for_each_max_commit(trans, range.end().to_bpos(), BtreeIterFlags::PREFETCH, None,
+                                 CommitFlags::NO_ENOSPC, |t, iter, k| {
+            progress.update(t, iter)?;
+            last_flushed.inc();
+            check_lru_key(t, iter, k, &mut last_flushed)
+        })?;
+
+        let Some(id) = id.checked_add(1) else { return Ok(()) };
+        next = LruPos::new(id, 0, 0).to_bpos();
+    }
+}
+
+crate::recovery_pass!(check_lrus => check_lrus);

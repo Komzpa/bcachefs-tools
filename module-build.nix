@@ -27,7 +27,13 @@ bcachefs-tools:
   stdenv,
   kernelModuleMakeFlags,
   kernel,
-  rustPlatform
+  rustPlatform,
+  rust-bindgen,
+  # The rustc to build with, and its rust-src: another than nixpkgs' -
+  # flake.nix's msrv check - builds bcachefs's Rust from the vendored stack,
+  # the kernel's having been built with nixpkgs'.
+  moduleRustc ? rustPlatform.rust.rustc,
+  moduleRustLibSrc ? rustPlatform.rustLibSrc,
 }:
 
 stdenv.mkDerivation {
@@ -39,20 +45,23 @@ stdenv.mkDerivation {
 
   src = bcachefs-tools.dkms;
 
-  nativeBuildInputs = kernel.moduleBuildDependencies;
+  # The kernel only brings rustc and bindgen when it was built with Rust; a
+  # kernel without it builds bcachefs's Rust from the vendored stack, which
+  # needs them all the same.
+  nativeBuildInputs = kernel.moduleBuildDependencies ++ [
+    moduleRustc
+    rust-bindgen
+  ];
 
   enableParallelBuilding = true;
 
   makeFlags = kernelModuleMakeFlags ++ [
     "KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
     "INSTALL_MOD_PATH=${placeholder "out"}"
-    "RUST_LIB_SRC=${rustPlatform.rustLibSrc}"
+    # by name, not by PATH, where the kernel's rustc may come first
+    "RUSTC=${lib.getExe' moduleRustc "rustc"}"
+    "RUST_LIB_SRC=${moduleRustLibSrc}"
   ];
-
-  postPatch = ''
-    substituteInPlace src/fs/bcachefs/Makefile \
-      --replace-fail '$(objtree)/vmlinux' '${kernel.dev}/vmlinux'
-  '';
 
   installPhase = ''
     runHook preInstall

@@ -2,7 +2,7 @@
 name = "bcachefs-kernel"
 version = "0.1.0"
 authors = [ "Kent Overstreet <kent.overstreet@linux.dev>" ]
-edition = "2021"
+edition = "2024"
 rust-version = "1.85.0"
 
 [lib]
@@ -16,18 +16,58 @@ path = "mod.rs"
 default = ["std"]
 # `zeroize` is a userspace crate; the in-kernel build (no_std, no crates.io)
 # wipes key material with a hand-rolled volatile memset instead (see mod.rs).
-std = ["dep:zeroize"]
+std = ["dep:zeroize", "dep:linux-keyutils"]
 
 [dependencies]
-bcachefs-shim = { path = "../bcachefs-shim" }
-bcachefs-typeinfo-macros = { path = "typeinfo-macros" }
-bitfield = { path = "vendor/bitfield" }
+bcachefs-shim = { path = "../os/linux_user/shim" }
+# The kernel build has pin_init as a crate too - --extern pin_init, the
+# kernel's or the vendored stack's: #[pin_data] and pin_init!() expand to
+# ::pin_init paths.
+pin-init = { path = "../os/linux_user/shim/pin-init" }
+bcachefs-cstruct-macros = { path = "cstruct-macros" }
+bitfield-struct = { path = "vendor/bitfield-struct" }
+nestify = { path = "vendor/nestify" }
 bitflags = { path = "vendor/bitflags" }
+num-traits = { path = "vendor/num-traits", default-features = false }
 paste    = { path = "vendor/paste" }
+# Userspace only: std's legacy-mangled names, in backtraces. v0 names are
+# util/demangle.rs's, and in the kernel every Rust name is v0
+rustc-demangle = "0.1.27"
 uuid     = "1.2.2"
+# The target's ioctl number layout (util/ioctl.rs) and errnos (errcode.rs):
+# bindgen output of each architecture's own headers. Userspace only - the
+# kernel build has no crates.io.
+linux-raw-sys = { version = "0.12", default-features = false, features = ["errno", "general", "no_std"] }
+# Endian-typed integers for the on-disk format: byteorder::{little,big}_endian.
+zerocopy = "0.8"
+# Userspace only: os/linux_user/kernel.rs's random_bytes(), the OS's CSPRNG.
+getrandom = "0.4"
+# Userspace only, util/prompt's: asking on the terminal - polled, echo off
+# for a passphrase - or through systemd's password agents; and the shim's
+# scheduler's futexes and gettid() (os/linux_user/sched.rs).
+rustix   = { version = "1.1.4", features = ["event", "fs", "termios", "thread"] }
+# Userspace only: os/linux_user/percpu.rs's per-thread chunks, mmap()ed, and
+# the pthread key whose destructor gives a thread's back when it exits.
+libc     = "0.2.69"
+# Userspace only: os/linux_user/blkdev.rs's IO.
+io-uring = "0.7"
+# Userspace only: os/linux_user/stacktrace.rs's unwinding and symbols.
+backtrace = "0.3"
+# Userspace only: os/linux_user/checksum.rs's crc32c(), in hardware on x86 and arm64.
+crc32c   = "0.6"
+# Userspace only: os/linux_user/checksum.rs's Xxh64.
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash64"] }
+# Userspace only: os/linux_user/crypto.rs's ChaCha20, Poly1305 and SHA-256.
+chacha20 = { version = "0.10", features = ["zeroize"] }
+poly1305 = { version = "0.9", features = ["zeroize"] }
+sha2     = { version = "0.11", default-features = false }
+# Userspace only: data/checksum.rs's derive_passphrase().
+scrypt   = { version = "0.12", default-features = false }
+# Userspace only: os/linux_user's Mutex, RwSem and PercpuRwSem.
+parking_lot = "0.12"
+owo-colors = "4"
+log      = { version = "0.4", features = ["std"] }
 zeroize  = { version = "1", optional = true, features = ["std", "zeroize_derive"] }
-
-[build-dependencies]
-# build.rs drives the `bindgen` CLI (see codegen.rs) rather than the bindgen
-# library, so the only build-dep is cc, for the static-inline wrappers.
-cc = "1.0"
+# The keyring the passphrase key is looked for in (os/linux_user/keyring.rs):
+# the kernel's in-kernel, these syscalls here.
+linux-keyutils = { version = "0.2", optional = true }

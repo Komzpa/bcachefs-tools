@@ -1,26 +1,27 @@
 use std::ffi::CStr;
 use std::mem;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
-use bch_bindgen::c::{
+use bcachefs_kernel::c::{
     bch_ioctl_dev_usage, bch_ioctl_dev_usage_v2,
-    bch_ioctl_dev_usage_bch_ioctl_dev_usage_type,
     bch_ioctl_disk, bch_ioctl_disk_v2,
     bch_ioctl_disk_set_state, bch_ioctl_disk_set_state_v2,
     bch_ioctl_disk_resize, bch_ioctl_disk_resize_v2,
     bch_ioctl_disk_resize_journal, bch_ioctl_disk_resize_journal_v2,
     bch_ioctl_subvolume, bch_ioctl_subvolume_v2,
     bch_ioctl_query_btree_keys, bch_ioctl_query_uuid, bch_ioctl_read_super,
-    BCH_BY_INDEX, BCH_SUBVOL_SNAPSHOT_CREATE,
+    BCH_BY_INDEX, BCH_SUBVOL_SNAPSHOT_CREATE, MemberState,
 };
-use bch_bindgen::accounting::data_type;
 use crate::wrappers::ioctl::*;
 use crate::wrappers::sysfs;
-use bch_bindgen::c::bch_sb;
+use bcachefs_kernel::c::bch_sb;
+use bcachefs_kernel::util::vstructs::{read_past, Head};
 use bcachefs_kernel::errcode::BchError;
+use bcachefs_kernel::format::{DataType, MetadataVersion};
 use bcachefs_kernel::path_to_cstr;
 use errno::Errno;
+use uuid::Uuid;
 
 fn io_errno(e: std::io::Error) -> Errno {
     Errno(e.raw_os_error().unwrap_or(libc::EIO))
@@ -49,21 +50,15 @@ macro_rules! v2_v1_ioctl {
 const SYSFS_BASE: &str = "/sys/fs/bcachefs/";
 
 /// `struct fs_sysfs_path` (linux/fs.h). Defined here because the blocklist
-/// keeps linux/fs.h's types out of the bindings. The ioctl number carrying its
-/// size comes from the C compiler, so the assert is what stops the two drifting.
+/// keeps linux/fs.h's types out of the bindings.
 #[repr(C)]
 struct FsSysfsPath {
     len: u8,
     name: [u8; 128],
 }
 
-const _: () = assert!(
-    mem::size_of::<FsSysfsPath>() == bch_bindgen::c::BCH_SIZEOF_FS_SYSFS_PATH as usize,
-    "FsSysfsPath must match struct fs_sysfs_path - FS_IOC_GETFSSYSFSPATH encodes its size",
-);
-
-const FS_IOC_GETFSSYSFSPATH: libc::Ioctl =
-    bch_bindgen::c::BCH_FS_IOC_GETFSSYSFSPATH as libc::Ioctl;
+/* FS_IOC_GETFSSYSFSPATH: _IOR(0x15, 1, struct fs_sysfs_path) */
+type GetFsSysfsPath = rustix::ioctl::Getter<{ rustix::ioctl::opcode::read::<FsSysfsPath>(0x15, 1) }, FsSysfsPath>;
 
 /// A handle to a bcachefs filesystem, with RAII close.
 pub(crate) struct BcachefsHandle {
@@ -101,9 +96,9 @@ impl BcachefsHandle {
 
         // Try as UUID string first (normalized: the sysfs dir is canonical
         // lowercase-with-dashes, the user's spelling may not be)
-        if let Ok(uuid) = parse_uuid(&path_str) {
-            return Self::open_by_name(&format_uuid(&uuid), Some(uuid))
-                .map_err(|e| BchError::from_raw(-e.0));
+        if let Ok(uuid) = Uuid::try_parse(&path_str).map(Uuid::into_bytes) {
+            return Self::open_by_name(&Uuid::from_bytes(uuid).to_string(), Some(uuid))
+                .map_err(|e| BchError::from(e.0));
         }
 
         if let Some(handle) = Self::open_if_mounted(path)? {
@@ -127,17 +122,17 @@ impl BcachefsHandle {
     pub(crate) fn open_if_mounted<P: AsRef<Path>>(path: P) -> Result<Option<Self>, BchError> {
         let path = path.as_ref();
 
-        if let Ok(uuid) = parse_uuid(&path.to_string_lossy()) {
+        if let Ok(uuid) = Uuid::try_parse(&path.to_string_lossy()).map(Uuid::into_bytes) {
             // No sysfs dir for the UUID means not mounted; any other error
             // (e.g. EACCES on the ctl device) is real and must not be
             // mistaken for "not mounted", or callers fall back to offline
             // superblock access on a live filesystem. Normalize the string
             // through parse+format: the sysfs dir is canonical lowercase
             // with dashes, the user's spelling may not be:
-            return match Self::open_by_name(&format_uuid(&uuid), Some(uuid)) {
+            return match Self::open_by_name(&Uuid::from_bytes(uuid).to_string(), Some(uuid)) {
                 Ok(h) => Ok(Some(h)),
                 Err(e) if e.0 == libc::ENOENT => Ok(None),
-                Err(e) => Err(BchError::from_raw(-e.0)),
+                Err(e) => Err(BchError::from(e.0)),
             };
         }
 
@@ -150,7 +145,7 @@ impl BcachefsHandle {
         };
 
         let stat = rustix::fs::fstat(&path_fd)
-            .map_err(|e| BchError::from_raw(-e.raw_os_error()))?;
+            .map_err(|e| BchError::from(e.raw_os_error()))?;
         let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
 
         if file_type == rustix::fs::FileType::RegularFile {
@@ -158,7 +153,7 @@ impl BcachefsHandle {
         }
 
         // Try BCH_IOCTL_QUERY_UUID — if it succeeds, it's a mounted fs path
-        let mut query_uuid = bch_ioctl_query_uuid::default();
+        let mut query_uuid = pin_init::zeroed::<bch_ioctl_query_uuid>();
         if ioctl_rw::<BCH_IOCTL_QUERY_UUID>(&path_fd, &mut query_uuid).is_ok() {
             return Self::open_mounted_path(path_fd, query_uuid.uuid.b).map(Some);
         }
@@ -177,9 +172,9 @@ impl BcachefsHandle {
                 // target looks like "../../fs/bcachefs/<uuid>/dev-N"
                 // We need to extract uuid and dev_idx
                 if let Some((uuid_str, dev_idx)) = parse_sysfs_link(&target) {
-                    let uuid = parse_uuid(uuid_str).ok();
+                    let uuid = Uuid::try_parse(uuid_str).ok().map(Uuid::into_bytes);
                     let mut handle = Self::open_by_name(uuid_str, uuid)
-                        .map_err(|e| BchError::from_raw(-e.0))?;
+                        .map_err(|e| BchError::from(e.0))?;
                     handle.dev_idx = dev_idx;
                     return Ok(Some(handle));
                 }
@@ -206,18 +201,18 @@ impl BcachefsHandle {
     /// these are.
     pub(crate) fn member_devices(&self) -> Result<Vec<std::path::PathBuf>, BchError> {
         let sysfs_path = sysfs::sysfs_path_from_fd(self.sysfs_fd())
-            .map_err(|_| BchError::from_raw(-libc::EIO))?;
+            .map_err(|_| BchError::from(libc::EIO))?;
 
         let mut devs = Vec::new();
         for d in sysfs::fs_get_devices(&sysfs_path, sysfs::DeviceNameMode::Raw)
-                .map_err(|_| BchError::from_raw(-libc::EIO))? {
+                .map_err(|_| BchError::from(libc::EIO))? {
             if d.online {
                 devs.push(std::path::PathBuf::from(format!("/dev/{}", d.dev)));
             }
         }
 
         if devs.is_empty() {
-            return Err(BchError::from_raw(-libc::ENOENT));
+            return Err(BchError::from(libc::ENOENT));
         }
         Ok(devs)
     }
@@ -225,30 +220,25 @@ impl BcachefsHandle {
     /// Open a mounted filesystem path. The fd becomes the ioctl fd.
     fn open_mounted_path(ioctl_fd: OwnedFd, uuid: [u8; 16]) -> Result<Self, BchError> {
         // Try FS_IOC_GETFSSYSFSPATH to get sysfs path
-        let mut fs_path = FsSysfsPath { len: 0, name: [0; 128] };
-        let ret = unsafe {
-            libc::ioctl(ioctl_fd.as_raw_fd(), FS_IOC_GETFSSYSFSPATH, &mut fs_path)
-        };
-
-        let sysfs_fd = if ret == 0 {
+        let sysfs_fd = if let Ok(fs_path) = unsafe { rustix::ioctl::ioctl(&ioctl_fd, GetFsSysfsPath::new()) } {
             let name_len = fs_path.len as usize;
             let name = std::str::from_utf8(&fs_path.name[..name_len])
-                .map_err(|_| BchError::from_raw(-libc::EINVAL))?;
+                .map_err(|_| BchError::from(libc::EINVAL))?;
             let sysfs = format!("/sys/fs/{}", name);
             rustix::fs::open(
                 sysfs.as_str(),
                 rustix::fs::OFlags::RDONLY,
                 rustix::fs::Mode::empty(),
-            ).map_err(|e| BchError::from_raw(-e.raw_os_error()))?
+            ).map_err(|e| BchError::from(e.raw_os_error()))?
         } else {
             // Fallback: use UUID
-            let uuid_str = format_uuid(&uuid);
+            let uuid_str = Uuid::from_bytes(uuid).to_string();
             let sysfs = format!("{}{}", SYSFS_BASE, uuid_str);
             rustix::fs::open(
                 sysfs.as_str(),
                 rustix::fs::OFlags::RDONLY,
                 rustix::fs::Mode::empty(),
-            ).map_err(|e| BchError::from_raw(-e.raw_os_error()))?
+            ).map_err(|e| BchError::from(e.raw_os_error()))?
         };
 
         Ok(BcachefsHandle {
@@ -291,20 +281,16 @@ impl BcachefsHandle {
         use bcachefs_kernel::c;
 
         let mut opts = c::bch_opts::default();
-        bcachefs_kernel::opt_set!(opts, noexcl, 1);
-        bcachefs_kernel::opt_set!(opts, nochanges, 1);
+        opts.set_noexcl(true);
+        opts.set_nochanges(true);
 
-        let sb = bch_bindgen::sb::io::read_super_opts(path, opts)
-            .map_err(|e| match e.downcast::<BchError>() {
-                Ok(bch_err) => bch_err,
-                Err(_) => BchError::from_raw(-libc::EIO),
-            })?;
+        let sb = bcachefs_kernel::sb::io::read_super(&bcachefs_kernel::path_to_cstr(path), &mut opts, None)?;
 
         let dev_idx = sb.sb().dev_idx as i32;
         let uuid = sb.sb().user_uuid.b;
-        let uuid_str = format_uuid(&uuid);
+        let uuid_str = Uuid::from_bytes(uuid).to_string();
 
-        unsafe { bch_bindgen::sb::io::bch2_free_super(&sb as *const _ as *mut _) };
+        drop(sb);
 
         let mut handle = Self::open_by_name(&uuid_str, Some(uuid))
             .map_err(|e| {
@@ -315,7 +301,7 @@ impl BcachefsHandle {
                         eprintln!("filesystem {} not mounted", uuid_str);
                     }
                 }
-                BchError::from_raw(-e.0)
+                BchError::from(e.0)
             })?;
         handle.dev_idx = dev_idx;
         Ok(handle)
@@ -430,11 +416,11 @@ impl BcachefsHandle {
     }
 
     /// Change device state (rw, ro, evacuating, spare).
-    pub(crate) fn disk_set_state(&self, dev_idx: u32, new_state: u32, flags: u32) -> Result<(), Errno> {
+    pub(crate) fn disk_set_state(&self, dev_idx: u32, new_state: MemberState, flags: u32) -> Result<(), Errno> {
         v2_v1_ioctl!(
             self.ioctl_fd(), BCH_IOCTL_DISK_SET_STATE_v2, BCH_IOCTL_DISK_SET_STATE,
-            bch_ioctl_disk_set_state_v2 { flags: flags | BCH_BY_INDEX, new_state: new_state as u8, dev: dev_idx as u64, ..Default::default() },
-            bch_ioctl_disk_set_state    { flags: flags | BCH_BY_INDEX, new_state: new_state as u8, dev: dev_idx as u64, ..Default::default() }
+            bch_ioctl_disk_set_state_v2 { flags: flags | BCH_BY_INDEX, new_state: new_state.0, dev: dev_idx as u64, ..Default::default() },
+            bch_ioctl_disk_set_state    { flags: flags | BCH_BY_INDEX, new_state: new_state.0, dev: dev_idx as u64, ..Default::default() }
         )
     }
 
@@ -459,27 +445,17 @@ impl BcachefsHandle {
     /// Read the filesystem superblock via BCH_IOCTL_READ_SUPER.
     ///
     /// Returns a heap-allocated buffer containing the raw superblock.
-    /// The kernel may return ERANGE if the buffer is too small, so we
-    /// start with a reasonable size and retry once if needed.
     pub(crate) fn read_super(&self) -> Result<Vec<u8>, Errno> {
-        let mut size: usize = 4096;
-
-        loop {
+        grow_on_erange(4096, 1 << 20, |size| {
             let mut buf = vec![0u8; size];
-
             let arg = bch_ioctl_read_super {
                 size: size as u64,
                 sb:   buf.as_mut_ptr() as u64,
                 ..Default::default()
             };
-
-            match ioctl_w::<BCH_IOCTL_READ_SUPER>(self.ioctl_fd(), &arg) {
-                Ok(_) => return Ok(buf),
-                Err(e) if e.raw_os_error() == Some(libc::ERANGE) && size < 1 << 20 =>
-                    size *= 4,
-                Err(e) => return Err(io_errno(e)),
-            }
-        }
+            ioctl_w::<BCH_IOCTL_READ_SUPER>(self.ioctl_fd(), &arg)?;
+            Ok(buf)
+        }).map_err(io_errno)
     }
 
     /// BCH_IOCTL_QUERY_BTREE_KEYS: fetch one buffer's worth of formatted
@@ -487,26 +463,24 @@ impl BcachefsHandle {
     /// advances `arg.start` past the last key returned; loop until
     /// `arg.done` is set. Returns ERANGE if `arg.buf_size` can't hold even
     /// a single key.
-    pub(crate) fn query_btree_keys(&self, arg: &mut bch_ioctl_query_btree_keys) -> Result<(), Errno> {
-        ioctl_rw::<BCH_IOCTL_QUERY_BTREE_KEYS>(self.ioctl_fd(), arg)
-            .map(|_| ()).map_err(io_errno)
+    pub(crate) fn query_btree_keys(&self, arg: &mut bch_ioctl_query_btree_keys) -> std::io::Result<()> {
+        ioctl_rw::<BCH_IOCTL_QUERY_BTREE_KEYS>(self.ioctl_fd(), arg).map(|_| ())
     }
 
     /// Read the on-disk metadata version from the filesystem superblock.
-    pub(crate) fn sb_version(&self) -> Result<u16, Errno> {
+    pub(crate) fn sb_version(&self) -> Result<MetadataVersion, Errno> {
         let buf = self.read_super()?;
-        if buf.len() < mem::size_of::<bch_sb>() {
+        if buf.len() < mem::size_of::<Head<bch_sb>>() {
             return Err(Errno(libc::EIO));
         }
-        let sb = unsafe { &*(buf.as_ptr() as *const bch_sb) };
-        Ok(sb.version)
+        Ok(read_past::<Head<bch_sb>>(&buf, 0).version.get())
     }
 
     /// Query device usage (v2 with flex array, v1 fallback).
     pub(crate) fn dev_usage(&self, dev_idx: u32) -> Result<DevUsage, Errno> {
-        let nr_data_types = data_type::nr.0 as usize;
+        let nr_data_types = DataType::NR as usize;
 
-        let mut buf = IoctlBuf::<bch_ioctl_dev_usage_v2>::new::<bch_ioctl_dev_usage_bch_ioctl_dev_usage_type>(nr_data_types);
+        let mut buf = IoctlBuf::<Head<bch_ioctl_dev_usage_v2>>::new(nr_data_types);
         let hdr = buf.hdr_mut();
         hdr.dev = dev_idx as u64;
         hdr.flags = BCH_BY_INDEX;
@@ -518,13 +492,12 @@ impl BcachefsHandle {
 
         if ret.is_ok() {
             let hdr = buf.hdr();
-            let nr = (hdr.nr_data_types as usize).min(nr_data_types);
 
             return Ok(DevUsage {
                 state: hdr.state,
                 bucket_size: hdr.bucket_size,
                 nr_buckets: hdr.nr_buckets,
-                data_types: unsafe { hdr.d.as_slice(nr) }.iter()
+                data_types: buf.get().map_err(|_| Errno(libc::EIO))?.d.iter()
                     .map(|d| DevUsageType { buckets: d.buckets, sectors: d.sectors, fragmented: d.fragmented })
                     .collect(),
             });
@@ -567,13 +540,13 @@ pub(crate) struct DevUsage {
 
 impl DevUsage {
     /// Iterate data types with their typed enum key.
-    /// Caps at BCH_DATA_NR to avoid UB if the kernel returns more types than we know.
-    pub fn iter_typed(&self) -> impl Iterator<Item = (data_type, &DevUsageType)> {
-        use super::accounting::data_type_from_u8;
-        let max = data_type::nr.0 as usize;
+    /// Caps at DataType::NR to avoid UB if the kernel returns more types than we know.
+    pub fn iter_typed(&self) -> impl Iterator<Item = (DataType, &DevUsageType)> {
+
+        let max = DataType::NR as usize;
         self.data_types.iter().enumerate()
             .take(max)
-            .map(|(i, dt)| (data_type_from_u8(i as u8), dt))
+            .map(|(i, dt)| (DataType(u32::from(i as u8)), dt))
     }
 
     /// Total capacity in sectors.
@@ -583,9 +556,8 @@ impl DevUsage {
 
     /// Hidden sectors (superblock + journal) — subtracted from capacity for percentage display.
     pub fn hidden_sectors(&self) -> u64 {
-        use super::accounting::data_type_is_hidden;
         self.iter_typed()
-            .filter(|(t, _)| data_type_is_hidden(*t))
+            .filter(|(t, _)| t.is_hidden())
             .map(|(_, dt)| dt.sectors)
             .sum()
     }
@@ -593,16 +565,18 @@ impl DevUsage {
     /// Used sectors (all data types except unstriped).
     pub fn used_sectors(&self) -> u64 {
         self.iter_typed()
-            .filter(|(t, _)| *t != data_type::unstriped)
+            .filter(|(t, _)| *t != DataType::unstriped)
             .map(|(_, dt)| dt.sectors)
             .sum()
     }
 
     /// Used buckets (excludes free/need_gc_gens/need_discard and hidden types).
+    /// Not unstriped either: those are stripe buckets that also hold data
+    /// outside the stripe, counted again - they're already in stripe's.
     pub fn used_buckets(&self) -> u64 {
-        use super::accounting::{data_type_is_empty, data_type_is_hidden};
         self.iter_typed()
-            .filter(|(t, _)| !data_type_is_empty(*t) && !data_type_is_hidden(*t))
+            .filter(|(t, _)| !t.is_empty() && !t.is_hidden() &&
+                             *t != DataType::unstriped)
             .map(|(_, dt)| dt.buckets)
             .sum()
     }
@@ -621,31 +595,6 @@ fn print_errmsg(err_buf: &[u8]) {
             eprintln!("ioctl error: {}", msg.to_string_lossy());
         }
     }
-}
-
-/// Parse a UUID string into 16 bytes.
-fn parse_uuid(s: &str) -> Result<[u8; 16], ()> {
-    let hex: String = s.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
-        return Err(());
-    }
-    let mut uuid = [0u8; 16];
-    for i in 0..16 {
-        uuid[i] = u8::from_str_radix(&hex[i*2..i*2+2], 16).map_err(|_| ())?;
-    }
-    Ok(uuid)
-}
-
-/// Format a UUID as a lowercase hex string with dashes.
-fn format_uuid(uuid: &[u8; 16]) -> String {
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        uuid[0], uuid[1], uuid[2], uuid[3],
-        uuid[4], uuid[5],
-        uuid[6], uuid[7],
-        uuid[8], uuid[9],
-        uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15],
-    )
 }
 
 /// Parse a sysfs bcachefs symlink target like "../../fs/bcachefs/<uuid>/dev-N".

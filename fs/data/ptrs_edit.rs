@@ -1,0 +1,252 @@
+//! Editing a key's entries in place - a PtrsMut key's, whose entries run to
+//! its value's end: dropping an entry, or a pointer and what was only its, and
+//! inserting one into a TransBkey's room. By EntryPos, the walk's positions,
+//! each good until something before it moves.
+
+use super::*;
+use crate::btree::bkey::{BkeyI, BKEY_U64S};
+use crate::btree::iter::{NoRoom, TransBkey};
+use crate::data_structures::dst_room::DstRoom;
+
+/// What a PtrsMut key does, in whichever form it's held: dropping only
+/// shrinks it, so any mutable key can; inserting grows it, so that's
+/// TransBkey's.
+pub trait BkeyVPtrsMut: BkeyVMut<V = PtrsMut> {
+    /// Where an entry inserted last goes: the value's end.
+    fn entries_end(&self) -> EntryPos {
+        EntryPos(self.k().val_u64s())
+    }
+
+    /// Drop the entry at @at, whatever it is, the entries after it moving
+    /// down: bch2_bkey_extent_entry_drop(). Panics if no entry starts at @at,
+    /// or the one that does is where the walk stopped.
+    fn drop_entry(&mut self, fs: &Fs, at: EntryPos) {
+        let len = match self.extent_entries_at(fs).find(|(p, _)| *p == at) {
+            None => panic!("no entry of the key at u64 {} to drop", at.0),
+            Some((_, e @ (ExtentEntry::Invalid { .. } | ExtentEntry::PastEnd { .. }))) =>
+                panic!("dropping the entry at u64 {}, of type {}, that the walk can't step past", at.0, e.ty()),
+            Some((_, e)) => e.bytes().len(),
+        };
+        let start = at.0 * size_of::<u64>();
+        self.val_bytes_mut().copy_within(start + len.., start);
+        self.as_s().k.u64s -= (len / size_of::<u64>()) as u8;
+    }
+
+    /// Drop the pointer at @at and what was only its: the stripe_ptr before
+    /// it, and the crc before it unless a pointer after it, before another
+    /// crc, still has it. bch2_bkey_drop_ptr_noerror(), of a key whose
+    /// pointers can be edited.
+    fn drop_ptr_entries(&mut self, fs: &Fs, at: EntryPos) {
+        assert_eq!(self.extent_entries_at(fs).find(|(p, _)| *p == at).map(|(_, e)| EntryKind::of(e)),
+                   Some(EntryKind::Ptr), "dropping the pointer at u64 {}, where there isn't one", at.0);
+
+        let drop_crc = self.extent_entries_at(fs)
+            .skip_while(|(p, _)| *p <= at)
+            .map(|(_, e)| EntryKind::of(e))
+            .find(|k| matches!(k, EntryKind::Crc | EntryKind::Ptr))
+            != Some(EntryKind::Ptr);
+
+        self.drop_entry(fs, at);
+
+        let mut cur = at;
+        while let Some((p, kind)) = entry_before(&*self, fs, cur) {
+            match kind {
+                EntryKind::Ptr => break,
+                EntryKind::Crc if drop_crc => self.drop_entry(fs, p),
+                EntryKind::Stripe => self.drop_entry(fs, p),
+                _ => {}
+            }
+            cur = p;
+        }
+    }
+
+    /// Drop the stripe_ptr of the first pointer to @dev - the last one
+    /// before it, as C's bch2_bkey_drop_ec() had it.
+    ///
+    /// XXX: C's - the stripe_ptr isn't forgotten at each pointer, so a
+    /// pointer to @dev without its own would drop an earlier pointer's; and
+    /// with none at all, C dereferences NULL, where this panics. Its callers
+    /// pass devices with a stripe; for ec's conversion.
+    fn drop_ec(&mut self, fs: &Fs, dev: u32) {
+        let mut ec = None;
+        let mut found = false;
+        for (p, e) in self.extent_entries_at(fs) {
+            match e {
+                ExtentEntry::stripe_ptr(_) => ec = Some(p),
+                ExtentEntry::ptr(ptr) if u32::from(ptr.dev()) == dev => {
+                    found = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if found {
+            let ec = ec.unwrap_or_else(|| panic!("dropping the stripe_ptr of the pointer to dev {dev}, with none"));
+            self.drop_entry(fs, ec);
+        }
+    }
+}
+
+impl<K: BkeyVMut<V = PtrsMut>> BkeyVPtrsMut for K {}
+
+/// What an entry is, for the editing that drops what belongs to a pointer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EntryKind {
+    Ptr,
+    Crc,
+    Stripe,
+    Other,
+}
+
+impl EntryKind {
+    fn of(e: ExtentEntry<'_>) -> Self {
+        match e {
+            ExtentEntry::ptr(_) => Self::Ptr,
+            ExtentEntry::crc32(_) | ExtentEntry::crc64(_) | ExtentEntry::crc128(_) => Self::Crc,
+            ExtentEntry::stripe_ptr(_) => Self::Stripe,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// @k's last entry before @at, and what kind it is: extent_entry_prev().
+fn entry_before<K: BkeyV<V = PtrsMut>>(k: &K, fs: &Fs, at: EntryPos) -> Option<(EntryPos, EntryKind)> {
+    k.extent_entries_at(fs)
+        .take_while(|(p, _)| *p < at)
+        .last()
+        .map(|(p, e)| (p, EntryKind::of(e)))
+}
+
+impl TransBkey<'_, '_, PtrsMut> {
+    /// Insert @entry - an extent entry, as its u64s - at @at, the entries from
+    /// there moving up: __extent_entry_insert(); at entries_end(), appended.
+    /// NoRoom if the key's buffer can't hold it.
+    pub fn insert_entry(&mut self, at: EntryPos, entry: &[u64]) -> Result<(), NoRoom> {
+        let val_u64s = self.entries_end().0;
+        assert!(at.0 <= val_u64s, "inserting at u64 {} of a value of {val_u64s}", at.0);
+
+        self.set_val_u64s(val_u64s + entry.len())?;
+        let val = &mut self.as_mut_u64s()[BKEY_U64S..][..val_u64s + entry.len()];
+        val.copy_within(at.0..val_u64s, at.0 + entry.len());
+        val[at.0..][..entry.len()].copy_from_slice(entry);
+        Ok(())
+    }
+
+    /// Its extent flags made @flags: its flags entry's, which comes first, or
+    /// one inserted first - NoRoom if the buffer can't hold it. The caller
+    /// requests the extent_flags incompat feature. bch2_bkey_extent_flags_set().
+    pub fn extent_flags_set(&mut self, fs: &Fs, flags: c::ExtentFlags) -> Result<(), NoRoom> {
+        // the field's 57 bits, as C's bitfield assignment truncates to
+        let flags = c::ExtentFlags::from_bits_retain(flags.bits() & ((1 << 57) - 1));
+
+        if let Some(ExtentEntryMut::flags(f)) = self.extent_entries_mut(fs).next() {
+            f.set_flags(flags);
+            return Ok(());
+        }
+
+        let start = EntryPos(PtrsMut::entry_range(self.as_sc()).start / size_of::<u64>());
+        self.insert_entry(start, &[c::bch_extent_flags::new().with_flags(flags).into_bits()])
+    }
+
+    /// @p inserted where its crc applies: its pointer, after its stripe_ptr if
+    /// it has one. With no crc, first - after the extent flags entry if there
+    /// is one, which has to come first; with a crc the key has an entry for,
+    /// just after that entry;
+    /// else after a new one, at the end. Only the last is an append: the
+    /// others go ahead of pointers already there, renumbering them. NoRoom if
+    /// the buffer can't hold it, and the key's as it was.
+    pub fn insert_decoded_ptr(&mut self, fs: &Fs, p: &c::extent_ptr_decoded) -> Result<(), NoRoom> {
+        let mut entries = ArrayVec::<u64, 5>::new();
+
+        let at = if p.crc == crc_none(self.k()) {
+            let start = EntryPos(PtrsMut::entry_range(self.as_sc()).start / size_of::<u64>());
+            match self.extent_entries(fs).next() {
+                Some(e @ ExtentEntry::flags(_)) => EntryPos(start.0 + e.bytes().len() / size_of::<u64>()),
+                _ => start,
+            }
+        } else if let Some(at) = self.extent_entries_at(fs)
+            .find(|&(_, e)| crc_unpack(self.k(), e) == Some(p.crc))
+            .map(|(at, e)| EntryPos(at.0 + e.bytes().len() / size_of::<u64>()))
+        {
+            at
+        } else {
+            entries.extend(crc_entry(&p.crc, c::ExtentEntryType::crc32));
+            self.entries_end()
+        };
+
+        if p.has_ec {
+            entries.push(p.ec.into_bits());
+        }
+        entries.push(p.ptr.into_bits().0);
+        self.insert_entry(at, &entries)
+    }
+
+    /// We're writing another replica for this extent, so while we've got the
+    /// data in memory we'll be computing a new checksum for the currently live
+    /// data.
+    ///
+    /// If there are other replicas we aren't moving, and they are checksummed
+    /// but not compressed, we can modify them to point to only the data that
+    /// is currently live (so that readers won't have to bounce) while we've
+    /// got the checksum we need: those under crc @old, to @new. False if it
+    /// has no entry for @old.
+    pub fn narrow_crc(&mut self, fs: &Fs, old: c::bch_extent_crc_unpacked, new: c::bch_extent_crc_unpacked)
+        -> bool
+    {
+        assert!(!crc_is_compressed(&new) && new.offset == 0 && new.uncompressed_size == new.live_size,
+                "narrowing to a crc that isn't of all its data, uncompressed");
+
+        let k = *self.k();
+        let Some((n, at, old_ty)) = self.extent_entries_at(fs).enumerate()
+            .find(|(_, (_, e))| crc_unpack(&k, *e) == Some(old))
+            .map(|(n, (at, e))| (n, at, e.ty()))
+        else {
+            return false;
+        };
+
+        for e in self.extent_entries_mut(fs).skip(n + 1) {
+            match e {
+                ExtentEntryMut::crc32(_) | ExtentEntryMut::crc64(_) | ExtentEntryMut::crc128(_) => break,
+                ExtentEntryMut::ptr(p) => p.set_offset(p.offset() + u64::from(old.offset)),
+                _ => {}
+            }
+        }
+
+        // Narrowing advances the nonce by the old offset (encrypted extents),
+        // which may no longer fit the old entry's nonce field: replace it with
+        // a larger entry in the same position. The caller leaves room for a
+        // crc128.
+        let entry = crc_entry(&new, c::ExtentEntryType(old_ty));
+        self.drop_entry(fs, at);
+        self.insert_entry(at, &entry).expect("room for a crc128: narrowing's caller makes it");
+        true
+    }
+}
+
+/// @crc appended to @k's entries, as the smallest entry it packs into:
+/// bch2_extent_crc_append(). @k is a key with pointers, its entries running
+/// to its value's end.
+pub(crate) fn extent_crc_append(k: &mut DstRoom<BkeyI>, crc: &c::bch_extent_crc_unpacked) -> Result<(), NoRoom> {
+    let e = crc_entry(crc, c::ExtentEntryType::crc32);
+    let val_u64s = k.k.val_u64s();
+    assert!(val_u64s + e.len() <= c::BKEY_EXTENT_VAL_U64s_MAX as usize,
+            "appending a crc past an extent's largest value");
+    k.append_val(&e)
+}
+
+/// @crc as the smallest crc entry it packs into, of type @min or larger, in
+/// u64s.
+pub(crate) fn crc_entry(crc: &c::bch_extent_crc_unpacked, min: c::ExtentEntryType) -> ArrayVec<u64, 3> {
+    use c::ExtentEntryType as t;
+    let words = |b: &[u8]| b.chunks(8).map(|w| u64::from_ne_bytes(w.try_into().unwrap())).collect();
+
+    if let Some(e) = (min.0 <= t::crc32.0).then(|| c::bch_extent_crc32::pack(crc)).flatten() {
+        [e.into_bits().0].into_iter().collect()
+    } else if let Some(e) = (min.0 <= t::crc64.0).then(|| c::bch_extent_crc64::pack(crc)).flatten() {
+        words(plain_bytes(&e))
+    } else {
+        let e = c::bch_extent_crc128::pack(crc)
+            .unwrap_or_else(|| panic!("a crc no entry holds: csum type {}", crc.csum_type.get()));
+        words(plain_bytes(&e))
+    }
+}

@@ -3,52 +3,75 @@
 // Uses a temporary second device for metadata, writes data sequentially to the
 // primary device, then migrates metadata to the primary and drops the temp device.
 
-use std::ffi::{CString, c_char, c_void};
-use std::fmt::Write;
+use bcachefs_kernel::fs::Dev;
+use std::ffi::CString;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::process;
 
 use anyhow::{anyhow, bail, Result};
-use bch_bindgen::fs::FsExt;
-use bcachefs_kernel::accounting::{compression_type, data_type, DiskAccountingKind};
-use bcachefs_kernel::btree::bkey::bkey_type;
-use bcachefs_kernel::btree_id;
-use bcachefs_kernel::opts::{prt_compression_type, prt_data_type};
-use bcachefs_kernel::btree::iter::{BtreeIter, BtreeTrans, lockrestart_do};
-use bch_bindgen::c;
+use crate::wrappers::fs::FsExt;
+use bcachefs_kernel::accounting;
+use bcachefs_kernel::alloc::{accounting_mem, replicas::replicas_acct};
+use bcachefs_kernel::util::{HumanReadable, ToText};
+use bcachefs_kernel::btree::iter::{BtreeIter, lockrestart_do};
+use bcachefs_kernel::c;
+use bcachefs_kernel::util::vstructs::Head;
 use crate::copy_fs::{CopyFsState, copy_fs};
-use bch_bindgen::data::moving::MovingContext;
-use bcachefs_kernel::fs::{Fs, btree_id_is_alloc, bucket_bytes, bucket_to_sector, dev_to_target,
-                      writepoint_hashed};
-use bcachefs_kernel::opt_set;
+use bcachefs_kernel::data::moving::{MoveStats, MovingCtxt};
+use bcachefs_kernel::alloc::disk_groups::Target;
+use bcachefs_kernel::fs::{Fs, btree_id_is_alloc};
 use bcachefs_kernel::util::printbuf::Printbuf;
-use bcachefs_kernel::sb;
-use bcachefs_kernel::sb::sb_field_type;
+use bcachefs_kernel::sb::SbFieldType;
 use bcachefs_kernel::{POS_MIN, SPOS_MAX, pos};
 use clap::Parser;
 
 use crate::commands::format::{
-    take_opt_value, take_short_value, metadata_version_current, version_parse,
+    take_opt_value, take_short_value, version_parse,
 };
-use crate::commands::format_util::DevOpts;
-use crate::wrappers::bdev;
+use crate::commands::format_util::{kernel_format_version, DevOpts, FormatOpts};
 use crate::commands::opts::{bch_opt_lookup_negated, opts_usage_str, parse_opt_val};
 use crate::key::Passphrase;
 use crate::util::parse_human_size;
-use crate::wrappers::super_io::SUPERBLOCK_SIZE_DEFAULT;
-use crate::wrappers::sysfs;
+use crate::commands::format_util::SUPERBLOCK_SIZE_DEFAULT;
+use bcachefs_kernel::sb::io::SbResize;
+use bcachefs_kernel::format::{Btree, CompressionType, DataType, DataTypes, BkeyType, MetadataVersion, SbFeatures};
 
 const BCH_REPLICAS_MAX: u32 = 4;
 const BTREE_MAX_DEPTH: u32 = 4;
 
-extern "C" {
-    fn strip_fs_alloc(c: *mut c::bch_fs);
-}
-
 // --- Core logic, converted from C ---
 
-/// Recursively count allocated bytes in a directory tree.
+/// Count logical data (non-hole) bytes in a single file - all @size of it if
+/// the holes can't be found.
+fn file_data_bytes(path: &std::path::Path, size: u64) -> u64 {
+    use rustix::fs::{seek, SeekFrom};
+    use rustix::io::Errno;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return size;
+    };
+
+    let mut bytes = 0;
+    let mut pos = 0;
+    while pos < size {
+        let start = match seek(&file, SeekFrom::Data(pos)) {
+            Ok(start) => start,
+            // no data past @pos: the rest is a hole
+            Err(Errno::NXIO) => break,
+            Err(_) => return size,
+        };
+        let end = seek(&file, SeekFrom::Hole(start)).unwrap_or(size).min(size);
+        if end <= start {
+            break;
+        }
+        bytes += end - start;
+        pos = end;
+    }
+
+    bytes
+}
+
+/// Recursively count data bytes in a directory tree.
 fn count_input_size(dir: &std::fs::File) -> u64 {
     use std::os::unix::fs::MetadataExt;
 
@@ -71,7 +94,17 @@ fn count_input_size(dir: &std::fs::File) -> u64 {
             Err(_) => continue,
         };
 
-        bytes += meta.blocks() * 512;
+        // What the file will take in the image: its allocated size here -
+        // for a small file a block, which covers what each file costs in the
+        // image - unless that's less than its logical size: compressed here,
+        // which the image may not be, or sparse. Then the bytes outside holes,
+        // not st_size, which counts the holes too.
+        let allocated = meta.blocks() * 512;
+        bytes += if meta.is_file() && allocated < meta.size() {
+            file_data_bytes(&entry.path(), meta.size()).max(allocated)
+        } else {
+            allocated
+        };
 
         if meta.is_dir() {
             if let Ok(subdir) = std::fs::File::open(entry.path()) {
@@ -86,90 +119,49 @@ fn count_input_size(dir: &std::fs::File) -> u64 {
 /// Set data_allowed on both devices for image update:
 /// dev 0 gets user data only, dev 1 gets journal+btree.
 fn set_data_allowed_for_image_update(fs: &Fs) {
-    let _lock = fs.sb_lock();
+    let mut sb = fs.sb_lock();
 
-    let m0 = unsafe { fs.member_mut(0) };
-    m0.set_member_data_allowed(data_type::user.bit());
-
-    let m1 = unsafe { fs.member_mut(1) };
-    m1.set_member_data_allowed(
-        data_type::journal.bit()
-            | data_type::btree.bit(),
-    );
+    sb.fs_member_mut(0).set_data_allowed(DataTypes::user);
+    sb.fs_member_mut(1).set_data_allowed(DataTypes::journal | DataTypes::btree);
 
     // Not started yet: the start persists this. It needs the in-memory
     // member info updated now, for the allocator.
-    fs.sb_update();
-    drop(_lock);
+    fs.sb_update(&mut sb);
 
     fs.dev_allocator_set_rw(0, true);
     fs.dev_allocator_set_rw(1, true);
-}
-
-/// Arguments passed through void* to the move predicate callback.
-struct MoveBtreeArgs {
-    move_alloc: bool,
-    target: u16,
-}
-
-/// Predicate for btree node moves — decides whether to move each btree node.
-unsafe extern "C" fn move_btree_pred(
-    _trans: *mut c::btree_trans,
-    arg: *mut c_void,
-    btree: c::btree_id,
-    k: c::bkey_s_c,
-    _io_opts: *mut c::bch_inode_opts,
-    data_opts: *mut c::data_update_opts,
-) -> i32 {
-    let args = &*(arg as *const MoveBtreeArgs);
-    let opts = &mut *data_opts;
-
-    opts.target = args.target;
-
-    if (*k.k).type_ != u32::from(bkey_type::btree_ptr_v2) as u8 {
-        return 0;
-    }
-
-    if !args.move_alloc && btree_id_is_alloc(u32::from(btree)) {
-        return 0;
-    }
-
-    opts.write_flags |= c::bch_write_flags::BCH_WRITE_only_specified_devs;
-    1
 }
 
 /// Move btree nodes to a target device. Flushes journal pins first.
 fn move_btree(fs: &Fs, move_alloc: bool, target_dev: u32) -> Result<(), anyhow::Error> {
     fs.journal_flush_all_pins();
 
-    let mut args = MoveBtreeArgs {
-        move_alloc,
-        target: dev_to_target(target_dev),
-    };
-
-    let mut ctxt = MovingContext::new(fs, writepoint_hashed(1), false);
-    let btree_id_nr = u32::from(btree_id::nr);
+    let target = Target::Dev(target_dev).encode();
+    let stats = MoveStats::default();
+    let ctxt = MovingCtxt::new(fs, &stats, c::write_point_specifier::hashed(1), false)
+        .map_err(|_| anyhow!("allocating a moving context"))?;
+    let btree_id_nr = Btree::NR;
 
     for btree in 0..btree_id_nr {
         if !move_alloc && btree_id_is_alloc(btree) {
             continue;
         }
 
-        let btree_id = c::btree_id::from_raw(btree).expect("invalid btree id");
+        let btree_id = Btree::from_raw(btree).expect("invalid btree id");
 
-        for level in 1..BTREE_MAX_DEPTH {
-            unsafe {
-                ctxt.move_data_btree(
-                    POS_MIN,
-                    SPOS_MAX,
-                    Some(move_btree_pred),
-                    &mut args as *mut MoveBtreeArgs as *mut c_void,
-                    btree_id,
-                    level,
-                )
+        ctxt.move_data_btree(btree_id, 1..BTREE_MAX_DEPTH, POS_MIN, SPOS_MAX, "move_btree_pred",
+                             |_, btree, k, _, opts| {
+            opts.target = target;
+
+            if k.k.key_type() != BkeyType::btree_ptr_v2 ||
+               (!move_alloc && btree_id_is_alloc(u32::from(btree))) {
+                return Ok(false);
             }
-            .map_err(|e| anyhow!("moving btree {}: {}", btree_id, e))?;
-        }
+
+            opts.write_flags |= c::WriteFlags::only_specified_devs;
+            Ok(true)
+        })
+        .map_err(|e| anyhow!("moving btree {}: {}", btree_id, e))?;
     }
 
     Ok(())
@@ -177,27 +169,26 @@ fn move_btree(fs: &Fs, move_alloc: bool, target_dev: u32) -> Result<(), anyhow::
 
 /// Look up the last alloc key to find how many buckets are used.
 fn get_nbuckets_used(fs: &Fs) -> Result<u64, anyhow::Error> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
     let mut iter = BtreeIter::new(
         &trans,
-        btree_id::alloc,
+        Btree::alloc,
         pos(0, u64::MAX),
         bcachefs_kernel::btree::iter::BtreeIterFlags::empty(),
     );
 
     // Extract type and offset inside the closure to avoid lifetime escape.
-    let result: Result<(u8, u64), _> = lockrestart_do(&trans, |t| {
-        let (t, k) = t.result_value(iter.peek_prev())?;
-        match k {
-            Some(k) => t.done((k.k.type_, k.k.p.offset)),
-            None => Err(bcachefs_kernel::errcode::BchError::from_raw(libc::ENOENT).into()),
+    let result: Result<(BkeyType, u64), _> = lockrestart_do(&trans, |t| {
+        match iter.peek_prev(t)? {
+            Some(k) => Ok((k.k.key_type(), k.k.p.offset)),
+            None => Err(bcachefs_kernel::errcode::BchError::from(libc::ENOENT)),
         }
     });
 
     let (key_type, offset) = result
         .map_err(|e| anyhow!("error looking up last alloc key: {}", e))?;
 
-    if key_type == u32::from(bkey_type::alloc_v4) as u8 {
+    if key_type == BkeyType::alloc_v4 {
         Ok(offset + 1)
     } else {
         bail!("error looking up last alloc key: no alloc_v4 found")
@@ -206,26 +197,24 @@ fn get_nbuckets_used(fs: &Fs) -> Result<u64, anyhow::Error> {
 
 /// Print sector count formatted as human-readable bytes.
 fn prt_sectors(out: &mut Printbuf, v: u64) {
-    write!(out, "\t").ok();
-    out.human_readable_u64(v << 9);
-    write!(out, "\r\n").ok();
+    write!(out, "\t{}\r\n", HumanReadable(v << 9));
 }
 
 /// Print usage for a specific data type on a device.
 fn print_data_type_usage(
     out: &mut Printbuf,
-    ca: &c::bch_dev,
+    ca: &Dev,
     usage: &c::bch_dev_usage_full,
-    data_type: c::bch_data_type,
+    data_type: DataType,
 ) {
-    let d = &usage.d[data_type.0 as usize];
+    let d = &usage.d[data_type];
     if d.buckets != 0 {
-        prt_data_type(out, data_type);
-        prt_sectors(out, bucket_to_sector(ca, d.buckets));
+        data_type.to_text(out);
+        prt_sectors(out, ca.bucket_to_sector(d.buckets));
     }
     if d.fragmented != 0 {
-        prt_data_type(out, data_type);
-        write!(out, " fragmented").ok();
+        data_type.to_text(out);
+        write!(out, " fragmented");
         prt_sectors(out, d.fragmented);
     }
 }
@@ -235,57 +224,39 @@ fn print_image_usage(fs: &Fs, keep_alloc: bool, nbuckets: u64) {
     let mut buf = Printbuf::new();
     buf.set_human_readable(true);
 
-    let usage = fs.dev_usage_full_read(0);
-    let ca = unsafe { &*fs.dev_raw(0) };
+    let ca = fs.dev_get(0).expect("an image has device 0");
+    let usage = ca.usage_full_read_fast();
 
-    print_data_type_usage(&mut buf, ca, &usage, data_type::sb);
-    print_data_type_usage(&mut buf, ca, &usage, data_type::journal);
-    print_data_type_usage(&mut buf, ca, &usage, data_type::btree);
+    print_data_type_usage(&mut buf, &ca, &usage, DataType::sb);
+    print_data_type_usage(&mut buf, &ca, &usage, DataType::journal);
+    print_data_type_usage(&mut buf, &ca, &usage, DataType::btree);
 
     {
         let mut indented = buf.indent(2);
 
-        let btree_id_nr = u32::from(btree_id::nr);
+        let btree_id_nr = Btree::NR;
         for i in 0..btree_id_nr {
             if btree_id_is_alloc(i) && !keep_alloc {
                 continue;
             }
 
-            let acc_pos = DiskAccountingKind::Btree { id: i }.encode();
-            let v = fs.accounting_mem_read(acc_pos.as_bpos(), 1);
+            let v = accounting::read(fs, accounting::Btree { id: i });
 
-            if v[0] != 0 {
-                unsafe {
-                    c::bch2_btree_id_to_text(
-                        indented.as_raw(),
-                        c::btree_id::from_raw(i).expect("invalid btree id"),
-                    )
-                };
-                prt_sectors(&mut indented, v[0]);
+            if v.sectors != 0 {
+                write!(indented, "{}", Btree::from_raw(i).expect("invalid btree id"));
+                prt_sectors(&mut indented, v.sectors);
             }
         }
     }
 
     // User data via replicas accounting
-    let acc_pos = DiskAccountingKind::Replicas {
-        data_type: data_type::user,
-        nr_devs: 1,
-        nr_required: 1,
-        devs: {
-            let mut d = [0u8; 20];
-            d[0] = 0; // dev 0
-            d
-        },
-    }
-    .encode();
-
-    let v = fs.accounting_mem_read(acc_pos.as_bpos(), 1);
-    write!(&mut buf, "user").ok();
+    let v = accounting_mem::mem_read(fs, &replicas_acct(DataType::user, 1, &[0]));
+    write!(&mut buf, "user");
     prt_sectors(&mut buf, v[0]);
 
-    let user_idx = data_type::user.0 as usize;
+    let user_idx = DataType::user.0 as usize;
     if usage.d[user_idx].fragmented != 0 {
-        write!(&mut buf, "user fragmented").ok();
+        write!(&mut buf, "user fragmented");
         prt_sectors(&mut buf, usage.d[user_idx].fragmented);
     }
 
@@ -293,44 +264,31 @@ fn print_image_usage(fs: &Fs, keep_alloc: bool, nbuckets: u64) {
 
     // Compression stats
     let mut compression_header = false;
-    let comp_nr = u32::from(compression_type::nr);
-    for i in 1..comp_nr {
-        let acc_pos = DiskAccountingKind::Compression {
-            compression_type: c::bch_compression_type(i),
-        }
-        .encode();
+    for t in (1..CompressionType::NR).map(CompressionType) {
+        let v = accounting::read(fs, accounting::Compression { type_: t.into() });
 
-        let v = fs.accounting_mem_read(acc_pos.as_bpos(), 3);
-
-        if v[0] == 0 {
+        if v.nr_extents == 0 {
             continue;
         }
 
         if !compression_header {
-            write!(&mut buf, "compression type\tcompressed\runcompressed\rratio\r\n").ok();
+            write!(&mut buf, "compression type\tcompressed\runcompressed\rratio\r\n");
             buf.indent_add(2);
         }
         compression_header = true;
 
-        let sectors_uncompressed = v[1];
-        let sectors_compressed = v[2];
+        write!(&mut buf, "{}\t{}\r", t, HumanReadable(v.compressed << 9));
 
-        prt_compression_type(&mut buf, c::bch_compression_type(i));
-        write!(&mut buf, "\t").ok();
-
-        buf.human_readable_u64(sectors_compressed << 9);
-        write!(&mut buf, "\r").ok();
-
-        if i == u32::from(compression_type::incompressible) {
+        if t == CompressionType::incompressible {
             buf.newline();
             continue;
         }
 
-        buf.human_readable_u64(sectors_uncompressed << 9);
-        if sectors_uncompressed > 0 {
-            write!(&mut buf, "\r{}%\r\n", sectors_compressed * 100 / sectors_uncompressed).ok();
+        write!(&mut buf, "{}", HumanReadable(v.uncompressed << 9));
+        if let Some(pct) = (v.compressed * 100).checked_div(v.uncompressed) {
+            write!(&mut buf, "\r{pct}%\r\n");
         } else {
-            write!(&mut buf, "\r\n").ok();
+            write!(&mut buf, "\r\n");
         }
     }
 
@@ -339,8 +297,8 @@ fn print_image_usage(fs: &Fs, keep_alloc: bool, nbuckets: u64) {
         buf.indent_sub(2);
     }
 
-    write!(&mut buf, "image size").ok();
-    prt_sectors(&mut buf, bucket_to_sector(ca, nbuckets));
+    write!(&mut buf, "image size");
+    prt_sectors(&mut buf, ca.bucket_to_sector(nbuckets));
 
     buf.tabstop_align();
     print!("{}", buf);
@@ -357,11 +315,9 @@ fn finish_image(fs: &Fs, keep_alloc: bool, verbosity: u32) -> Result<(), anyhow:
 
     // Allow btree data on primary device
     {
-        let _lock = fs.sb_lock();
-        let m = unsafe { fs.member_mut(0) };
-        let allowed = m.member_data_allowed() | data_type::btree.bit();
-        m.set_member_data_allowed(allowed);
-        fs.write_super();
+        let mut sb = fs.sb_lock();
+        sb.fs_member_mut(0).update_data_allowed(|a| a | DataTypes::btree);
+        fs.write_super(&mut sb);
     }
 
     fs.dev_allocator_set_rw(0, true);
@@ -369,7 +325,7 @@ fn finish_image(fs: &Fs, keep_alloc: bool, verbosity: u32) -> Result<(), anyhow:
     move_btree(fs, keep_alloc, 0)
         .map_err(|e| anyhow!("migrating btree from temporary device: {}", e))?;
 
-    fs.read_only();
+    fs.state_lock_write().read_only();
 
     let nbuckets = get_nbuckets_used(fs)?;
 
@@ -378,64 +334,59 @@ fn finish_image(fs: &Fs, keep_alloc: bool, verbosity: u32) -> Result<(), anyhow:
     }
 
     // Truncate image to used size
-    let ca = unsafe { &*fs.dev_raw(0) };
-    let image_size = nbuckets * bucket_bytes(ca);
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*ca.disk_sb.bdev).bd_fd) };
+    let ca = fs.dev_get(0).expect("an image has device 0");
+    let image_size = nbuckets * ca.bucket_bytes();
+    let fd = ca.disk_sb.bdev().fd();
     rustix::fs::ftruncate(fd, image_size)
         .map_err(|e| anyhow!("truncate error: {}", e))?;
 
+    // Drop temp device: the superblock written below is the image's alone
+    fs.dev_detach(1);
+
     // Lock sb and finalize
-    let _lock = fs.sb_lock();
+    let mut sb = fs.sb_lock();
 
     if !keep_alloc {
         if verbosity > 1 {
             println!("Stripping alloc info");
         }
-        unsafe { strip_fs_alloc(fs.raw) };
+        bcachefs_kernel::sb::clean::strip_alloc(&fs, &mut sb);
     }
 
-    // Drop temp device
-    unsafe { (*fs.raw).devs[1] = std::ptr::null_mut() };
-
     // Allow journal on primary device
-    let m = unsafe { fs.member_mut(0) };
-    let allowed = m.member_data_allowed() | data_type::journal.bit();
-    m.set_member_data_allowed(allowed);
+    sb.fs_member_mut(0).update_data_allowed(|a| a | DataTypes::journal);
 
     // Set nbuckets
-    unsafe { fs.member_mut(0) }.nbuckets = nbuckets.to_le();
+    sb.fs_member_mut(0).nbuckets = nbuckets.into();
 
     // Set resize_on_mount for all online members
-    let _ = fs.for_each_online_member(|ca| {
-        let m = unsafe { fs.member_mut(ca.dev_idx as u32) };
-        m.set_member_resize_on_mount(1);
-        std::ops::ControlFlow::Continue(())
-    });
+    for ca in fs.online_members() {
+        sb.fs_member_mut(ca.dev_idx as u32).set_resize_on_mount(true);
+    }
 
     // Set small_image feature
-    let disk_sb = unsafe { fs.disk_sb_mut() };
-    disk_sb.sb_mut().features[0] |= (1u64 << c::bch_sb_feature::BCH_FEATURE_small_image as u64).to_le();
+    sb.sb_mut().features.update(|f| f | SbFeatures::small_image);
 
     // Resize members_v2 to contain only one device
-    let mi: &c::bch_sb_field_members_v2 = disk_sb.field()
-        .expect("members_v2 field missing");
-    let member_bytes = u16::from_le(mi.member_bytes);
-    let u64s = (std::mem::size_of::<c::bch_sb_field_members_v2>() as u32 + member_bytes as u32)
+    let member_bytes = sb.field::<c::bch_sb_field_members_v2>()
+        .expect("members_v2 field missing")
+        .member_bytes.get();
+    let u64s = (std::mem::size_of::<Head<c::bch_sb_field_members_v2>>() as u32 + member_bytes as u32)
         .div_ceil(8) as u32;
-    sb::io::sb_field_resize::<c::bch_sb_field_members_v2>(disk_sb, u64s);
-    disk_sb.sb_mut().nr_devices = 1;
-    disk_sb.sb_mut().set_sb_multi_device(0);
+    fs.sb_resize(&mut sb).field_resize::<c::bch_sb_field_members_v2>(u64s);
+    sb.sb_mut().nr_devices = 1;
+    sb.sb_mut().set_multi_device(false);
 
-    fs.write_super();
+    fs.write_super(&mut sb);
 
     Ok(())
 }
 
 /// Create a new filesystem image from a directory.
 fn image_create_inner(
-    fs_opt_strs: c::bch_opt_strs,
+    fs_opt_strs: &[(c::OptId, String)],
     fs_opts: c::bch_opts,
-    mut format_opts: c::format_opts,
+    mut format_opts: FormatOpts<'_>,
     dev_opts: DevOpts,
     src_path: &str,
     keep_alloc: bool,
@@ -463,15 +414,11 @@ fn image_create_inner(
 
     {
         let dev0_opts = &mut devs[0].opts;
-        opt_set!(dev0_opts, data_allowed, data_type::user.bit() as u8);
+        dev0_opts.set_data_allowed(DataType::user.bit() as u8);
     }
     {
         let meta_opts = &mut meta_dev.opts;
-        opt_set!(
-            meta_opts,
-            data_allowed,
-            (data_type::journal.bit() | data_type::btree.bit()) as u8
-        );
+        meta_opts.set_data_allowed((DataType::journal.bit() | DataType::btree.bit()) as u8);
     }
     devs.push(meta_dev);
 
@@ -480,7 +427,7 @@ fn image_create_inner(
     // journal capacity for finish_image's btree migration.
     let target_size = std::cmp::max(input_bytes * 2, 64 << 20);
     for dev in &mut devs {
-        dev.open(bdev::BLK_OPEN_CREAT, false).map_err(|e| {
+        dev.open(c::BLK_OPEN_CREAT, false).map_err(|e| {
             anyhow!("Error opening {}: {}", dev.path.to_string_lossy(), std::io::Error::from_raw_os_error(e))
         })?;
         if rustix::fs::ftruncate(dev.as_fd(), target_size).is_err() {
@@ -490,24 +437,17 @@ fn image_create_inner(
 
     format_opts.no_sb_at_end = true;
 
-    let sb = crate::commands::format_util::format(fs_opt_strs, fs_opts, format_opts, &mut devs);
-    if sb.is_null() {
-        bail!("format returned null");
-    }
+    let Some(sb) = crate::commands::format_util::format(fs_opt_strs, fs_opts, format_opts, &mut devs) else {
+        bail!("format failed");
+    };
 
     if verbosity > 1 {
         let mut buf = Printbuf::new();
         buf.set_human_readable(true);
-        unsafe {
-            buf.sb_to_text(
-                std::ptr::null_mut(),
-                &*sb,
-                false,
-                sb_field_type::members_v2.bit(),
-            );
-        }
+        bcachefs_kernel::sb::io::sb_to_text(&mut buf, None, sb.sb().as_unvalidated(), false, SbFieldType::members_v2.bit());
         print!("{}", buf);
     }
+    drop(sb);
 
     // Collect paths before dropping devs — Fs::open needs O_EXCL and
     // the format fds are still holding it.
@@ -518,9 +458,9 @@ fn image_create_inner(
     drop(devs);
 
     let mut opts: c::bch_opts = Default::default();
-    opt_set!(opts, copygc_enabled, 0u8);
-    opt_set!(opts, reconcile_enabled, 0u8);
-    opt_set!(opts, nostart, 1u8);
+    opts.set_copygc_enabled(false);
+    opts.set_reconcile_enabled(false);
+    opts.set_nostart(true);
 
     let fs = Fs::open(&device_paths, opts)
         .map_err(|e| anyhow!("error opening {}: {}", device_paths[0].display(), e))?;
@@ -599,9 +539,9 @@ fn image_update_inner(
 
     // Open filesystem
     let mut opts: c::bch_opts = Default::default();
-    opt_set!(opts, copygc_enabled, 0u8);
-    opt_set!(opts, reconcile_enabled, 0u8);
-    opt_set!(opts, nostart, 1u8);
+    opts.set_copygc_enabled(false);
+    opts.set_reconcile_enabled(false);
+    opts.set_nostart(true);
 
     let fs = Fs::open(&[PathBuf::from(dst_image)], opts)
         .map_err(|e| anyhow!("error opening image: {}", e))?;
@@ -613,7 +553,7 @@ fn image_update_inner(
 
     let mut dev_opts = DevOpts::new(CString::new(metadata_path.as_str())?);
 
-    dev_opts.open(bdev::BLK_OPEN_CREAT, false).map_err(|e| {
+    dev_opts.open(c::BLK_OPEN_CREAT, false).map_err(|e| {
         anyhow!("error opening {}: {}", metadata_path, std::io::Error::from_raw_os_error(e))
     })?;
 
@@ -624,7 +564,7 @@ fn image_update_inner(
     let metadata_dev_size = std::cmp::max(
         input_bytes,
         std::cmp::max(
-            fs.opts().btree_node_size as u64 * c::BCH_MIN_NR_NBUCKETS as u64,
+            fs.opts().btree_node_size.get() as u64 * c::BCH_MIN_NR_NBUCKETS as u64,
             64 << 20,
         ),
     );
@@ -633,8 +573,8 @@ fn image_update_inner(
         bail!("ftruncate error: {}", std::io::Error::last_os_error());
     }
 
-    let block_size = fs.opts().block_size as u32;
-    let btree_node_size = fs.opts().btree_node_size;
+    let block_size = fs.opts().block_size.get() as u32;
+    let btree_node_size = fs.opts().btree_node_size.get();
     let ret = crate::commands::format_util::format_for_device_add(
         &mut dev_opts, block_size, btree_node_size,
     );
@@ -643,7 +583,7 @@ fn image_update_inner(
             bcachefs_kernel::errcode::BchError::from_raw(ret).msg());
     }
 
-    fs.dev_add(&metadata_path)
+    FsExt::dev_add(&*fs, &metadata_path)
         .map_err(|e| anyhow!("error adding metadata device: {}", e))?;
 
     set_data_allowed_for_image_update(&fs);
@@ -661,10 +601,11 @@ fn image_update_inner(
         println!("Deleting xattrs");
     }
     fs.btree_delete_range(
-        btree_id::xattrs,
+        Btree::xattrs,
         POS_MIN,
         SPOS_MAX,
         bcachefs_kernel::btree::iter::BtreeIterFlags::ALL_SNAPSHOTS,
+        bcachefs_kernel::btree::iter::UpdateTriggerFlags::empty(),
     )
     .map_err(|e| anyhow!("deleting xattrs: {}", e))?;
 
@@ -707,11 +648,11 @@ fn image_update_inner(
 
 fn image_create_usage() {
     let fs_opts = opts_usage_str(
-        c::opt_flags::OPT_FORMAT as u32 | c::opt_flags::OPT_FS as u32,
-        c::opt_flags::OPT_DEVICE as u32,
+        c::OptFlags::format.bits() | c::OptFlags::fs.bits(),
+        c::OptFlags::device.bits(),
     );
     let dev_opts = opts_usage_str(
-        c::opt_flags::OPT_DEVICE as u32,
+        c::OptFlags::device.bits(),
         0,
     );
 
@@ -749,9 +690,9 @@ Report bugs to <linux-bcachefs@vger.kernel.org>
 }
 
 fn cmd_image_create(argv: Vec<String>) -> Result<()> {
-    let opt_flags = c::opt_flags::OPT_FORMAT as u32
-        | c::opt_flags::OPT_FS as u32
-        | c::opt_flags::OPT_DEVICE as u32;
+    let opt_flags = c::OptFlags::format.bits()
+        | c::OptFlags::fs.bits()
+        | c::OptFlags::device.bits();
 
     let mut source: Option<String> = None;
     let mut keep_alloc = false;
@@ -760,7 +701,7 @@ fn cmd_image_create(argv: Vec<String>) -> Result<()> {
     let mut passphrase_file: Option<String> = None;
     let mut fs_label: Option<String> = None;
     let mut uuid_bytes: Option<[u8; 16]> = None;
-    let mut format_version: Option<u32> = None;
+    let mut format_version: Option<MetadataVersion> = None;
     let mut superblock_size: u32 = SUPERBLOCK_SIZE_DEFAULT;
     let mut verbosity: u32 = 1;
 
@@ -769,7 +710,7 @@ fn cmd_image_create(argv: Vec<String>) -> Result<()> {
     let mut dev_opts: c::bch_opts = Default::default();
 
     let mut fs_opts: c::bch_opts = Default::default();
-    let mut deferred_opts: Vec<(c::bch_opt_id, String)> = Vec::new();
+    let mut deferred_opts: Vec<(c::OptId, String)> = Vec::new();
 
     let mut image_path: Option<String> = None;
 
@@ -794,12 +735,12 @@ fn cmd_image_create(argv: Vec<String>) -> Result<()> {
             let name = raw_name.replace('-', "_");
 
             if let Some((opt_id, opt, negated)) = bch_opt_lookup_negated(&name) {
-                if opt.flags as u32 & opt_flags != 0 {
+                if opt.flags.bits() & opt_flags != 0 {
                     let val_str = if negated {
                         "0".to_string()
                     } else if let Some(v) = inline_val {
                         v.to_string()
-                    } else if opt.type_ != c::opt_type::BCH_OPT_BOOL {
+                    } else if !matches!(opt.ty, bcachefs_kernel::opts::OptType::Bool) {
                         take_opt_value(None, &argv, &mut i, raw_name)?
                     } else {
                         "1".to_string()
@@ -808,10 +749,10 @@ fn cmd_image_create(argv: Vec<String>) -> Result<()> {
                     match parse_opt_val(opt, &val_str)? {
                         None => deferred_opts.push((opt_id, val_str)),
                         Some(v) => {
-                            if opt.flags as u32 & c::opt_flags::OPT_DEVICE as u32 != 0 {
-                                bcachefs_kernel::opts::opt_set_by_id(&mut dev_opts, opt_id, v);
-                            } else if opt.flags as u32 & c::opt_flags::OPT_FS as u32 != 0 {
-                                bcachefs_kernel::opts::opt_set_by_id(&mut fs_opts, opt_id, v);
+                            if opt.flags.bits() & c::OptFlags::device.bits() != 0 {
+                                dev_opts.set(opt_id, v);
+                            } else if opt.flags.bits() & c::OptFlags::fs.bits() != 0 {
+                                fs_opts.set(opt_id, v);
                             }
                         }
                     }
@@ -832,8 +773,8 @@ fn cmd_image_create(argv: Vec<String>) -> Result<()> {
                     if v == 0 || v > BCH_REPLICAS_MAX {
                         bail!("invalid replicas");
                     }
-                    opt_set!(fs_opts, metadata_replicas, v as u8);
-                    opt_set!(fs_opts, data_replicas, v as u8);
+                    fs_opts.set_metadata_replicas(v as u8);
+                    fs_opts.set_data_replicas(v as u8);
                 }
                 "encrypted" => encrypted = true,
                 "passphrase_file" => {
@@ -940,73 +881,39 @@ fn cmd_image_create(argv: Vec<String>) -> Result<()> {
         None
     };
 
-    // Determine format version
-    let _ = process::Command::new("modprobe")
-        .arg("bcachefs")
-        .stdout(process::Stdio::null())
-        .stderr(process::Stdio::null())
-        .status();
+    let kernel_version = kernel_format_version();
+    let version = format_version.unwrap_or(kernel_version);
 
-    let kernel_version = sysfs::bcachefs_kernel_version() as u32;
-    let current_version = metadata_version_current();
-
-    let version = format_version.unwrap_or_else(|| {
-        if kernel_version > 0 {
-            current_version.min(kernel_version)
-        } else {
-            current_version
-        }
-    });
-
-    // Build C format_opts
-    let label_cstr = fs_label.as_ref().map(|l| CString::new(l.as_str())).transpose()?;
     let dev_label_cstr = dev_label.as_ref().map(|l| CString::new(l.as_str())).transpose()?;
     let path_cstr = CString::new(image_path.as_str())?;
 
-    let mut fmt_opts = c::format_opts {
+    let fmt_opts = FormatOpts {
+        label:           fs_label.as_deref(),
+        uuid:            uuid_bytes,
         version,
         superblock_size,
         encrypted,
-        ..Default::default()
+        passphrase:      passphrase.as_ref(),
+        no_sb_at_end:    false,
     };
-    if let Some(ref l) = label_cstr {
-        fmt_opts.label = l.as_ptr() as *mut c_char;
-    }
-    if let Some(bytes) = uuid_bytes {
-        fmt_opts.uuid.b = bytes;
-    }
-    if let Some(ref p) = passphrase {
-        fmt_opts.passphrase = p.get().as_ptr() as *mut c_char;
-    }
-
-    // Build bch_opt_strs for deferred options
-    let mut fs_opt_strs: c::bch_opt_strs = Default::default();
-    for &(id, ref val) in &deferred_opts {
-        let cstr = CString::new(val.as_str())?;
-        fs_opt_strs.set(id, &cstr);
-    }
 
     // Build DevOpts
     let mut d = DevOpts::new(path_cstr);
     d.fs_size = dev_fs_size;
     d.opts = dev_opts;
     if let Some(l) = dev_label_cstr {
-        d.opt_strs.push((c::bch_opt_id::Opt_label, l));
+        d.opt_strs.push((c::OptId::label, l));
     }
 
-    let result = image_create_inner(
-        fs_opt_strs,
+    image_create_inner(
+        &deferred_opts,
         fs_opts,
         fmt_opts,
         d,
         &source,
         keep_alloc,
         verbosity,
-    );
-
-    fs_opt_strs.free();
-
-    result
+    )
 }
 
 /// Update a filesystem image, minimizing changes

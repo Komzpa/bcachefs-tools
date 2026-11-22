@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = [".", "fs", "fs/typeinfo-macros", "bcachefs-shim", "bcachefs-shim-macros", "bch_bindgen", "doc/docgen"]
+members = [".", "fs", "fs/cstruct-macros", "os/linux_user/shim", "os/linux_user/shim/pin-init", "os/linux_user/shim/pin-init/internal", "doc/docgen"]
 default-members = [".", "fs"]
 
 [package]
 name = "bcachefs-tools"
 version = "1.39.7"
 authors = ["Yuxuan Shui <yshuiv7@gmail.com>", "Kayla Firestack <dev@kaylafire.me>", "Kent Overstreet <kent.overstreet@linux.dev>" ]
-edition = "2021"
+edition = "2024"
 rust-version = "1.85.0"
 
 [[bin]]
@@ -32,7 +32,8 @@ uuid = { version = "1.2.2", features = ["v4"] }
 errno = "0.3"
 either = "1.5"
 bcachefs-kernel = { path = "fs" }
-bch_bindgen = { path = "bch_bindgen" }
+linux-keyutils = { version = "0.2", features = ["std"] }
+pin-init = { path = "os/linux_user/shim/pin-init" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 zeroize = { version = "1", features = ["std", "zeroize_derive"] }
@@ -40,7 +41,6 @@ rustix = { version = "1.1.4", features = ["event", "fs", "mount", "param", "pipe
 owo-colors = "4"
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 tiny_http = "0.12.0"
-rustc-demangle = "0.1"
 chrono = { version = "0.4.43", default-features = false, features = ["clock"] }
 fuser = { version = "0.17", optional = true }
 # rustyline 18 requires home 0.5.12, which requires rustc 1.88 (> our 1.85 MSRV)
@@ -67,3 +67,5 @@ platforms = ["*-linux-*"]
 # branch (from v0.17.0); sent upstream - drop this once a release has it.
 [patch.crates-io]
 fuser = { git = "https://github.com/koverstreet/fuser", branch = "destroy-before-reply" }
+# fs/'s, vendored for the kernel build: one copy, chrono's too.
+num-traits = { path = "fs/vendor/num-traits" }

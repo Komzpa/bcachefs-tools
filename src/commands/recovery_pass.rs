@@ -1,13 +1,13 @@
-use std::fmt::Write;
 
 use anyhow::Result;
 use bcachefs_kernel::c;
-use bcachefs_kernel::opt_set;
+use bcachefs_kernel::init::passes;
 use clap::Parser;
 
 use crate::util::read_flag_list;
 
 use bcachefs_kernel::util::printbuf::Printbuf;
+use bcachefs_kernel::sb::io::SbResize;
 
 /// List and manage scheduled recovery passes
 #[derive(Parser, Debug)]
@@ -32,59 +32,51 @@ fn cmd_recovery_pass(cli: RecoveryPassCli) -> Result<()> {
     let mut passes_to_unset: u64 = 0;
 
     for s in &cli.set {
-        passes_to_set |= read_flag_list(s, unsafe { &c::bch2_recovery_passes }, "recovery pass")?;
+        passes_to_set |= read_flag_list(s, bcachefs_kernel::names_by_value!(bcachefs_kernel::init::passes::RecoveryPass), "recovery pass")?;
     }
 
     for s in &cli.unset {
-        passes_to_unset |= read_flag_list(s, unsafe { &c::bch2_recovery_passes }, "recovery pass")?;
+        passes_to_unset |= read_flag_list(s, bcachefs_kernel::names_by_value!(bcachefs_kernel::init::passes::RecoveryPass), "recovery pass")?;
     }
 
-    passes_to_set = unsafe { c::bch2_recovery_passes_to_stable(passes_to_set) };
-    passes_to_unset = unsafe { c::bch2_recovery_passes_to_stable(passes_to_unset) };
+    passes_to_set = passes::passes_to_stable(passes_to_set);
+    passes_to_unset = passes::passes_to_stable(passes_to_unset);
 
     let devs: Vec<std::path::PathBuf> = cli.devices.iter().map(|d| d.as_str().into()).collect();
 
     let mut fs_opts = c::bch_opts::default();
-    opt_set!(fs_opts, nostart, 1);
-    opt_set!(fs_opts, will_not_start, 1);
+    fs_opts.set_nostart(true);
+    fs_opts.set_will_not_start(true);
 
     let fs = crate::device_scan::open_scan(&devs, fs_opts)?;
 
-    unsafe {
-        let _sb_lock = crate::wrappers::sb_lock(fs.raw);
+    let scheduled = {
+        let mut sb = fs.sb_lock();
 
         let ext_u64s = (std::mem::size_of::<c::bch_sb_field_ext>() / std::mem::size_of::<u64>()) as u32;
-        let ext: &mut c::bch_sb_field_ext = bcachefs_kernel::sb::io::sb_field_get_minsize(
-            &mut (*fs.raw).disk_sb,
-            ext_u64s,
-        ).ok_or_else(|| anyhow::anyhow!("Error getting sb_field_ext"))?;
+        let mut disk_sb = fs.sb_resize(&mut sb);
+        let ext = disk_sb.field_get_minsize::<c::bch_sb_field_ext>(ext_u64s)
+            .ok_or_else(|| anyhow::anyhow!("Error getting sb_field_ext"))?;
 
-        let mut scheduled = u64::from_le(ext.recovery_passes_required[0]);
+        let r = &mut ext.recovery_passes_required[0];
+        r.set((r.get() & !passes_to_unset) | passes_to_set);
+        let scheduled = r.get();
 
         if passes_to_set != 0 || passes_to_unset != 0 {
-            ext.recovery_passes_required[0] &= !passes_to_unset.to_le();
-            ext.recovery_passes_required[0] |= passes_to_set.to_le();
-            scheduled = u64::from_le(ext.recovery_passes_required[0]);
-            fs.write_super_ret()
+            fs.write_super_ret(&mut sb)
                 .map_err(|e| anyhow::anyhow!("error writing superblock: {e}"))?;
         }
+        scheduled
+    };
 
-        drop(_sb_lock);
-
-        let mut buf = Printbuf::new();
-        let _ = write!(buf, "Scheduled recovery passes: ");
-
-        if scheduled != 0 {
-            buf.prt_bitflags(
-                c::bch2_recovery_passes.as_ptr(),
-                c::bch2_recovery_passes_from_stable(scheduled),
-            );
-        } else {
-            let _ = write!(buf, "(none)");
-        }
-
-        println!("{}", buf);
+    let mut buf = Printbuf::new();
+    write!(buf, "Scheduled recovery passes: ");
+    if scheduled != 0 {
+        passes::prt_stable(&mut buf, scheduled);
+    } else {
+        write!(buf, "(none)");
     }
+    println!("{}", buf);
 
     Ok(())
 }

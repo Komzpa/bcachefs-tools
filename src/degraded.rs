@@ -1,6 +1,6 @@
 //! Answering degraded=ask.
 //!
-//! bch2_fs_may_start() acts on yes and very and refuses everything else, `ask`
+//! may_start() acts on yes and very and refuses everything else, `ask`
 //! included - correct for a kernel, which has no user to ask. So `ask` is ours
 //! to resolve, and since it is the default, a filesystem that loses a member is
 //! refused outright until something here answers.
@@ -10,11 +10,11 @@
 //! whether the data on the missing devices has another copy, which is a reading
 //! of the replicas table against the devices actually here - the kernel's to
 //! make, at the moment it decides. So we attempt the mount and let
-//! bch2_fs_may_start() classify its own refusal, as
+//! may_start() classify its own refusal, as
 //! insufficient_devices_data_intact or insufficient_devices_data_lost.
 //!
-//! Attempting is cheap: bch2_fs_may_start() is the first thing
-//! __bch2_fs_start() does, before recovery reads and sorts the journal, which
+//! Attempting is cheap: may_start() is the first thing
+//! Fs::start() does, before recovery reads and sorts the journal, which
 //! after an unclean shutdown is where the time goes. This would not be worth
 //! doing if it were the other way round.
 //!
@@ -23,11 +23,11 @@
 //! degraded= value that needs is ours to work out, not theirs.
 
 use std::path::PathBuf;
-use crate::prompt::{fs_name, Choice, Prompt, Question, Watch, NO_ONE_TO_ASK, PROMPT_TIMEOUT};
+use bcachefs_kernel::util::prompt::{fs_name, Choice, Prompt, Question, Reply, Watch, NO_ONE_TO_ASK, PROMPT_TIMEOUT};
 
 use anyhow::Result;
-use bcachefs_kernel::errcode::{self, BchError};
-use bcachefs_kernel::{c, opt_defined, opt_get};
+use bcachefs_kernel::errcode::{BchError, Errcode};
+use bcachefs_kernel::c;
 use c::bch_opts;
 use c::bch_sb_handle;
 use log::{info, warn};
@@ -35,23 +35,23 @@ use uuid::Uuid;
 
 use crate::device_scan;
 
-fn sb_opts(sb: &bch_sb_handle) -> Option<bch_opts> {
+fn sb_opts(sb: &bch_sb_handle) -> bch_opts {
     let mut opts: bch_opts = Default::default();
-
-    (unsafe { c::bch2_opts_from_sb(&mut opts, sb.sb) } == 0).then_some(opts)
+    bcachefs_kernel::opts::opts_from_sb(&mut opts, sb.sb().as_unvalidated());
+    opts
 }
 
 /// What the filesystem says to do about a missing device, unless the caller
 /// said otherwise on the command line.
-fn degraded_action(sbs: &[(PathBuf, bch_sb_handle)], cli_opts: &bch_opts) -> u8 {
-    if opt_defined!(cli_opts, degraded) != 0 {
-        return opt_get!(cli_opts, degraded);
+fn degraded_action(sbs: &[(PathBuf, bch_sb_handle)], cli_opts: &bch_opts) -> c::DegradedAction {
+    if cli_opts.defined(c::OptId::degraded) {
+        return cli_opts.degraded();
     }
 
     sbs.first()
-        .and_then(|(_, sb)| sb_opts(sb))
-        .map(|o| opt_get!(o, degraded))
-        .unwrap_or(c::bch_degraded_actions::BCH_DEGRADED_ask as u8)
+        .map(|(_, sb)| sb_opts(sb))
+        .map(|o| o.degraded_or_default())
+        .unwrap_or(c::DegradedAction::ask)
 }
 
 /// Which refusal we are answering, and so what is at stake.
@@ -69,9 +69,9 @@ enum Situation {
 
 impl Situation {
     fn of(err: &BchError) -> Option<Situation> {
-        if err.matches(errcode::insufficient_devices_data_intact) {
+        if err.matches(Errcode::insufficient_devices_data_intact) {
             Some(Situation::DataIntact)
-        } else if err.matches(errcode::insufficient_devices_data_lost) {
+        } else if err.matches(Errcode::insufficient_devices_data_lost) {
             Some(Situation::DataLost)
         } else {
             None
@@ -88,7 +88,7 @@ impl Situation {
     }
 
     /// What it costs, and the question that follows from it. Neither says which
-    /// devices: the count is in front of this and bch2_fs_may_start() has
+    /// devices: the count is in front of this and may_start() has
     /// already listed them, with everything it knows about each.
     fn line(self) -> (&'static str, &'static str) {
         match self {
@@ -169,18 +169,18 @@ impl Ask {
         let present  = device_scan::present_devices(sbs).len();
 
         if present >= expected
-            || degraded_action(sbs, cli_opts) != c::bch_degraded_actions::BCH_DEGRADED_ask as u8
+            || degraded_action(sbs, cli_opts) != c::DegradedAction::ask
         {
             return None;
         }
 
         Some(Ask {
-            name:     fs_name(first),
+            name:     fs_name(first.sb()),
             uuid:     first.sb().uuid(),
             missing:  expected - present,
             expected,
             opts:     *cli_opts,
-            use_udev: opt_get!(cli_opts, mount_trusts_udev) != 0,
+            use_udev: cli_opts.mount_trusts_udev_or_default(),
         })
     }
 
@@ -196,7 +196,7 @@ impl Ask {
 
     /// Put the question, if @err is one we know how to ask about.
     ///
-    /// The devices themselves are not named here: bch2_fs_may_start() already
+    /// The devices themselves are not named here: may_start() already
     /// printed them, along with everything it knows about each, on its way to
     /// throwing @err.
     pub fn put(&self, err: &BchError) -> Result<Outcome> {
@@ -221,18 +221,20 @@ impl Ask {
 
         let id = self.uuid.hyphenated().to_string();
 
-        let answer = p.put(&Question {
+        let answer = match p.put(&Question {
             prompt:  &q,
             choices: CHOICES,
-            silence: Answer::No,
+            silence: Some(Answer::No),
             alarm:   s == Situation::DataLost,
             uuid:    &id,
             timeout: Some(PROMPT_TIMEOUT),
-        }, watch)?;
-
-        let Some(answer) = answer else {
-            warn!("device turned up while asking; mounting normally");
-            return Ok(Outcome::Rescan);
+        }, watch)? {
+            Reply::Answer(a) => a,
+            Reply::Settled => {
+                warn!("device turned up while asking; mounting normally");
+                return Ok(Outcome::Rescan);
+            }
+            Reply::Unanswered => Answer::No,
         };
 
         if answer == Answer::No {
@@ -266,15 +268,16 @@ pub fn append_opt(fs_opts: Option<String>, opt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcachefs_kernel::util::Printbuf;
 
     fn q(prompt: &str) -> Question<'_, Answer> {
         Question {
             prompt, choices: CHOICES,
-            silence: Answer::No, alarm: false, uuid: "", timeout: None,
+            silence: Some(Answer::No), alarm: false, uuid: "", timeout: None,
         }
     }
 
-    fn parse(reply: &str) -> Answer {
+    fn parse(reply: &str) -> Option<Answer> {
         q("").parse(reply)
     }
 
@@ -295,28 +298,31 @@ mod tests {
     /// Enter will do.
     #[test]
     fn the_summary_names_the_answers_and_marks_the_default() {
-        assert_eq!(q("").brief(), "[y / r=read-only / N]");
+        let (mut brief, mut lines) = (Printbuf::new(), Printbuf::new());
+        q("").brief(&mut brief);
+        q("").lines(&mut lines);
 
-        assert_eq!(q("").lines(), [
+        assert_eq!(brief.as_str(), "[y / r=read-only / N]");
+        assert_eq!(lines.as_str(), [
             "  y  mount",
             "  r  mount read-only: nothing gets written or re-replicated",
             "  n  don't mount",
-        ]);
+        ].join("\n"));
     }
 
     #[test]
     fn answer_parses_the_three_things_there_are_to_say() {
         for s in ["y", "Y", "yes", "Yes", " y \n"] {
-            assert_eq!(parse(s), Answer::Yes, "{s:?}");
+            assert_eq!(parse(s), Some(Answer::Yes), "{s:?}");
         }
         for s in ["r", "R", "ro", "readonly", "ReadOnly"] {
-            assert_eq!(parse(s), Answer::ReadOnly, "{s:?}");
+            assert_eq!(parse(s), Some(Answer::ReadOnly), "{s:?}");
         }
     }
 
-    /// Anything not positively recognised as consent is a refusal - including
-    /// an empty answer, which is what a bare Enter and a timed-out systemd
-    /// prompt both produce.
+    /// An empty answer is a refusal - what a bare Enter and a timed-out systemd
+    /// prompt both produce - and anything not recognised is asked again, never
+    /// taken as consent.
     ///
     /// `f`, `force` and `very` are in there because they used to be answers:
     /// the question no longer asks how hard to try, and a user typing what an
@@ -324,9 +330,11 @@ mod tests {
     /// they would by saying yes.
     #[test]
     fn answer_defaults_to_refusing() {
-        for s in ["", "\n", "n", "N", "no", "q", "yolo", "degraded",
-                  "f", "force", "very"] {
-            assert_eq!(parse(s), Answer::No, "{s:?}");
+        for s in ["", "\n", "n", "N", "no"] {
+            assert_eq!(parse(s), Some(Answer::No), "{s:?}");
+        }
+        for s in ["q", "yolo", "degraded", "f", "force", "very"] {
+            assert_eq!(parse(s), None, "{s:?}");
         }
     }
 
@@ -344,8 +352,8 @@ mod tests {
     /// that, before anything touches a terminal.
     #[test]
     fn only_the_two_refusals_we_know_about_are_ours_to_ask_about() {
-        let lost   = BchError::from_errcode(errcode::insufficient_devices_data_lost);
-        let intact = BchError::from_errcode(errcode::insufficient_devices_data_intact);
+        let lost   = BchError::from(Errcode::insufficient_devices_data_lost);
+        let intact = BchError::from(Errcode::insufficient_devices_data_intact);
 
         assert_eq!(Situation::of(&lost),   Some(Situation::DataLost));
         assert_eq!(Situation::of(&intact), Some(Situation::DataIntact));
@@ -353,18 +361,18 @@ mod tests {
         for e in [
             // The parent, which a kernel that hasn't got the split still
             // throws: we cannot tell which situation it is, so we don't ask.
-            BchError::from_errcode(errcode::insufficient_devices_to_start),
-            BchError::from_errcode(errcode::EINVAL_opt_parse_str_required),
+            BchError::from(Errcode::insufficient_devices_to_start),
+            BchError::from(Errcode::EINVAL_opt_parse_str_required),
             // A flattened errno, which is what the mount(2) fallback gives us:
             // the same EINVAL a typo'd option produces.
-            BchError::from_raw(libc::EINVAL),
+            BchError::from(libc::EINVAL),
             BchError::from_raw(0),
             // A code from a kernel module newer than this binary - the normal
             // state of affairs for a filesystem that ships DKMS-only. The
             // errcode parent-chain walk BUG_ON()s rather than bounds-checking,
             // so what's being asserted here is as much "doesn't abort" as
             // "doesn't match".
-            BchError::from_raw(c::bch_errcode::BCH_ERR_MAX as i32 + 1),
+            BchError::from_raw(c::Errcode::MAX.0 as i32 + 1),
         ] {
             assert_eq!(Situation::of(&e), None, "{e:?}");
         }

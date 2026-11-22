@@ -1,8 +1,5 @@
-use std::ffi::CString;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use crate::c;
-use bcachefs_kernel::util::printbuf::Printbuf;
 
 extern crate tiny_http;
 
@@ -23,19 +20,18 @@ fn http_thread(server: tiny_http::Server) {
     for request in server.incoming_requests() {
         let (_, path) = request.url().split_once('/').unwrap();
 
-        let c_path = CString::new(path).unwrap();
-
         let response = match request.method() {
             tiny_http::Method::Get => {
-                let mut buf = Printbuf::new();
+                let mut body = Vec::new();
+                let ret = match path.strip_prefix("debug").filter(|p| p.is_empty() || p.starts_with('/')) {
+                    Some(debug_path) => bcachefs_kernel::os::debugfs::read_or_html_dirlist(debug_path, &mut body),
+                    None => bcachefs_kernel::os::kobject::read_or_html_dirlist(path, &mut body),
+                }.map_err(|e| e.class());
 
-                let ret = unsafe { c::sysfs_read_or_html_dirlist(c_path.as_ptr(), buf.as_raw()) };
-
-                if ret < 0 {
-                    Response::from_string(format!("Error {}", ret))
-                        .with_status_code(403)
-                } else {
-                    Response::from_string(buf.as_str())
+                match ret {
+                    Ok(())   => Response::from_string(String::from_utf8_lossy(&body).into_owned()),
+                    Err(ret) => Response::from_string(format!("Error {}", ret))
+                        .with_status_code(403),
                 }
             }
 
@@ -57,7 +53,7 @@ fn http_thread(server: tiny_http::Server) {
  */
 fn http_socket_path() -> String {
     let pid = std::process::id();
-    let uid = unsafe { libc::geteuid() };
+    let uid = rustix::process::geteuid().as_raw();
     let parent = if uid == 0 {
         "/run/bcachefs".to_string()
     } else if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -88,9 +84,9 @@ static INIT_LOCK: Mutex<()> = Mutex::new(());
  * Idempotent within a process: only the first call per pid actually
  * starts the server.
  *
- * Called from linux/kobject.c's debugfs_create_file shim, so userspace
- * fses (mount, fsck, format, migrate, ...) all expose their debugfs
- * tree without needing to opt in.
+ * Called as a filesystem's debugfs files are made, through the hook main()
+ * sets (os::debugfs::START_HTTP), so userspace fses (mount, fsck, format,
+ * migrate, ...) all expose their debugfs tree without needing to opt in.
  *
  * Fork handling: process-local Once doesn't work — a child of a process
  * that already started the server would skip startup and have no http
@@ -113,8 +109,7 @@ static INIT_LOCK: Mutex<()> = Mutex::new(());
  * stale file exists rather than overwriting (so we never hijack an
  * in-use path).
  */
-#[no_mangle]
-pub extern "C" fn bch2_start_http_lazy() {
+pub fn start_lazy() {
     let my_pid = std::process::id();
     if STARTED_FOR_PID.load(Ordering::Acquire) == my_pid {
         return;
