@@ -1,13 +1,12 @@
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use bch_bindgen::fs::FsExt;
-use bch_bindgen::c;
-use bch_bindgen::c::bch_degraded_actions;
-use bch_bindgen::c::bch_persistent_counters::BCH_COUNTER_NR;
+use crate::wrappers::fs::FsExt;
+use bcachefs_kernel::c;
+use bcachefs_kernel::c::DegradedAction;
+use bcachefs_kernel::c::PersistentCounter;
 use bcachefs_kernel::fs::Fs;
-use bcachefs_kernel::opt_set;
-use bcachefs_kernel::sb::io::COUNTERS;
+use bcachefs_kernel::sb::counters::COUNTERS;
 use clap::Parser;
 
 fn match_counter(name: &str) -> Result<usize> {
@@ -43,29 +42,26 @@ fn cmd_reset_counters(cli: Cli) -> Result<()> {
 
     // open fs in nostart mode
     let mut fs_opts = c::bch_opts::default();
-    opt_set!(fs_opts, nostart, 1);
-    opt_set!(fs_opts, will_not_start, 1);
-    opt_set!(fs_opts, degraded, bch_degraded_actions::BCH_DEGRADED_very as u8);
+    fs_opts.set_nostart(true);
+    fs_opts.set_will_not_start(true);
+    fs_opts.set_degraded(DegradedAction::very);
 
     let fs = Fs::open(&devs, fs_opts)
         .context("opening filesystem")?;
 
-    unsafe {
-        if to_reset.is_empty() {
-            for i in 0..BCH_COUNTER_NR as usize {
-                c::bch2_counter_reset(fs.raw, i as u32);
-            }
-        } else {
-            for &i in &to_reset {
-                c::bch2_counter_reset(fs.raw, i as u32);
-            }
+    if to_reset.is_empty() {
+        for i in 0..PersistentCounter::NR as usize {
+            fs.counter_reset(i);
         }
-
-        // persist to superblock
-        let _lock = crate::wrappers::sb_lock(fs.raw);
-        fs.write_super_ret()
-            .map_err(|e| anyhow!("error writing superblock: {}", e))?;
+    } else {
+        for &i in &to_reset {
+            fs.counter_reset(i);
+        }
     }
+
+    // persist to superblock
+    fs.write_super_ret(&mut fs.sb_lock())
+        .map_err(|e| anyhow!("error writing superblock: {}", e))?;
 
     Ok(())
 }

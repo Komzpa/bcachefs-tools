@@ -1,0 +1,700 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! An async executor.
+//!
+//! A Task is a future plus a Header, the part the executor needs to run it
+//! without knowing the future's type. A task lives in memory its owner
+//! provides - a field of the object it's the task of, a bio's front pad, or a
+//! box (box.rs) - and the executor never allocates or frees one. Its future is
+//! initialized in place and never moves, so a large future is never built on
+//! the spawner's stack. (An awaited future is the opposite: rustc builds it on
+//! the poller's stack and moves it into the awaiting future, so large state
+//! belongs in the task's own locals, with stack_pin_init!().)
+//!
+//! When the future returns, the executor calls the owner's done function.
+//! That's the executor's last access to the task: the done function is where
+//! the owner learns the task has finished, and may free it. Dropping a task
+//! that started and hasn't finished panics.
+//!
+//! # Where a task runs
+//!
+//! A task is spawned on a workqueue, a RunQueue (queue.rs: run by its owner,
+//! between the owner's own work), or a kthread of its own; a RunQueue or
+//! kthread task always runs there. Or inline: its first poll run by start(),
+//! in the caller's context. Every await says where its task resumes, with
+//! resume_on():
+//! - Queue(q): on workqueue q - or with resume_on_cpu(q, cpu), on q on cpu,
+//!   for the part of a task that wants it there; or with
+//!   resume_on_run_queue(rq), on a worked RunQueue, by its work on its queue.
+//! - Inline: in the completer's context, an endio, where everything up to the
+//!   next await runs. It must not sleep, or take a lock that isn't irqsave -
+//!   C's continue_at(cl, fn, NULL), and as unchecked.
+//! - RUNQ: a RunQueue task's, on its RunQueue - where it always runs.
+//! The target is recorded in the header (@target) while the await is pending.
+//! requeue(at) moves a running task to @at - a queue, or any Resume - an
+//! await of nothing: out of an endio's context, say, before it allocates. On
+//! @at already, it runs on.
+//!
+//! # Running and waiting
+//!
+//! A task is either running, or parked on exactly one Done (completion.rs),
+//! and the header's @waiting says which: that Done's address, or null. Null is
+//! every state in which someone owns the task - running, dispatched, not yet
+//! started, or finished. @waiting is the task's lock: to run a parked task you
+//! change @waiting from its Done to null, and only one party can, so a task is
+//! never polled twice at once.
+//!
+//! An await of a Completion that isn't done names its Done in the poll's
+//! Polled - lent to every poll through Context::ext() - and returns Pending.
+//! An await waits on one thing: two named in one poll is a bug, and panics -
+//! eager!() starts a future without awaiting it. When the poll returns,
+//! run() publishes the Done in @waiting - not before, because only then has
+//! every level of the state machine stored where it resumes. The IO's
+//! completer marks the Done and calls wake(), which takes @waiting from that
+//! Done to null if that's what it holds, and dispatches the task. If the task
+//! isn't parked on that Done - it's running, and will see the Done when it
+//! next looks, or it's parked on another - wake() writes nothing.
+//!
+//! The two sides are the wait_event()/wake_up() protocol: run() stores
+//! @waiting, then checks the Done; the completer stores the Done, then checks
+//! @waiting. Each side's store must be ordered before its load, or both can
+//! miss the other and the wakeup is lost. run()'s store is SeqCst, an xchg on
+//! x86 as smp_store_mb() is; the completer's compare-exchange is a full
+//! barrier by itself. If run() finds the Done completed after publishing, it
+//! races the completer for @waiting with the same compare-exchange.
+//!
+//! Each side reads memory the other may already be finished with. Once
+//! @waiting is published, a completer can take the task, run it to the end
+//! and free it before run() checks the Done; once the Done is marked, the task
+//! can see it, finish and be freed before the completer reads @waiting. So a
+//! task - and so every Done in its memory - is freed only after an RCU grace
+//! period, and both sides make that last access under rcu_read_lock().
+//!
+//! A poll finds its task through Context::ext() (current_task()), not through
+//! a Waker. Nothing wakes a task through a Waker, so the Context's is
+//! Waker::noop().
+//!
+//! A kthread task's thread runs the task whenever @waiting is null - which,
+//! as the task runs nowhere else, means it's been dispatched there - and
+//! sleeps otherwise. The done function runs on that thread, so the thread
+//! exits on its own when the task finishes; the task's drop stops the thread
+//! only if the task never started.
+//!
+//! Also here: completion.rs, the Done and Completion an IO's end is waited on
+//! through; queue.rs, the RunQueue; box.rs, a task in a box with what it's
+//! the task of (TaskBox).
+
+mod r#box;
+pub mod completion;
+mod list;
+mod queue;
+mod select;
+mod waitlist;
+
+pub use completion::{waiter, Armable, Completion, CompletionReturn, Done, DoneWith, DynDone, Return, Unarmed, Waiter};
+pub use list::{TaskList, TASKS};
+pub use queue::RunQueue;
+pub use select::{Select, SelectWait};
+pub use waitlist::{Complete, DynComplete, WaitList, WaitlistCompletion};
+pub use r#box::{exclusive_size, spawn_detached, spawn_static, Exclusive, Join, Shared, TaskBox, TaskSlot};
+
+use crate::c;
+use crate::errcode::BchError;
+use crate::os::kthread::{Kthread, KthreadRef};
+use crate::util::rcu::{self, HasRcuHead, RcuHead, RcuMember, RcuWorkHead};
+use crate::util::sleep::{sleep_until, Sleep};
+use crate::util::Printbuf;
+use crate::prt;
+use crate::os::workqueue::{Queue, RawWork};
+use core::fmt;
+use core::future::Future;
+use core::cell::Cell;
+use core::marker::{PhantomData, PhantomPinned};
+use core::mem::ManuallyDrop;
+use core::pin::Pin;
+use core::ptr::{null_mut, NonNull};
+use core::sync::atomic::{AtomicPtr, Ordering};
+use core::task::{Context, ContextBuilder, Poll, Waker};
+use pin_init::{pin_data, pin_init, pinned_drop, PinInit};
+
+/// Where an await resumes its task: one word, in every await - a queue, or
+/// a value no queue is at.
+#[derive(Clone, Copy)]
+pub struct Resume<'a>(NonNull<Queue>, PhantomData<&'a Queue>);
+
+unsafe impl Send for Resume<'_> {}
+unsafe impl Sync for Resume<'_> {}
+
+/// A Resume, to match on.
+pub enum ResumeAt<'a> {
+    Inline,
+    Queue(&'a Queue),
+    RunQueue,
+}
+
+impl<'a> Resume<'a> {
+    pub const INLINE: Self = Self::at(1);
+    pub const RUNQ: Self = Self::at(2);
+
+    const fn at(v: usize) -> Self {
+        Resume(unsafe { NonNull::new_unchecked(core::ptr::without_provenance_mut(v)) }, PhantomData)
+    }
+
+    pub const fn queue(q: &'a Queue) -> Self {
+        Resume(unsafe { NonNull::new_unchecked(core::ptr::from_ref(q).cast_mut()) }, PhantomData)
+    }
+
+    pub fn get(self) -> ResumeAt<'a> {
+        match self.0.as_ptr().addr() {
+            1 => ResumeAt::Inline,
+            2 => ResumeAt::RunQueue,
+            _ => ResumeAt::Queue(unsafe { self.0.as_ref() }),
+        }
+    }
+}
+
+impl<'a> From<&'a Queue> for Resume<'a> {
+    fn from(q: &'a Queue) -> Self {
+        Resume::queue(q)
+    }
+}
+
+/// What a thread waits on - a Completion, a Gather, a Select - sleeping as
+/// @how says, to its end: a task's is Resumable, awaited.
+pub trait WaitSync {
+    type Output;
+
+    fn wait_sync(self, how: Sleep) -> Self::Output;
+}
+
+pub trait Resumable {
+    type Output;
+
+    fn poll_resume(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+
+    fn resume_on(self, r: Resume<'_>) -> Resumed<'_, Self>
+    where
+        Self: Sized,
+    {
+        Resumed { inner: self, target: r, cpu: None, runq: None, recorded: None, _pin: PhantomPinned }
+    }
+
+    /// resume_on() workqueue @q, on @cpu: queue_work_on().
+    fn resume_on_cpu(self, q: &Queue, cpu: u32) -> Resumed<'_, Self>
+    where
+        Self: Sized,
+    {
+        Resumed { inner: self, target: Resume::queue(q), cpu: Some(cpu), runq: None, recorded: None,
+                  _pin: PhantomPinned }
+    }
+
+    /// Resumed on @rq, a RunQueue::worked() one.
+    fn resume_on_run_queue(self, rq: Pin<&RunQueue>) -> Resumed<'_, Self>
+    where
+        Self: Sized,
+    {
+        Resumed { inner: self, target: Resume::INLINE, cpu: None, runq: Some(rq.get_ref()),
+                  recorded: None, _pin: PhantomPinned }
+    }
+}
+
+impl<F: Future> Resumable for F {
+    type Output = F::Output;
+
+    fn poll_resume(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        Future::poll(self, cx)
+    }
+}
+
+#[must_use = "a future does nothing unless awaited"]
+#[pin_data(PinnedDrop)]
+pub struct Resumed<'r, A> {
+    #[pin]
+    inner:    A,
+    target:   Resume<'r>,
+    cpu:      Option<u32>,
+    /* resume_on_run_queue()'s: dispatched onto it, in place of @target */
+    runq:     Option<&'r RunQueue>,
+    recorded: Option<Recorded>,
+    #[pin]
+    _pin:     PhantomPinned,
+}
+
+#[derive(Clone, Copy)]
+struct Recorded {
+    task: TaskRef,
+    ours: Target,
+    prev: Target,
+}
+
+impl<A: Resumable> Future for Resumed<'_, A> {
+    type Output = A::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<A::Output> {
+        let this = self.project();
+
+        let Some(task) = task_in(cx) else {
+            return this.inner.poll_resume(cx);
+        };
+
+        let header = unsafe { task.0.as_ref() };
+        let ours = match (*this.runq, this.target.get()) {
+            (Some(rq), _) => Target::Run(NonNull::from(rq)),
+            (None, ResumeAt::Inline) => Target::Inline,
+            (None, ResumeAt::Queue(q)) => Target::Queue(NonNull::from(q), *this.cpu),
+            (None, ResumeAt::RunQueue) => {
+                debug_assert!(header.runq.is_some(), "Resume::RUNQ, in a task on no RunQueue");
+                return this.inner.poll_resume(cx);
+            }
+        };
+        match *this.recorded {
+            None => *this.recorded = Some(Recorded { task, ours, prev: header.target.get() }),
+            Some(recorded) => assert!(recorded.task == task, "an await moved from one task to another"),
+        }
+        header.target.set(ours);
+        let result = this.inner.poll_resume(cx);
+        if result.is_ready() {
+            if let Some(recorded) = this.recorded.take() {
+                if header.target.get() == recorded.ours {
+                    header.target.set(recorded.prev);
+                }
+            }
+        }
+        result
+    }
+}
+
+#[pinned_drop]
+impl<A> PinnedDrop for Resumed<'_, A> {
+    fn drop(self: Pin<&mut Self>) {
+        if let Some(recorded) = self.recorded {
+            let target = &unsafe { recorded.task.0.as_ref() }.target;
+            if target.get() == recorded.ours {
+                target.set(recorded.prev);
+            }
+        }
+    }
+}
+
+pub fn requeue<'a>(at: impl Into<Resume<'a>>) -> Resumed<'a, Requeue> {
+    Requeue { done: Done::completed(), parked: false }.resume_on(at.into())
+}
+
+/// requeue(), onto @q on @cpu.
+pub fn requeue_on_cpu(q: &Queue, cpu: u32) -> Resumed<'_, Requeue> {
+    Requeue { done: Done::completed(), parked: false }.resume_on_cpu(q, cpu)
+}
+
+/// Pending once, on a Done that's done: run() moves the task to its target.
+pub struct Requeue {
+    done:   Done,
+    parked: bool,
+}
+
+impl Resumable for Requeue {
+    type Output = ();
+
+    fn poll_resume(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.parked {
+            return Poll::Ready(());
+        }
+        self.parked = true;
+        park_on(cx, &self.done);
+        Poll::Pending
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Inline,
+    /* and the cpu, where the await names one */
+    Queue(NonNull<Queue>, Option<u32>),
+    /* a worked RunQueue */
+    Run(NonNull<RunQueue>),
+}
+
+impl Target {
+    const UNUSED: Target = Target::Inline;
+}
+
+unsafe impl Send for Target {}
+
+#[derive(Clone, Copy)]
+pub enum Spawn<'q, 'n> {
+    /// Its first poll run by start(), in the caller's context.
+    Inline,
+    Queue(&'q Queue),
+    Run(Pin<&'q RunQueue>),
+    Thread(fmt::Arguments<'n>),
+}
+
+#[repr(C)]
+#[pin_data]
+struct Header {
+    #[pin]
+    work:      c::work_struct,
+    waiting:   AtomicPtr<Done>,
+    target:    Cell<Target>,
+    runq:      Option<NonNull<RunQueue>>,
+    thread:    Option<KthreadRef>,
+    started:   Cell<bool>,
+    finished:  Cell<bool>,
+    listed:    Cell<u32>,
+    runq_next: AtomicPtr<Header>,
+    list:      NonNull<TaskList>,
+    vtable:    &'static TaskVtable,
+    _rcu:      RcuMember,
+}
+
+/// What the executor calls on a task without knowing its future's type.
+struct TaskVtable {
+    poll:   unsafe fn(NonNull<Header>, &mut Context<'_>) -> Poll<()>,
+    finish: unsafe fn(NonNull<Header>),
+    name:   fn() -> &'static str,
+}
+
+// The free's head is @work, dead once the task has finished: only dispatch()
+// queues it. What's still reached locklessly after - a late completer's
+// compare-exchange of @waiting, which then fails - must stay outside the head.
+impl HasRcuHead for Header {
+    const HEAD: usize = {
+        assert!(size_of::<RcuWorkHead>() <= size_of::<c::work_struct>());
+        core::mem::offset_of!(Header, work)
+    };
+    const WORK: bool = true;
+}
+
+/// The future, and once it's Ready, what it returned: never both.
+#[repr(C)]
+union Body<F, O> {
+    future: ManuallyDrop<F>,
+    output: ManuallyDrop<O>,
+}
+
+#[repr(C)]
+#[pin_data(PinnedDrop)]
+#[derive(RcuHead)]
+pub struct Task<'q, F: Future> {
+    #[pin]
+    #[rcu_head]
+    header:     Header,
+    #[pin]
+    body:       Body<F, F::Output>,
+    owner_done: unsafe fn(NonNull<Self>, F::Output),
+    _q:         PhantomData<&'q Queue>,
+}
+
+unsafe impl<F: Future + Send> Send for Task<'_, F> where F::Output: Send {}
+unsafe impl<F: Future + Send> Sync for Task<'_, F> where F::Output: Send {}
+
+impl<'q, F: Future + Send> Task<'q, F> {
+    pub fn new<'n>(spawn: Spawn<'q, 'n>, list: &'q TaskList, future: impl PinInit<F> + 'n,
+                   owner_done: unsafe fn(NonNull<Self>, F::Output)) -> impl PinInit<Self, BchError> + 'n
+    where
+        F: 'n,
+        'q: 'n,
+    {
+        let (target, runq) = match spawn {
+            Spawn::Inline => (Target::Inline, None),
+            Spawn::Queue(wq) => (Target::Queue(NonNull::from(wq), None), None),
+            Spawn::Run(rq) => (Target::UNUSED, Some(NonNull::from(rq.get_ref()))),
+            Spawn::Thread(_) => (Target::UNUSED, None),
+        };
+        let body = unsafe {
+            pin_init::pin_init_from_closure(move |slot: *mut Body<F, F::Output>| {
+                crate::util::alloc::init_at(future, (&raw mut (*slot).future).cast::<F>())
+            })
+        };
+        pin_init!(Self {
+            header <- pin_init!(Header {
+                work <- crate::new_work!(crate::os::workqueue::run_raw::<Header>, "bcachefs task"),
+                waiting:   AtomicPtr::new(null_mut()),
+                target:    Cell::new(target),
+                runq,
+                thread:    None,
+                started:   Cell::new(false),
+                finished:  Cell::new(false),
+                listed:    Cell::new(0),
+                runq_next: AtomicPtr::new(null_mut()),
+                list:      NonNull::from(list),
+                vtable:    const {
+                    &TaskVtable { poll: Self::poll, finish: Self::finish, name: core::any::type_name::<F> }
+                },
+                _rcu:      RcuMember::default(),
+            }),
+            body <- body,
+            owner_done,
+            _q:     PhantomData,
+        }? BchError)
+        .pin_chain(move |task| {
+            task.header.listed.set(list.add(task.task()));
+            if let Spawn::Thread(name) = spawn {
+                let task_ref = task.task();
+                let thread_fn = move || unsafe { task_ref.run_thread() };
+                let thread = unsafe { KthreadRef::create(name, thread_fn) }?;
+                *task.project().header.project().thread = Some(thread);
+            }
+            Ok(())
+        })
+    }
+
+    pub fn task(&self) -> TaskRef {
+        TaskRef(NonNull::from(&self.header))
+    }
+
+    unsafe fn poll(header: NonNull<Header>, cx: &mut Context<'_>) -> Poll<()> {
+        let task = header.cast::<Self>().as_ptr();
+        let future = unsafe { (&raw mut (*task).body.future).cast::<F>() };
+        match unsafe { Pin::new_unchecked(&mut *future) }.poll(cx) {
+            Poll::Ready(output) => {
+                unsafe {
+                    core::ptr::drop_in_place(future);
+                    (&raw mut (*task).body.output).write(ManuallyDrop::new(output));
+                }
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    unsafe fn finish(header: NonNull<Header>) {
+        let task = header.cast::<Self>();
+        unsafe {
+            let output = ManuallyDrop::into_inner((&raw const (*task.as_ptr()).body.output).read());
+            ((*task.as_ptr()).owner_done)(task, output)
+        };
+    }
+}
+
+#[pinned_drop]
+impl<F: Future> PinnedDrop for Task<'_, F> {
+    fn drop(self: Pin<&mut Self>) {
+        let task = unsafe { self.get_unchecked_mut() };
+        let started = task.header.started.get();
+        assert!(!started || task.header.finished.get(), "a task freed while it runs");
+        if !started {
+            task.header.unlist();
+            unsafe { ManuallyDrop::drop(&mut task.body.future) };
+        }
+        if let Some(thread) = task.header.thread.take() {
+            if !started {
+                thread.stop();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TaskRef(NonNull<Header>);
+
+unsafe impl Send for TaskRef {}
+unsafe impl Sync for TaskRef {}
+
+impl TaskRef {
+    pub fn to_text(&self, out: &mut Printbuf) {
+        let h = unsafe { self.0.as_ref() };
+        let waiting = h.waiting.load(Ordering::Relaxed);
+
+        prt!(out, "{} ", (h.vtable.name)());
+        if !h.started.get() {
+            prt!(out, "not started\n");
+        } else if h.finished.get() {
+            prt!(out, "finished\n");
+        } else if !waiting.is_null() {
+            prt!(out, "waiting on {waiting:p}\n");
+        } else {
+            prt!(out, "running\n");
+        }
+    }
+
+    /// # Safety
+    /// The task's memory lasts till its done function runs, and what its
+    /// future borrows outlives it.
+    pub unsafe fn start(self) {
+        assert!(!unsafe { self.0.as_ref() }.started.replace(true), "a task started twice");
+        unsafe { self.dispatch() };
+    }
+
+    unsafe fn dispatch(self) {
+        let header = unsafe { self.0.as_ref() };
+        if let Some(thread) = &header.thread {
+            thread.wake();
+            return;
+        }
+        if let Some(runq) = header.runq {
+            unsafe { runq.as_ref().push(self.0) };
+            return;
+        }
+        match header.target.get() {
+            Target::Inline => {
+                unsafe { self.run(Target::Inline) };
+            }
+            Target::Queue(wq, cpu) => {
+                let work = unsafe { &raw mut (*self.0.as_ptr()).work };
+                match cpu {
+                    Some(cpu) => unsafe { wq.as_ref().queue_work_on(cpu, work) },
+                    None      => unsafe { wq.as_ref().queue_work(work) },
+                };
+            }
+            Target::Run(rq) => unsafe { rq.as_ref().push_worked(self.0) },
+        }
+    }
+
+    /// Polls the task, running @running_on, till it parks, finishes, or its
+    /// target moves it.
+    unsafe fn run(self, running_on: Target) -> bool {
+        let header = unsafe { self.0.as_ref() };
+        debug_assert!(header.waiting.load(Ordering::Relaxed).is_null() && !header.finished.get());
+        let never_moves = header.runq.is_some() || header.thread.is_some();
+        let mut polled = Polled { task: self, parks_on: None };
+        let mut cx = ContextBuilder::from_waker(Waker::noop()).ext(&mut polled).build();
+
+        loop {
+            if unsafe { (header.vtable.poll)(self.0, &mut cx) }.is_ready() {
+                let finish = header.vtable.finish;
+                header.unlist();
+                header.finished.set(true);
+                unsafe { finish(self.0) };
+                return true;
+            }
+
+            let parked_on = polled_of(&mut cx).parks_on.take()
+                .expect("a task pending on nothing: nothing will run it again");
+            if !unsafe { parked_on.as_ref() }.done() {
+                let _rcu = rcu::read_lock();
+                header.waiting.store(parked_on.as_ptr(), Ordering::SeqCst);
+                if !unsafe { parked_on.as_ref() }.done_ordered() {
+                    return false;
+                }
+                let took_it_back = header.waiting
+                    .compare_exchange(parked_on.as_ptr(), null_mut(), Ordering::SeqCst, Ordering::Relaxed)
+                    .is_ok();
+                if !took_it_back {
+                    return false;
+                }
+            }
+
+            if !never_moves && header.target.get() != running_on {
+                unsafe { self.dispatch() };
+                return false;
+            }
+        }
+    }
+
+    pub(super) unsafe fn wake(self, done: NonNull<Done>) {
+        let header = unsafe { self.0.as_ref() };
+        let was_parked_on_it = header.waiting
+            .compare_exchange(done.as_ptr(), null_mut(), Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok();
+        if was_parked_on_it {
+            unsafe { self.dispatch() };
+        }
+    }
+
+    unsafe fn run_thread(self) {
+        if Kthread::should_stop() {
+            return;
+        }
+        loop {
+            let header = unsafe { self.0.as_ref() };
+            let Ok(()) = sleep_until(Sleep::IDLE.freezable(),
+                || header.waiting.load(Ordering::Acquire).is_null().then_some(()));
+            let finished = unsafe { self.run(header.target.get()) };
+            if finished {
+                return;
+            }
+        }
+    }
+}
+
+impl RawWork for Header {
+    const WORK: usize = core::mem::offset_of!(Header, work);
+
+    #[inline(always)]
+    unsafe fn run(header: NonNull<Self>) {
+        unsafe { TaskRef(header).run(header.as_ref().target.get()) };
+    }
+}
+
+pub fn current_task() -> impl Future<Output = TaskRef> {
+    core::future::poll_fn(|cx| Poll::Ready(task_in(cx).expect("polled outside a task of ours")))
+}
+
+/// @f, a pinned future, polled once, in this task's poll, and gone on from:
+/// started, and awaited later. What it parks on is forgotten - wake() writes
+/// nothing to a task not parked on that Done, and @f, awaited later, looks at
+/// it again - and the task's target is put back as it was. Where it resumes
+/// is the task's when it's awaited: an await of something already done
+/// doesn't move the task.
+///
+/// ```ignore
+/// let read = pin!(read::read(rbio, inum, flags, ()));
+/// let read = eager!(read);
+/// ...
+/// read.await
+/// ```
+#[macro_export]
+macro_rules! eager {
+    ($f:expr) => {
+        $crate::util::task::eager_start($f).await
+    };
+}
+
+#[doc(hidden)]
+pub fn eager_start<F: Future>(f: Pin<&mut F>) -> impl Future<Output = Eager<'_, F>> {
+    let mut f = Some(f);
+    core::future::poll_fn(move |cx| {
+        let task = task_in(cx).expect("polled outside a task of ours");
+        debug_assert!(polled_of(cx).parks_on.is_none());
+        let target = &unsafe { task.0.as_ref() }.target;
+        let was = target.get();
+
+        let mut f = f.take().expect("eager!(), polled again");
+        let ret = f.as_mut().poll(cx);
+
+        polled_of(cx).parks_on = None;
+        target.set(was);
+        Poll::Ready(match ret {
+            Poll::Ready(out) => Eager::Done(Some(out)),
+            Poll::Pending    => Eager::Started(f),
+        })
+    })
+}
+
+/// A future eager!() started: what it came to, if that first poll finished it.
+pub enum Eager<'f, F: Future> {
+    Done(Option<F::Output>),
+    Started(Pin<&'f mut F>),
+}
+
+// the output is moved out, never pinned
+impl<F: Future> Unpin for Eager<'_, F> {}
+
+impl<F: Future> Future for Eager<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        match self.get_mut() {
+            Eager::Done(out) => Poll::Ready(out.take().expect("an eager future's output, awaited twice")),
+            Eager::Started(f) => f.as_mut().poll(cx),
+        }
+    }
+}
+
+struct Polled {
+    task:     TaskRef,
+    parks_on: Option<NonNull<Done>>,
+}
+
+fn task_in(cx: &mut Context<'_>) -> Option<TaskRef> {
+    cx.ext().downcast_mut::<Polled>().map(|polled| polled.task)
+}
+
+fn polled_of<'a>(cx: &'a mut Context<'_>) -> &'a mut Polled {
+    cx.ext().downcast_mut::<Polled>().expect("polled outside a task of ours")
+}
+
+fn park_on(cx: &mut Context<'_>, done: &Done) {
+    let already = polled_of(cx).parks_on.replace(NonNull::from(done));
+    assert!(already.is_none(), "two awaits pending in one poll: a task waits on one thing at a time");
+}

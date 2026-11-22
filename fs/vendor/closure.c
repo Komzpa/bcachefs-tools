@@ -7,11 +7,10 @@
  */
 
 #include "closure.h"
-#include <linux/debugfs.h>
-#include <linux/export.h>
 #include <linux/rcupdate.h>
-#include <linux/seq_file.h>
+#ifdef __KERNEL__
 #include <linux/sched/debug.h>
+#endif
 
 enum new_closure_state {
 	CLOSURE_normal_put,
@@ -209,11 +208,4 @@ int __sched __bch2_closure_sync_timeout(struct closure *cl, unsigned long timeou
 success:
 	__set_current_state(TASK_RUNNING);
 	return ret;
-}
-
-void bch2_closure_sync_unbounded(struct closure *cl)
-{
-	/* Avoid hung task warnings due to TASK_UNINTERRUPTIBLE */
-	while (closure_sync_timeout(cl, HZ))
-		;
 }

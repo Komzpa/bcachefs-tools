@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! The superblock made ready for a start: its devices' last_mount, the
+//! recovery passes it asks for, and the version upgrade or downgrade the
+//! options and the version say - with the passes each needs run.
+
+use crate::init::passes::RecoveryPass;
+use crate::c;
+use crate::c::FsFlag as Flag;
+use crate::c::VersionUpgradeOpt as Upgrade;
+use crate::format::{Btree, MetadataVersion};
+use crate::fs::{Fs, SbLockGuard};
+use crate::init::passes::{passes_from_stable, passes_to_stable, prt_stable};
+use crate::prt;
+use crate::sb::downgrade::{ext, sb_set_downgrade, sb_set_upgrade};
+use crate::sb::errors::SbErrorId;
+use crate::sb::io::{check_version_downgrade, sb_upgrade};
+use crate::types::Le64;
+use crate::data_structures::bitmap::LeBitmap;
+use crate::os::kernel::ktime_get_real_seconds;
+use crate::util::names;
+use crate::util::rcu::read_lock;
+use crate::util::Printbuf;
+
+/// Older than this, an upgrade isn't optional
+const REQUIRED_UPGRADE_BELOW: MetadataVersion = MetadataVersion::btree_node_accounting;
+
+fn check_version_upgrade(fs: &Fs, sb: &mut SbLockGuard<'_>, out: &mut Printbuf) -> bool {
+    let latest_version = c::MetadataVersion::CURRENT;
+    let latest_compatible = latest_version.min(fs.sb.version.get().latest_compatible());
+    let old_version = fs.sb.version_upgrade_complete.get();
+    let upgrade = Upgrade(fs.opts().version_upgrade.get().into());
+    let incompat = upgrade == Upgrade::incompatible;
+    let mut ret = false;
+
+    let new_version = if old_version < REQUIRED_UPGRADE_BELOW {
+        if incompat || latest_compatible < REQUIRED_UPGRADE_BELOW {
+            latest_version
+        } else {
+            latest_compatible
+        }
+    } else {
+        match upgrade {
+            Upgrade::compatible   => latest_compatible,
+            Upgrade::incompatible => latest_version,
+            Upgrade::none         => old_version.min(latest_version),
+            _                     => old_version,
+        }
+    };
+
+    if new_version > old_version {
+        if old_version < REQUIRED_UPGRADE_BELOW {
+            prt!(out, "Version upgrade required:\n");
+        }
+
+        if old_version != fs.sb.version.get() {
+            prt!(out, "Version upgrade from {} to {} incomplete\n",
+                 fs.sb.version_upgrade_complete.get(), fs.sb.version.get());
+        }
+
+        prt!(out, "Doing {} version upgrade from {old_version} to {new_version}\n",
+             if old_version.major() != new_version.major() { "incompatible" } else { "compatible" });
+
+        let passes = ext(sb).recovery_passes_required[0].get();
+        sb_set_upgrade(sb, old_version, new_version);
+        let passes = ext(sb).recovery_passes_required[0].get() & !passes;
+
+        if passes != 0 {
+            prt!(out, "Upgrade requires recovery passes: ");
+            prt_stable(out, passes);
+            out.newline();
+        }
+
+        ret = true;
+    }
+
+    if new_version > fs.sb.version_incompat_allowed.get() && incompat {
+        prt!(out, "Now allowing incompatible features up to {new_version}, previously allowed up to {}\n",
+             fs.sb.version_incompat_allowed.get());
+
+        ret = true;
+    }
+
+    if ret {
+        sb_upgrade(fs, sb, new_version, incompat);
+    }
+
+    ret
+}
+
+/*
+ * Prepare the superblock for a start: last_mount, required recovery passes,
+ * version upgrade/downgrade, and what those imply. An open that will never
+ * start - offline superblock edits - skips this, so its in-memory superblock
+ * stays what's on disk plus the caller's edit, and writing it persists only
+ * that. See __bch2_write_super().
+ */
+pub fn prep_for_start(fs: &Fs, out: &mut Printbuf) {
+    let pass = |p: RecoveryPass| passes_to_stable(1 << p as u32);
+    let mut sb = fs.sb_lock();
+
+    let now = Le64::new(ktime_get_real_seconds() as u64);
+    {
+        let rcu = read_lock();
+        for ca in fs.online_devs_rcu(&rcu) {
+            sb.fs_member_mut(ca.dev_idx.into()).last_mount = now;
+        }
+    }
+
+    if sb.sb().has_topology_errors() {
+        ext(&mut sb).recovery_passes_required[0] |= pass(RecoveryPass::check_topology);
+    }
+
+    let sb_passes = passes_from_stable(ext(&mut sb).recovery_passes_required[0].get());
+    if sb_passes != 0 {
+        prt!(out, "superblock requires following recovery passes to be run: ");
+        names::prt_set::<RecoveryPass>(out, sb_passes);
+        out.newline();
+    }
+
+    let btrees_lost_data = ext(&mut sb).btrees_lost_data().get();
+    if btrees_lost_data != 0 {
+        prt!(out, "superblock indicates damage to following btrees:  ");
+        names::prt_set::<Btree>(out, btrees_lost_data);
+        out.newline();
+    }
+
+    if fs.flags.get(Flag::may_upgrade_downgrade) {
+        if check_version_downgrade(fs, &mut sb) {
+            prt!(out, "Version downgrade required");
+
+            let passes = ext(&mut sb).recovery_passes_required[0].get();
+            sb_set_downgrade(&mut sb, c::MetadataVersion::CURRENT.minor(), fs.sb.version.get().minor());
+            let passes = ext(&mut sb).recovery_passes_required[0].get() & !passes;
+            if passes != 0 {
+                prt!(out, ", running recovery passes: ");
+                prt_stable(out, passes);
+            }
+            out.newline();
+        }
+
+        check_version_upgrade(fs, &mut sb, out);
+    }
+
+    let required = passes_from_stable(ext(&mut sb).recovery_passes_required[0].get());
+    let recovery_passes = fs.opts().recovery_passes.get() | required;
+    fs.opts_writer(&mut sb).recovery_passes.set(recovery_passes);
+
+    if fs.sb.version_upgrade_complete.get() < MetadataVersion::autofix_errors {
+        sb.sb_mut().set_error_action(c::ErrorAction::fix_safe);
+    }
+
+    let extent_bp_shift_needed = (fs.opts().encoded_extent_max.get() >> 9).ilog2() + 1;
+    if extent_bp_shift_needed > u32::from(fs.sb.extent_bp_shift.get()) {
+        prt!(out, "extent_bp_shift too small: must repair backpointers\n");
+        sb.sb_mut().set_extent_bp_shift(extent_bp_shift_needed as u8);
+
+        let ext = ext(&mut sb);
+        ext.recovery_passes_required[0] |= pass(RecoveryPass::check_extents_to_backpointers);
+        ext.recovery_passes_required[0] |= pass(RecoveryPass::check_backpointers_to_extents);
+        let silent = LeBitmap::from_words_mut(&mut ext.errors_silent);
+        silent.set(SbErrorId::backpointer_to_missing_ptr.0 as usize);
+        silent.set(SbErrorId::ptr_to_missing_backpointer.0 as usize);
+    }
+
+    fs.flags.set(Flag::sb_dirty, true);
+}

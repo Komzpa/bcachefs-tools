@@ -19,7 +19,7 @@
 // - Inode lifetime: there is no VFS inode cache here, so we keep the part of
 //   it that matters - how many references the kernel holds (FUSE's lookup
 //   count: one per entry we hand it, dropped by forget). When that reaches
-//   zero we do what bch2_evict_inode() does: an inode with no links left is
+//   zero we do what the kernel's evict does: an inode with no links left is
 //   deleted. Unlink only queues an inode for deletion; without this nothing
 //   ever deleted it, its space was never freed, and unmount left the
 //   filesystem marked clean with deleted inodes outstanding. FUSE doesn't
@@ -51,7 +51,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::ffi::{CString, OsStr};
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -60,17 +60,21 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bch_bindgen::fs::FsExt;
-use bch_bindgen::c;
-use bch_bindgen::data::io::block_on;
+use crate::wrappers::fs::FsExt;
+use bcachefs_kernel::c;
 use bcachefs_kernel::errcode::BchError;
-use bcachefs_kernel::fs::Fs;
+use bcachefs_kernel::fs::{Fs, OpenFs};
 use bcachefs_kernel::{accounting, btree, dirent, namei, str_hash};
-use bcachefs_kernel::btree::iter::{CommitFlags, CommitOpts};
-use bcachefs_kernel::inode;
-use bcachefs_kernel::opt_set;
+use bcachefs_kernel::btree::bkey::{pos, BkeyV};
+use bcachefs_kernel::btree::iter::{lockrestart_do, BtreeIter, BtreeIterFlags, CommitFlags};
+use bcachefs_kernel::format::Btree;
+use bcachefs_kernel::xattr::{self, XattrType};
+use bcachefs_kernel::{inode, inode_opts};
+use bcachefs_kernel::snapshots::subvolume;
 
-use crate::util::AlignedBuf;
+use bcachefs_kernel::os::kernel::PAGE_SIZE;
+use bcachefs_kernel::util::alloc::{AlignedBox, Flags};
+use bcachefs_kernel::util::bio::io_buf;
 
 /// Guard that calls rcu_unregister_thread on drop (i.e. thread exit).
 struct RcuGuard;
@@ -78,7 +82,7 @@ struct RcuGuard;
 impl Drop for RcuGuard {
     fn drop(&mut self) {
         eprintln!("fuse worker thread exiting, unregistering RCU");
-        unsafe { c::rust_fuse_rcu_unregister() };
+        unsafe { c::linux_thread_exit() };
     }
 }
 
@@ -95,13 +99,21 @@ thread_local! {
 fn ensure_thread_init() {
     THREAD_INITIALIZED.with(|init| {
         if !init.get() {
-            unsafe { c::rust_fuse_ensure_current() };
-            unsafe { c::rust_fuse_rcu_register() };
+            unsafe { c::linux_thread_init() };
             RCU_GUARD.with(|g| g.set(Some(RcuGuard)));
             init.set(true);
             eprintln!("fuse worker thread initialized (current + RCU)");
         }
     });
+}
+
+/// linux_shrinkers_init(), which registers its caller with RCU for the life of
+/// the process - so ensure_thread_init() mustn't register it again. That
+/// thread serves the session when it isn't spawned (an image file:
+/// fuser::mount2()), and destroy() runs on it.
+fn shrinkers_init() {
+    bcachefs_kernel::os::shrinker::linux_shrinkers_init();
+    THREAD_INITIALIZED.with(|init| init.set(true));
 }
 
 use fuser::{
@@ -153,6 +165,32 @@ fn mode_to_filetype(mode: u32) -> FileType {
     }
 }
 
+/// What dirent::readdir() emits to, for a readdir: @reply.
+struct FuseDir<'r> {
+    pos:   u64,
+    reply: &'r mut ReplyDirectory,
+}
+
+impl dirent::DirEmit for FuseDir<'_> {
+    fn pos(&self) -> u64 {
+        self.pos
+    }
+
+    fn set_pos(&mut self, pos: u64) {
+        self.pos = pos;
+    }
+
+    fn emit(&mut self, name: &[u8], pos: u64, ino: u64, d_type: u32) -> bool {
+        // A fuse dirent's offset field is the cookie to resume the listing
+        // *after* that entry; pos is the entry's own dirent offset
+        // (bch2_dir_emit() sets ctx->pos before emitting). If we reject on a
+        // full reply buffer, ctx->pos never advances past this entry and the
+        // next readdir re-reads it.
+        let full = self.reply.add(INodeNo(ino), pos + 1, dtype_to_filetype(d_type), OsStr::from_bytes(name));
+        !full
+    }
+}
+
 fn dtype_to_filetype(dtype: u32) -> FileType {
     match dtype {
         DT_DIR  => FileType::Directory,
@@ -198,31 +236,68 @@ fn signal_parent_err(fd: OwnedFd, byte: u8, reason: &str) {
         .take_while(|&e| e <= CHILD_MSG_MAX)
         .last()
         .unwrap_or(0);
-    buf.extend_from_slice(reason[..end].as_bytes());
+    buf.extend_from_slice(&reason.as_bytes()[..end]);
     let _ = File::from(fd).write_all(&buf);
 }
 
-/// Convert a raw C return value (negative bcachefs error code) to a fuser Errno.
-/// Walks the bcachefs error hierarchy to the root standard errno.
-fn err(ret: i32) -> Errno {
-    let e = BchError::from_raw(if ret < 0 { -ret } else { ret });
-    Errno::from_i32(e.errno())
-}
-
-/// Convert a BchError to a fuser Errno.
-/// Reply to a getxattr or listxattr with what a rust_fuse_xattr_*() shim returned:
-/// a length, or a negative error. An empty @buf means the caller asked only for
-/// the length.
-fn reply_xattr(reply: ReplyXattr, ret: i32, buf: &[u8]) {
-    if ret < 0 {
-        reply.error(bch_err(&BchError::from_raw(-ret)));
-    } else if buf.is_empty() {
-        reply.size(ret as u32);
-    } else {
-        reply.data(&buf[..ret as usize]);
+/// Reply to a getxattr or listxattr: with @size 0, the length alone - else
+/// all of @data, ERANGE if that's past @size.
+fn reply_xattr(reply: ReplyXattr, size: u32, data: Result<Vec<u8>, BchError>) {
+    match data {
+        Err(e) => reply.error(bch_err(&e)),
+        Ok(d) if size == 0 => reply.size(d.len() as u32),
+        Ok(d) if d.len() > size as usize => reply.error(Errno::ERANGE),
+        Ok(d) => reply.data(&d),
     }
 }
 
+/// The xattrs served, by their names' prefixes: user., trusted. and
+/// security. system.posix_acl_* is stored in bcachefs's own ACL format and
+/// bcachefs.* names inode options rather than xattrs - both need conversions
+/// this doesn't do. @name's type, and its name past the prefix.
+fn xattr_type(name: &OsStr) -> Result<(XattrType, &OsStr), Errno> {
+    XattrType::from_name(name.as_bytes())
+        .filter(|(ty, _)| [XattrType::USER, XattrType::TRUSTED, XattrType::SECURITY].contains(ty))
+        .map(|(ty, n)| (ty, OsStr::from_bytes(n)))
+        .ok_or(Errno::EOPNOTSUPP)
+}
+
+/// @inum's xattrs' names, NUL separated, as listxattr(2) has them - those
+/// xattr_type() serves. trusted.* only with @show_trusted: the kernel lists
+/// those only to CAP_SYS_ADMIN, and decides that from the caller, which we
+/// can't see.
+fn xattr_names(fs: &Fs, inum: c::subvol_inum, show_trusted: bool) -> Result<Vec<u8>, BchError> {
+    let trans = bcachefs_kernel::btree_trans!(fs);
+    let mut iter = BtreeIter::new(&trans, Btree::xattrs, pos(inum.inum, 0), BtreeIterFlags::empty());
+    let mut names = Vec::new();
+    subvolume::for_each_in_subvolume_max(&trans, &mut iter, pos(inum.inum, u64::MAX), inum.subvol as u32,
+                                         BtreeIterFlags::empty(), |_, _, k| {
+        let Some(x) = k.arm::<c::Xattr>() else { return Ok(()) };
+        let ty = x.v().ty();
+        if [XattrType::USER, XattrType::SECURITY].contains(&ty) || (ty == XattrType::TRUSTED && show_trusted) {
+            names.extend_from_slice(ty.prefix().expect("a served type's prefix").as_bytes());
+            names.extend_from_slice(x.v().name());
+            names.push(0);
+        }
+        Ok(())
+    })?;
+    Ok(names)
+}
+
+/// Set xattr @name on @inum, or with @value None remove it - and its ctime.
+/// @flags: XATTR_CREATE, XATTR_REPLACE.
+fn xattr_set(fs: &Fs, inum: c::subvol_inum, name: &OsStr, value: Option<&[u8]>, flags: i32)
+    -> Result<(), Errno>
+{
+    let (ty, name) = xattr_type(name)?;
+    let mut inode_u = c::bch_inode_unpacked::default();
+    btree::iter::trans_commit_do(fs, None, CommitFlags::empty(), |t| {
+        xattr::set_trans(t, inum, &mut inode_u, name, value, ty, flags)
+    }).map_err(|e| bch_err(&e))
+}
+
+/// Convert a BchError to a fuser Errno: the standard errno at the root of the
+/// bcachefs error hierarchy.
 fn bch_err(e: &BchError) -> Errno {
     Errno::from_i32(e.errno())
 }
@@ -235,21 +310,20 @@ fn fuse_create_inode(
     fs:    &Fs,
     req:   &Request,
     dir:   c::subvol_inum,
-    name:  &[u8],
+    name:  &OsStr,
     mode:  u16,
     rdev:  u64,
 ) -> Result<c::bch_inode_unpacked, BchError> {
-    let qstr = dirent::qstr(name);
     let mut dir_u: c::bch_inode_unpacked = Default::default();
     let mut inode: c::bch_inode_unpacked = Default::default();
-    let mut subvol: c::bch_subvolume = Default::default();
+    let mut subvol: c::Subvolume = Default::default();
 
     inode::init_early(fs, &mut inode);
 
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new(),
+        CommitFlags::empty(),
         |t| {
             namei::create_trans(
                 t,
@@ -257,11 +331,13 @@ fn fuse_create_inode(
                 &mut dir_u,
                 &mut inode,
                 &mut subvol,
-                &qstr,
+                Some(name),
                 req.uid(),
                 req.gid(),
                 mode,
                 rdev,
+                None,
+                None,
                 c::subvol_inum::default(),
                 0,
             )
@@ -272,15 +348,14 @@ fn fuse_create_inode(
 }
 
 /// Returns the inode as the unlink left it.
-fn fuse_unlink(fs: &Fs, dir: c::subvol_inum, name: &[u8]) -> Result<c::bch_inode_unpacked, BchError> {
-    let qstr = dirent::qstr(name);
+fn fuse_unlink(fs: &Fs, dir: c::subvol_inum, name: &OsStr) -> Result<c::bch_inode_unpacked, BchError> {
     let mut dir_u: c::bch_inode_unpacked = Default::default();
     let mut inode: c::bch_inode_unpacked = Default::default();
 
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
             namei::unlink_trans(
                 t,
@@ -288,7 +363,7 @@ fn fuse_unlink(fs: &Fs, dir: c::subvol_inum, name: &[u8]) -> Result<c::bch_inode
                 &mut dir_u,
                 c::subvol_inum::default(),
                 &mut inode,
-                &qstr,
+                name,
                 false,
             )
         },
@@ -300,32 +375,30 @@ fn fuse_link(
     fs:        &Fs,
     inum:      c::subvol_inum,
     newparent: c::subvol_inum,
-    name:      &[u8],
+    name:      &OsStr,
 ) -> Result<c::bch_inode_unpacked, BchError> {
-    let qstr = dirent::qstr(name);
     let mut dir_u: c::bch_inode_unpacked = Default::default();
     let mut inode: c::bch_inode_unpacked = Default::default();
 
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new(),
-        |t| namei::link_trans(t, newparent, &mut dir_u, inum, &mut inode, &qstr),
+        CommitFlags::empty(),
+        |t| namei::link_trans(t, newparent, &mut dir_u, inum, &mut inode, name),
     )?;
 
     Ok(inode)
 }
 
 /// Whether @name exists in @dir.
-fn dirent_exists(fs: &Fs, dir: c::subvol_inum, name: &[u8]) -> Result<bool, BchError> {
-    let qstr = dirent::qstr(name);
+fn dirent_exists(fs: &Fs, dir: c::subvol_inum, name: &OsStr) -> Result<bool, BchError> {
     let lookup = inode::find_by_inum(fs, dir)
         .and_then(|dir_u| str_hash::hash_info_init(fs, &dir_u))
-        .and_then(|hash_info| dirent::lookup(fs, dir, &hash_info, &qstr));
+        .and_then(|hash_info| dirent::lookup(fs, dir, &hash_info, name));
 
     match lookup {
         Ok(_) => Ok(true),
-        Err(e) if e.matches_errno(libc::ENOENT) => Ok(false),
+        Err(e) if e.matches(libc::ENOENT) => Ok(false),
         Err(e) => Err(e),
     }
 }
@@ -335,13 +408,11 @@ fn dirent_exists(fs: &Fs, dir: c::subvol_inum, name: &[u8]) -> Result<bool, BchE
 fn fuse_rename(
     fs:       &Fs,
     src_dir:  c::subvol_inum,
-    src_name: &[u8],
+    src_name: &OsStr,
     dst_dir:  c::subvol_inum,
-    dst_name: &[u8],
-    mode:     c::bch_rename_mode,
+    dst_name: &OsStr,
+    mode:     c::RenameMode,
 ) -> Result<c::bch_inode_unpacked, BchError> {
-    let src_qstr = dirent::qstr(src_name);
-    let dst_qstr = dirent::qstr(dst_name);
     let mut src_dir_u: c::bch_inode_unpacked = Default::default();
     let mut dst_dir_u: c::bch_inode_unpacked = Default::default();
     let mut src_inode_u: c::bch_inode_unpacked = Default::default();
@@ -352,7 +423,7 @@ fn fuse_rename(
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new(),
+        CommitFlags::empty(),
         |t| {
             namei::rename_trans(
                 t,
@@ -362,8 +433,8 @@ fn fuse_rename(
                 &mut dst_dir_u,
                 &mut src_inode_u,
                 &mut dst_inode_u,
-                &src_qstr,
-                &dst_qstr,
+                src_name,
+                dst_name,
                 mode,
                 &mut src_opt_change,
                 &mut dst_opt_change,
@@ -371,7 +442,10 @@ fn fuse_rename(
         },
     )?;
 
-    namei::rename_opt_changes_finish(fs, &mut src_opt_change, &mut dst_opt_change)?;
+    // What the rename left to do, after its commit
+    let trans = bcachefs_kernel::btree_trans!(fs);
+    src_opt_change.finish(&trans)?;
+    dst_opt_change.finish(&trans)?;
     Ok(dst_inode_u)
 }
 
@@ -394,19 +468,12 @@ fn fuse_setattr(
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
             let now = fs.current_time();
-            let mut iter = btree::iter::BtreeIter::uninit();
-            let mut inode_u: c::bch_inode_unpacked = Default::default();
-
-            let t = inode::peek(
-                t,
-                &mut iter,
-                &mut inode_u,
-                inum,
-                btree::iter::BtreeIterFlags::INTENT,
-            )?;
+            let mut iter = btree::iter::BtreeIter::uninit(t.trans());
+            let mut inode_u =
+                inode::peek(t, &mut iter, inum, btree::iter::BtreeIterFlags::INTENT)?;
 
             if let Some(mode) = mode {
                 inode_u.bi_mode = mode;
@@ -436,9 +503,9 @@ fn fuse_setattr(
             // sends a ctime with the writeback cache, so it's ours to set:
             inode_u.bi_ctime = ctime.unwrap_or(now);
 
-            let t = inode::write(t, &mut iter, &mut inode_u)?;
+            inode::write(t, &mut iter, &mut inode_u)?;
             inode_out = inode_u;
-            Ok(t)
+            Ok(())
         },
     )?;
 
@@ -460,14 +527,13 @@ fn fuse_truncate(fs: &Fs, inum: c::subvol_inum, new_size: u64) -> Result<(), Bch
     let tail = (new_size & (block_size - 1)) as usize;
     if tail != 0 {
         let block_start = new_size - tail as u64;
-        let mut buf = AlignedBuf::new(block_size as usize);
-        block_on(fs.read(inum, block_start, &bi, &mut buf))?;
+        let mut buf = io_buf(block_size as usize, Flags::empty())?;
+        let buf = fs.read(inum, block_start, &bi, &mut buf)?;
 
         if buf[tail..].iter().any(|&b| b != 0) {
             buf[tail..].fill(0);
-            let replicas = std::cmp::max(inode::opts_get_inode(fs, &bi).data_replicas as u32, 1);
-            block_on(fs.write(bi.bi_inum, block_start, inum.subvol as u32,
-                              replicas, &buf, new_size))?;
+            let replicas = std::cmp::max(inode_opts::get_inode(fs, &bi).data_replicas as u32, 1);
+            fs.write(bi.bi_inum, block_start, inum.subvol as u32, replicas, buf, new_size)?;
         }
     }
 
@@ -479,7 +545,7 @@ fn fuse_truncate(fs: &Fs, inum: c::subvol_inum, new_size: u64) -> Result<(), Bch
 /// the journal only as far as the inode's last update; we don't track that,
 /// so we flush all of it: more than the minimum, never less.
 fn fuse_fsync(fs: &Fs) -> Result<(), BchError> {
-    if unsafe { (*fs.raw).opts.journal_flush_disabled } != 0 {
+    if fs.opts().journal_flush_disabled.get() != 0 {
         return Ok(());
     }
     fs.journal_flush()
@@ -497,21 +563,14 @@ fn fuse_touch_atime(fs: &Fs, opts: AtimeOpts, inum: c::subvol_inum, bi: &c::bch_
     let ret = btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
             let now = fs.current_time();
-            let mut iter = btree::iter::BtreeIter::uninit();
-            let mut inode_u: c::bch_inode_unpacked = Default::default();
-
-            let t = inode::peek(
-                t,
-                &mut iter,
-                &mut inode_u,
-                inum,
-                btree::iter::BtreeIterFlags::INTENT,
-            )?;
+            let mut iter = btree::iter::BtreeIter::uninit(t.trans());
+            let mut inode_u =
+                inode::peek(t, &mut iter, inum, btree::iter::BtreeIterFlags::INTENT)?;
             if !opts.needs_update(fs, &inode_u, now) {
-                return Ok(t);
+                return Ok(());
             }
             inode_u.bi_atime = now;
             inode::write(t, &mut iter, &mut inode_u)
@@ -526,19 +585,12 @@ fn fuse_update_inode_after_write(fs: &Fs, inum: c::subvol_inum) -> Result<(), Bc
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
             let now = fs.current_time();
-            let mut iter = btree::iter::BtreeIter::uninit();
-            let mut inode_u: c::bch_inode_unpacked = Default::default();
-
-            let t = inode::peek(
-                t,
-                &mut iter,
-                &mut inode_u,
-                inum,
-                btree::iter::BtreeIterFlags::INTENT,
-            )?;
+            let mut iter = btree::iter::BtreeIter::uninit(t.trans());
+            let mut inode_u =
+                inode::peek(t, &mut iter, inum, btree::iter::BtreeIterFlags::INTENT)?;
             inode_u.bi_mtime = now;
             inode_u.bi_ctime = now;
             inode::write(t, &mut iter, &mut inode_u)
@@ -566,7 +618,7 @@ struct AtimeOpts {
 
 impl AtimeOpts {
     /// relatime unless told otherwise, as for a kernel mount:
-    fn from_ms_flags(flags: libc::c_ulong) -> Self {
+    fn from_ms_flags(flags: core::ffi::c_ulong) -> Self {
         let mode = if flags & (libc::MS_NOATIME | libc::MS_RDONLY) != 0 {
             AtimeMode::Never
         } else if flags & libc::MS_STRICTATIME != 0 {
@@ -769,10 +821,10 @@ macro_rules! resolve {
 }
 
 struct BcachefsFs {
-    /// Shut down (Fs's Drop: bch2_fs_exit()) exactly once on every path:
+    /// Shut down (OpenFs's Drop: bch2_fs_exit()) exactly once on every path:
     /// destroy() takes it, and if the mount fails before fuser hands us to a
     /// FilesystemHolder - whose Drop calls destroy() - it goes down with us.
-    fs: Option<Fs>,
+    fs: Option<OpenFs>,
     /// Write end of a pipe used to signal the parent process that the
     /// FUSE mount is established. Written in init(), None in foreground mode.
     signal_fd: Option<OwnedFd>,
@@ -810,7 +862,7 @@ impl BcachefsFs {
     /// the kernel driver refuses in its VFS ops (bch2_open() and friends),
     /// which our handlers stand in for.
     fn subvol_writable(&self, subvol: u64) -> Result<(), Errno> {
-        self.fs().subvol_is_ro(subvol as u32).map_err(|e| bch_err(&e))
+        subvolume::is_ro(self.fs(), subvol as u32).map_err(|e| bch_err(&e))
     }
 
     /// forget: drop @nlookup references to @node; with the last, evict.
@@ -821,12 +873,12 @@ impl BcachefsFs {
         }
     }
 
-    /// bch2_evict_inode(): nothing references the inode any more, so if it
-    /// has no links left, delete it. A subvolume root with no links is the
+    /// The kernel's evict, InodeInfo::evict(): nothing references the inode
+    /// any more, so if it has no links left, delete it. A subvolume root with no links is the
     /// subvolume deletion path's to delete, not ours.
     fn inode_evict(&self, inum: c::subvol_inum) {
         let fs = self.fs();
-        let bi = match inode::find_by_inum(&fs, inum) {
+        let bi = match inode::find_by_inum(fs, inum) {
             Ok(bi) => bi,
             Err(e) => {
                 eprintln!("bcachefs fuse: evicting inode {}: lookup error {}", inum.inum, e);
@@ -834,11 +886,11 @@ impl BcachefsFs {
             }
         };
 
-        if Fs::inode_nlink_get(&bi) != 0 || inode::is_subvolume_root(&bi) {
+        if bi.nlink() != 0 || bi.is_subvolume_root() {
             return;
         }
 
-        if let Err(e) = inode::rm(&fs, inum) {
+        if let Err(e) = inode::rm(fs, inum) {
             eprintln!("bcachefs fuse: deleting unlinked inode {}: {}", inum.inum, e);
         }
     }
@@ -855,9 +907,7 @@ impl BcachefsFs {
     /// inode deleted and gets ENOENT (NodeMap::open()), as if the unlink had
     /// come before its lookup.
     fn inode_unlinked(&self, inum: c::subvol_inum, bi: &c::bch_inode_unpacked) {
-        if Fs::inode_nlink_get(bi) != 0 ||
-           (bi.bi_mode as u32 & libc::S_IFMT) == S_IFDIR ||
-           inode::is_subvolume_root(bi) {
+        if bi.nlink() != 0 || bi.is_dir() || bi.is_subvolume_root() {
             return;
         }
 
@@ -872,7 +922,7 @@ impl BcachefsFs {
         let ts_m = fs.time_to_timespec(bi.bi_mtime as i64);
         let ts_c = fs.time_to_timespec(bi.bi_ctime as i64);
         let blksize = fs.block_bytes() as u32;
-        let nlink = Fs::inode_nlink_get(bi);
+        let nlink = bi.nlink();
 
         FileAttr {
             ino: INodeNo(bi.bi_inum),
@@ -896,12 +946,14 @@ impl BcachefsFs {
 
 /// Times before 1970 are valid on bcachefs: a timespec's tv_sec is then
 /// negative, with tv_nsec still counting forwards from it.
+// time_t is 32 bits on some targets (i586): the cast isn't a no-op there
+#[allow(clippy::unnecessary_cast)]
 fn ts_to_systime(ts: c::timespec) -> SystemTime {
     let nsec = Duration::from_nanos(ts.tv_nsec as u64);
     if ts.tv_sec >= 0 {
         UNIX_EPOCH + Duration::from_secs(ts.tv_sec as u64) + nsec
     } else {
-        UNIX_EPOCH - Duration::from_secs(ts.tv_sec.unsigned_abs()) + nsec
+        UNIX_EPOCH - Duration::from_secs((ts.tv_sec as i64).unsigned_abs()) + nsec
     }
 }
 
@@ -966,14 +1018,13 @@ impl Filesystem for BcachefsFs {
         eprintln!("fuse_lookup(dir={}, name={:?})", dir.inum, name);
 
         let fs = self.fs();
-        let qstr = dirent::qstr(name_bytes);
         let lookup = match name_bytes {
             // Only sent to resolve a file handle (FUSE_EXPORT_SUPPORT, see
             // init()); there are no dirents for them. The parent is
             // bch2_get_parent()'s: a subvolume root's is in its parent
             // subvolume.
-            b"." => inode::find_by_inum(&fs, dir).map(|bi| (dir, bi)),
-            b".." => inode::find_by_inum(&fs, dir).and_then(|dir_u| {
+            b"." => inode::find_by_inum(fs, dir).map(|bi| (dir, bi)),
+            b".." => inode::find_by_inum(fs, dir).and_then(|dir_u| {
                 let parent = if (dir.subvol, dir.inum) == (BCACHEFS_ROOT_SUBVOL, BCACHEFS_ROOT_INO) {
                     dir
                 } else {
@@ -982,12 +1033,12 @@ impl Filesystem for BcachefsFs {
                         inum:   dir_u.bi_dir,
                     }
                 };
-                inode::find_by_inum(&fs, parent).map(|bi| (parent, bi))
+                inode::find_by_inum(fs, parent).map(|bi| (parent, bi))
             }),
-            _ => inode::find_by_inum(&fs, dir)
-                .and_then(|dir_u| str_hash::hash_info_init(&fs, &dir_u))
-                .and_then(|hash_info| dirent::lookup(&fs, dir, &hash_info, &qstr))
-                .and_then(|inum| inode::find_by_inum(&fs, inum).map(|bi| (inum, bi))),
+            _ => inode::find_by_inum(fs, dir)
+                .and_then(|dir_u| str_hash::hash_info_init(fs, &dir_u))
+                .and_then(|hash_info| dirent::lookup(fs, dir, &hash_info, name))
+                .and_then(|inum| inode::find_by_inum(fs, inum).map(|bi| (inum, bi))),
         };
 
         let (inum, bi) = match lookup {
@@ -995,7 +1046,7 @@ impl Filesystem for BcachefsFs {
             Err(e) => {
                 eprintln!("  lookup -> err {}", e);
                 // Negative dentry caching: return empty entry for ENOENT
-                if e.matches_errno(libc::ENOENT) {
+                if e.matches(libc::ENOENT) {
                     let attr = FileAttr {
                         ino: INodeNo(0),
                         size: 0, blocks: 0,
@@ -1025,7 +1076,7 @@ impl Filesystem for BcachefsFs {
         eprintln!("fuse_getattr(inum={})", inum.inum);
 
         let fs = self.fs();
-        let bi = match inode::find_by_inum(&fs, inum) {
+        let bi = match inode::find_by_inum(fs, inum) {
             Ok(bi) => bi,
             Err(e) => {
                 eprintln!("  getattr -> err {}", e.raw());
@@ -1082,7 +1133,7 @@ impl Filesystem for BcachefsFs {
             // A size change modifies the file: truncate(2) sends only the
             // size, and leaves mtime to us as it does to a kernel filesystem.
             // Asked before truncating, which already changes it.
-            let size_changed = match inode::find_by_inum(&fs, inum) {
+            let size_changed = match inode::find_by_inum(fs, inum) {
                 Ok(bi) => bi.bi_size != size,
                 Err(e) => { reply.error(bch_err(&e)); return; }
             };
@@ -1090,14 +1141,14 @@ impl Filesystem for BcachefsFs {
                 mtime_flag = 2;
             }
 
-            if let Err(e) = fuse_truncate(&fs, inum, size) {
+            if let Err(e) = fuse_truncate(fs, inum, size) {
                 reply.error(bch_err(&e));
                 return;
             }
         }
 
         let bi = match fuse_setattr(
-            &fs,
+            fs,
             inum,
             mode.map(|mode| mode as u16),
             uid,
@@ -1122,21 +1173,24 @@ impl Filesystem for BcachefsFs {
         eprintln!("fuse_readlink(inum={})", inum.inum);
 
         let fs = self.fs();
-        let bi = match inode::find_by_inum(&fs, inum) {
+        let bi = match inode::find_by_inum(fs, inum) {
             Ok(bi) => bi,
             Err(e) => { reply.error(bch_err(&e)); return; }
         };
 
         let size = bi.bi_size as usize;
         let block_size = fs.block_bytes() as usize;
-        let aligned_size = (size + block_size - 1) & !(block_size - 1);
+        let aligned_size = size.next_multiple_of(block_size);
 
-        let mut buf = AlignedBuf::new(aligned_size);
-
-        if let Err(e) = block_on(fs.read(inum, 0, &bi, &mut buf)) {
-            reply.error(bch_err(&e));
+        let Ok(mut buf) = io_buf(aligned_size, Flags::empty()) else {
+            reply.error(Errno::ENOMEM);
             return;
-        }
+        };
+
+        let buf = match fs.read(inum, 0, &bi, &mut buf) {
+            Ok(buf) => buf,
+            Err(e)  => { reply.error(bch_err(&e)); return; }
+        };
 
         let end = buf[..size].iter().position(|&b| b == 0).unwrap_or(size);
         reply.data(&buf[..end]);
@@ -1154,11 +1208,10 @@ impl Filesystem for BcachefsFs {
     ) {
         ensure_thread_init();
         let dir = resolve!(self, parent, reply);
-        let name_bytes = name.as_bytes();
         eprintln!("fuse_mknod(dir={}, name={:?}, mode={:#o})", dir.inum, name, mode);
 
         let fs = self.fs();
-        let new_inode = match fuse_create_inode(&fs, req, dir, name_bytes, mode as u16, rdev as u64) {
+        let new_inode = match fuse_create_inode(fs, req, dir, name, mode as u16, rdev as u64) {
             Ok(inode) => inode,
             Err(e)    => { reply.error(bch_err(&e)); return; }
         };
@@ -1184,11 +1237,10 @@ impl Filesystem for BcachefsFs {
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         ensure_thread_init();
         let dir = resolve!(self, parent, reply);
-        let name_bytes = name.as_bytes();
         eprintln!("fuse_unlink(dir={}, name={:?})", dir.inum, name);
 
         let fs = self.fs();
-        match fuse_unlink(&fs, dir, name_bytes) {
+        match fuse_unlink(fs, dir, name) {
             Ok(bi) => {
                 self.inode_unlinked(c::subvol_inum { subvol: dir.subvol, inum: bi.bi_inum }, &bi);
                 reply.ok()
@@ -1212,13 +1264,12 @@ impl Filesystem for BcachefsFs {
     ) {
         ensure_thread_init();
         let dir = resolve!(self, parent, reply);
-        let name_bytes = name.as_bytes();
         let link_bytes = link.as_os_str().as_bytes();
         eprintln!("fuse_symlink(dir={}, name={:?}, link={:?})", dir.inum, name, link);
 
         // Create the symlink inode
         let fs = self.fs();
-        let new_inode = match fuse_create_inode(&fs, req, dir, name_bytes, (S_IFLNK | 0o777) as u16, 0) {
+        let new_inode = match fuse_create_inode(fs, req, dir, name, (S_IFLNK | 0o777) as u16, 0) {
             Ok(inode) => inode,
             Err(e)    => { reply.error(bch_err(&e)); return; }
         };
@@ -1229,21 +1280,23 @@ impl Filesystem for BcachefsFs {
         // the block size is an extent past the end of the inode, which fsck
         // deletes. readlink stops at i_size.
         let block_size = fs.block_bytes();
-        let padded = (link_bytes.len() as u64).div_ceil(block_size) * block_size;
+        let padded = (link_bytes.len() as u64).next_multiple_of(block_size);
 
-        let mut buf = AlignedBuf::new(padded as usize);
+        let Ok(mut buf) = AlignedBox::<[u8], PAGE_SIZE>::try_new_zeroed_slice_gfp(padded as usize, Flags::empty()) else {
+            reply.error(Errno::ENOMEM);
+            return;
+        };
         buf[..link_bytes.len()].copy_from_slice(link_bytes);
 
         let sym_inum = c::subvol_inum { subvol: dir.subvol, inum: new_inode.bi_inum };
-        if let Err(e) = block_on(fs.write(new_inode.bi_inum, 0, dir.subvol as u32,
-                                          1, &buf, link_bytes.len() as u64)) {
+        if let Err(e) = fs.write(new_inode.bi_inum, 0, dir.subvol as u32, 1, &buf, link_bytes.len() as u64) {
             reply.error(bch_err(&e));
             return;
         }
 
         // Re-read inode to get updated state
         let fs = self.fs();
-        let new_inode = match inode::find_by_inum(&fs, sym_inum) {
+        let new_inode = match inode::find_by_inum(fs, sym_inum) {
             Ok(bi) => bi,
             Err(e) => { reply.error(bch_err(&e)); return; }
         };
@@ -1266,8 +1319,6 @@ impl Filesystem for BcachefsFs {
         ensure_thread_init();
         let src_dir = resolve!(self, parent, reply);
         let dst_dir = resolve!(self, newparent, reply);
-        let src_bytes = name.as_bytes();
-        let dst_bytes = newname.as_bytes();
         eprintln!("fuse_rename(src_dir={}, {:?} -> dst_dir={}, {:?}, flags={})",
                src_dir.inum, name, dst_dir.inum, newname, flags);
 
@@ -1289,7 +1340,7 @@ impl Filesystem for BcachefsFs {
         // name with it inserts a second dirent of that name. The kernel holds
         // both directories locked for the whole request, so the target can't
         // appear or vanish between this lookup and the rename.
-        let dst_exists = match dirent_exists(&fs, dst_dir, dst_bytes) {
+        let dst_exists = match dirent_exists(fs, dst_dir, newname) {
             Ok(v)  => v,
             Err(e) => { reply.error(bch_err(&e)); return; }
         };
@@ -1299,20 +1350,20 @@ impl Filesystem for BcachefsFs {
                 reply.error(Errno::ENOENT);
                 return;
             }
-            c::bch_rename_mode::BCH_RENAME_EXCHANGE
+            c::RenameMode::BCH_RENAME_EXCHANGE
         } else if dst_exists {
             if flags.contains(RenameFlags::RENAME_NOREPLACE) {
                 reply.error(Errno::EEXIST);
                 return;
             }
-            c::bch_rename_mode::BCH_RENAME_OVERWRITE
+            c::RenameMode::BCH_RENAME_OVERWRITE
         } else {
-            c::bch_rename_mode::BCH_RENAME
+            c::RenameMode::BCH_RENAME
         };
 
-        match fuse_rename(&fs, src_dir, src_bytes, dst_dir, dst_bytes, mode) {
+        match fuse_rename(fs, src_dir, name, dst_dir, newname, mode) {
             Ok(dst_bi) => {
-                if mode == c::bch_rename_mode::BCH_RENAME_OVERWRITE {
+                if mode == c::RenameMode::BCH_RENAME_OVERWRITE {
                     self.inode_unlinked(c::subvol_inum { subvol: dst_dir.subvol, inum: dst_bi.bi_inum },
                                         &dst_bi);
                 }
@@ -1333,7 +1384,6 @@ impl Filesystem for BcachefsFs {
         ensure_thread_init();
         let src_inum = resolve!(self, ino, reply);
         let parent = resolve!(self, newparent, reply);
-        let name_bytes = newname.as_bytes();
         eprintln!("fuse_link(ino={}, newparent={}, name={:?})",
                src_inum.inum, parent.inum, newname);
 
@@ -1344,7 +1394,7 @@ impl Filesystem for BcachefsFs {
         }
 
         let fs = self.fs();
-        let inode_u = match fuse_link(&fs, src_inum, parent, name_bytes) {
+        let inode_u = match fuse_link(fs, src_inum, parent, newname) {
             Ok(inode) => inode,
             Err(e)    => { reply.error(bch_err(&e)); return; }
         };
@@ -1391,7 +1441,7 @@ impl Filesystem for BcachefsFs {
         // The last open of an inode with no links left: it goes now
         let last = self.nodes.lock().unwrap().release(ino.0);
         if let Some(inum) = last {
-            if let Ok(bi) = inode::find_by_inum(&self.fs(), inum) {
+            if let Ok(bi) = inode::find_by_inum(self.fs(), inum) {
                 self.inode_unlinked(inum, &bi);
             }
         }
@@ -1415,13 +1465,13 @@ impl Filesystem for BcachefsFs {
         eprintln!("fuse_read(ino={}, offset={}, size={})", inum.inum, offset, size);
 
         let fs = self.fs();
-        let bi = match inode::find_by_inum(&fs, inum) {
+        let bi = match inode::find_by_inum(fs, inum) {
             Ok(bi) => bi,
             Err(e) => { reply.error(bch_err(&e)); return; }
         };
 
         // Even a read at EOF, as filemap_read()'s file_accessed():
-        fuse_touch_atime(&fs, self.atime, inum, &bi);
+        fuse_touch_atime(fs, self.atime, inum, &bi);
 
         let end = std::cmp::min(bi.bi_size, offset + size as u64);
         if end <= offset {
@@ -1433,15 +1483,18 @@ impl Filesystem for BcachefsFs {
         let block_size = fs.block_bytes();
         let aligned_start = offset & !(block_size - 1);
         let pad_start = (offset - aligned_start) as usize;
-        let aligned_end = (offset + read_size as u64).div_ceil(block_size) * block_size;
+        let aligned_end = (offset + read_size as u64).next_multiple_of(block_size);
         let aligned_size = (aligned_end - aligned_start) as usize;
 
-        let mut buf = AlignedBuf::new(aligned_size);
-
-        if let Err(e) = block_on(fs.read(inum, aligned_start, &bi, &mut buf)) {
-            reply.error(bch_err(&e));
+        let Ok(mut buf) = io_buf(aligned_size, Flags::empty()) else {
+            reply.error(Errno::ENOMEM);
             return;
-        }
+        };
+
+        let buf = match fs.read(inum, aligned_start, &bi, &mut buf) {
+            Ok(buf) => buf,
+            Err(e)  => { reply.error(bch_err(&e)); return; }
+        };
 
         reply.data(&buf[pad_start..pad_start + read_size]);
     }
@@ -1464,7 +1517,7 @@ impl Filesystem for BcachefsFs {
         eprintln!("fuse_write(ino={}, offset={}, size={})", inum.inum, offset, size);
 
         let fs = self.fs();
-        let bi = match inode::find_by_inum(&fs, inum) {
+        let bi = match inode::find_by_inum(fs, inum) {
             Ok(bi) => bi,
             Err(e) => { reply.error(bch_err(&e)); return; }
         };
@@ -1474,19 +1527,21 @@ impl Filesystem for BcachefsFs {
         // Compute alignment
         let aligned_start = offset & !(block_size - 1);
         let pad_start = (offset - aligned_start) as usize;
-        let aligned_end = (offset + size as u64).div_ceil(block_size) * block_size;
+        let aligned_end = (offset + size as u64).next_multiple_of(block_size);
         let aligned_size = (aligned_end - aligned_start) as usize;
 
-        let mut buf = AlignedBuf::new(aligned_size);
+        let Ok(mut buf) = io_buf(aligned_size, Flags::empty()) else {
+            reply.error(Errno::ENOMEM);
+            return;
+        };
+        let buf = &mut buf[..];
 
         // RMW: read partial start block
         if pad_start > 0 {
-            let mut start_block = AlignedBuf::new(block_size as usize);
-            if let Err(e) = block_on(fs.read(inum, aligned_start, &bi, &mut start_block)) {
+            if let Err(e) = fs.read(inum, aligned_start, &bi, &mut buf[..block_size as usize]) {
                 reply.error(bch_err(&e));
                 return;
             }
-            buf[..block_size as usize].copy_from_slice(&start_block);
         }
 
         // RMW: read partial end block (if different from start)
@@ -1494,19 +1549,21 @@ impl Filesystem for BcachefsFs {
         if pad_end > 0 && !(pad_start > 0 && aligned_size == block_size as usize) {
             let end_block_offset = aligned_end - block_size;
             let buf_offset = aligned_size - block_size as usize;
-            let mut end_block = AlignedBuf::new(block_size as usize);
-            if let Err(e) = block_on(fs.read(inum, end_block_offset, &bi, &mut end_block)) {
+            if let Err(e) = fs.read(inum, end_block_offset, &bi, &mut buf[buf_offset..]) {
                 reply.error(bch_err(&e));
                 return;
             }
-            buf[buf_offset..].copy_from_slice(&end_block);
         }
 
         // Overlay user data
-        buf[pad_start..pad_start + size].copy_from_slice(data);
+        for (b, d) in buf[pad_start..pad_start + size].iter_mut().zip(data) {
+            b.write(*d);
+        }
+        // the data, and the reads of the blocks it doesn't cover
+        let buf = unsafe { crate::util::assume_init_mut(buf) };
 
         // Get inode opts for replicas
-        let opts = inode::opts_get_inode(&fs, &bi);
+        let opts = inode_opts::get_inode(fs, &bi);
         let replicas = std::cmp::max(opts.data_replicas as u32, 1);
 
         // Write aligned buffer. new_i_size is the file's size after the write,
@@ -1514,14 +1571,13 @@ impl Filesystem for BcachefsFs {
         // lies past it, and a write into the middle of the file would lose the
         // rest of its last block (stored as a short inline extent).
         let new_i_size = std::cmp::max(bi.bi_size, offset + size as u64);
-        if let Err(e) = block_on(fs.write(bi.bi_inum, aligned_start, inum.subvol as u32,
-                                          replicas, &buf, new_i_size)) {
+        if let Err(e) = fs.write(bi.bi_inum, aligned_start, inum.subvol as u32, replicas, buf, new_i_size) {
             reply.error(bch_err(&e));
             return;
         }
 
         // Update inode times
-        if let Err(e) = fuse_update_inode_after_write(&fs, inum) {
+        if let Err(e) = fuse_update_inode_after_write(fs, inum) {
             reply.error(bch_err(&e));
             return;
         }
@@ -1537,7 +1593,7 @@ impl Filesystem for BcachefsFs {
              reply: ReplyEmpty) {
         ensure_thread_init();
         eprintln!("fuse_fsync(ino={})", ino.0);
-        match fuse_fsync(&self.fs()) {
+        match fuse_fsync(self.fs()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(bch_err(&e)),
         }
@@ -1547,7 +1603,7 @@ impl Filesystem for BcachefsFs {
                 reply: ReplyEmpty) {
         ensure_thread_init();
         eprintln!("fuse_fsyncdir(ino={})", ino.0);
-        match fuse_fsync(&self.fs()) {
+        match fuse_fsync(self.fs()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(bch_err(&e)),
         }
@@ -1558,7 +1614,7 @@ impl Filesystem for BcachefsFs {
     fn syncfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyEmpty) {
         ensure_thread_init();
         eprintln!("fuse_syncfs");
-        match fuse_fsync(&self.fs()) {
+        match fuse_fsync(self.fs()) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(bch_err(&e)),
         }
@@ -1576,19 +1632,16 @@ impl Filesystem for BcachefsFs {
         let dir = resolve!(self, ino, reply);
         eprintln!("fuse_readdir(dir={}, offset={})", dir.inum, offset);
 
-        let parent_inum = {
-            let fs = self.fs();
-            match inode::find_by_inum(&fs, dir) {
-                Ok(bi) => {
-                    fuse_touch_atime(&fs, self.atime, dir, &bi);
-                    if dir.inum == BCACHEFS_ROOT_INO && dir.subvol == BCACHEFS_ROOT_SUBVOL {
-                        dir.inum
-                    } else {
-                        bi.bi_dir
-                    }
-                }
-                Err(e) => { reply.error(bch_err(&e)); return; }
-            }
+        let fs = self.fs();
+        let bi = match inode::find_by_inum(fs, dir) {
+            Ok(bi) => bi,
+            Err(e) => { reply.error(bch_err(&e)); return; }
+        };
+        fuse_touch_atime(fs, self.atime, dir, &bi);
+        let parent_inum = if dir.inum == BCACHEFS_ROOT_INO && dir.subvol == BCACHEFS_ROOT_SUBVOL {
+            dir.inum
+        } else {
+            bi.bi_dir
         };
 
         let mut pos = offset;
@@ -1609,59 +1662,41 @@ impl Filesystem for BcachefsFs {
             pos = 2;
         }
 
-        // Read remaining entries via C shim with callback
-        unsafe extern "C" fn filldir(
-            ctx: *mut std::ffi::c_void,
-            name: *const std::ffi::c_char,
-            name_len: std::ffi::c_uint,
-            ino: u64,
-            dtype: std::ffi::c_uint,
-            pos: u64,
-        ) -> std::ffi::c_int {
-            let reply = unsafe { &mut *(ctx as *mut ReplyDirectory) };
-            let name_bytes = unsafe {
-                std::slice::from_raw_parts(name as *const u8, name_len as usize)
-            };
-            let name_str = OsStr::from_bytes(name_bytes);
-            let file_type = dtype_to_filetype(dtype);
-            let full = reply.add(INodeNo(ino), pos, file_type, name_str);
-            if full { -1 } else { 0 }
-        }
-
-        let ret = unsafe {
-            c::rust_fuse_readdir(
-                self.fs().raw, dir, pos,
-                &mut reply as *mut ReplyDirectory as *mut _,
-                Some(filldir),
-            )
+        let mut hash = match str_hash::hash_info_init(fs, &bi) {
+            Ok(hash) => hash,
+            Err(e) => { reply.error(bch_err(&e)); return; }
         };
 
-        if ret != 0 {
-            reply.error(err(ret));
-        } else {
-            reply.ok();
+        let ret = dirent::readdir(fs, dir, &mut hash, FuseDir { pos, reply: &mut reply });
+        match ret {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(bch_err(&e)),
         }
     }
 
-    // xattrs: user., trusted. and security. - see rust_fuse_xattr_*() in
-    // c_src/fuse_shims.c for what's served and why. Permissions are the
-    // kernel's: with default_permissions it checks them before asking us.
+    // xattrs: those xattr_type() serves. Permissions are the kernel's: with
+    // default_permissions it checks them before asking us.
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         ensure_thread_init();
         let inum = resolve!(self, ino, reply);
-        let Ok(name) = CString::new(name.as_bytes()) else {
-            reply.error(Errno::EINVAL);
-            return;
+        let (ty, name) = match xattr_type(name) {
+            Ok(x) => x,
+            Err(e) => { reply.error(e); return; }
         };
 
-        let mut buf = vec![0u8; size as usize];
-        let ret = unsafe {
-            c::rust_fuse_xattr_get(self.fs().raw, inum, name.as_ptr(),
-                              if size == 0 { std::ptr::null_mut() } else { buf.as_mut_ptr().cast() },
-                              buf.len())
-        };
-        reply_xattr(reply, ret, &buf);
+        let trans = bcachefs_kernel::btree_trans!(self.fs());
+        let value = lockrestart_do(&trans, |t| {
+            let inode_u = inode::find_by_inum_trans(t, inum, bcachefs_kernel::here!())?;
+            let mut iter = BtreeIter::uninit(t.trans());
+            let k = xattr::lookup(t, &mut iter, &inode_u, inum, ty, name, BtreeIterFlags::empty())?;
+            Ok(xattr::value(k).to_vec())
+        });
+        match value {
+            // as the VFS's getxattr: a missing xattr is ENODATA
+            Err(e) if e.matches(c::ENOENT) => reply.error(Errno::ENODATA),
+            value => reply_xattr(reply, size, value),
+        }
     }
 
     fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
@@ -1672,50 +1707,26 @@ impl Filesystem for BcachefsFs {
         // the list for FUSE; we only see the caller's uid.
         let show_trusted = req.uid() == 0;
 
-        let mut buf = vec![0u8; size as usize];
-        let ret = unsafe {
-            c::rust_fuse_xattr_list(self.fs().raw, inum,
-                               if size == 0 { std::ptr::null_mut() } else { buf.as_mut_ptr().cast() },
-                               buf.len(), show_trusted)
-        };
-        reply_xattr(reply, ret, &buf);
+        reply_xattr(reply, size, xattr_names(self.fs(), inum, show_trusted));
     }
 
     fn setxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, value: &[u8],
                 flags: i32, _position: u32, reply: ReplyEmpty) {
         ensure_thread_init();
         let inum = resolve!(self, ino, reply);
-        let Ok(name) = CString::new(name.as_bytes()) else {
-            reply.error(Errno::EINVAL);
-            return;
-        };
-
-        let ret = unsafe {
-            c::rust_fuse_xattr_set(self.fs().raw, inum, name.as_ptr(),
-                              value.as_ptr().cast(), value.len(), flags)
-        };
-        match ret {
-            0 => reply.ok(),
-            e => reply.error(bch_err(&BchError::from_raw(-e))),
+        match xattr_set(self.fs(), inum, name, Some(value), flags) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
     }
 
     fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         ensure_thread_init();
         let inum = resolve!(self, ino, reply);
-        let Ok(name) = CString::new(name.as_bytes()) else {
-            reply.error(Errno::EINVAL);
-            return;
-        };
-
         // As the VFS does: XATTR_REPLACE, so that a missing xattr is ENODATA
-        let ret = unsafe {
-            c::rust_fuse_xattr_set(self.fs().raw, inum, name.as_ptr(), std::ptr::null(), 0,
-                              libc::XATTR_REPLACE)
-        };
-        match ret {
-            0 => reply.ok(),
-            e => reply.error(bch_err(&BchError::from_raw(-e))),
+        match xattr_set(self.fs(), inum, name, None, libc::XATTR_REPLACE) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -1729,7 +1740,7 @@ impl Filesystem for BcachefsFs {
         // usage is in 512 byte sectors - as bch2_statfs():
         let shift = block_size.trailing_zeros() as u64 - 9;
 
-        let nr_inodes = accounting::nr_inodes(&fs);
+        let nr_inodes = accounting::nr_inodes(fs);
         // As bch2_statfs(): inodes have no fixed limit, so count the free
         // space as room for ~256 byte inodes. (u64::MAX here read as -1,
         // "unknown", and df -i showed "-" - which xfstests generic/273 then
@@ -1760,11 +1771,10 @@ impl Filesystem for BcachefsFs {
     ) {
         ensure_thread_init();
         let dir = resolve!(self, parent, reply);
-        let name_bytes = name.as_bytes();
         eprintln!("fuse_create(dir={}, name={:?}, mode={:#o})", dir.inum, name, mode);
 
         let fs = self.fs();
-        let new_inode = match fuse_create_inode(&fs, req, dir, name_bytes, mode as u16, 0) {
+        let new_inode = match fuse_create_inode(fs, req, dir, name, mode as u16, 0) {
             Ok(inode) => inode,
             Err(e)    => {
                 eprintln!("  create -> err {}", e);
@@ -1809,7 +1819,7 @@ pub struct Cli {
 fn parse_fuse_mount_options(
     device: &str,
     options: Option<&str>,
-) -> anyhow::Result<(c::bch_opts, Vec<MountOption>, libc::c_ulong)> {
+) -> anyhow::Result<(c::bch_opts, Vec<MountOption>, core::ffi::c_ulong)> {
     let mut mount_options = vec![
         MountOption::FSName(device.to_string()),
         // Use CUSTOM instead of Subtype — fuser categorizes Subtype as
@@ -1829,12 +1839,12 @@ fn parse_fuse_mount_options(
         .unwrap_or_default();
     let mut bch_opts = bcachefs_kernel::opts::parse_mount_opts(None, parsed.fs_opts.as_deref(), true)?;
 
-    opt_set!(bch_opts, nostart, 1);
+    bch_opts.set_nostart(true);
 
     // read-only is both a fuser option (carried in parsed.fuse_options) and a
     // filesystem-open concern - the latter isn't a mount flag, so set it here:
     if parsed.flags & libc::MS_RDONLY != 0 {
-        opt_set!(bch_opts, read_only, 1);
+        bch_opts.set_read_only(true);
     }
 
     mount_options.extend(parsed.fuse_options);
@@ -1997,7 +2007,7 @@ enum FuseMount {
     /// fuseblk, mounted by us, for block devices.
     Fuseblk {
         source:   PathBuf,
-        ms_flags: libc::c_ulong,
+        ms_flags: core::ffi::c_ulong,
     },
 }
 
@@ -2010,7 +2020,7 @@ enum FuseMount {
 fn mount_fuseblk(
     source:     &Path,
     mountpoint: &str,
-    ms_flags:   libc::c_ulong,
+    ms_flags:   core::ffi::c_ulong,
     blksize:    u32,
 ) -> std::io::Result<OwnedFd> {
     let dev_fuse = OpenOptions::new().read(true).write(true).open("/dev/fuse")?;
@@ -2211,7 +2221,7 @@ pub fn cmd_fusemount(cli: Cli) -> anyhow::Result<()> {
     };
 
     if matches!(mount, FuseMount::Fuseblk { .. }) {
-        opt_set!(bch_opts, noexcl, 1);
+        bch_opts.set_noexcl(true);
     }
 
     // Held until destroy(), with the claims below: see lock_devices(). Across
@@ -2243,7 +2253,7 @@ pub fn cmd_fusemount(cli: Cli) -> anyhow::Result<()> {
     config.clone_fd = true;
 
     if cli.foreground {
-        unsafe { c::linux_shrinkers_init() };
+        shrinkers_init();
         let fd = fuse_claim(&fs, &cli.mountpoint, &mount)
             .map_err(|e| anyhow::anyhow!("Error mounting filesystem: {}", e))?;
         if let Err(e) = fs.start() {
@@ -2342,7 +2352,7 @@ pub fn cmd_fusemount(cli: Cli) -> anyhow::Result<()> {
     // from a pthread_atfork child handler -- which also fired in the child of
     // every other fork, including the one that execs fusermount3, where
     // binding a socket and spawning threads is not allowed.
-    crate::http::bch2_start_http_lazy();
+    crate::http::start_lazy();
 
     // Daemon mode must not hold on to the caller's stdio, nor grow a fixed log
     // file under /tmp; foreground mode still leaves debug output visible.
@@ -2355,7 +2365,7 @@ pub fn cmd_fusemount(cli: Cli) -> anyhow::Result<()> {
         rustix::stdio::dup2_stderr(&f)?;
     }
 
-    unsafe { c::linux_shrinkers_init() };
+    shrinkers_init();
 
     // process::exit() skips destructors: drop fs explicitly before it.
     let fuse_fd = match fuse_claim(&fs, &cli.mountpoint, &mount) {
@@ -2423,8 +2433,7 @@ pub const CMD: super::CmdDef = typed_cmd!("fusemount", "FUSE mount", Cli, cmd_fu
 mod tests {
     use super::{parse_fuse_mount_options, systime_to_ts, ts_to_systime, AtimeMode, AtimeOpts};
     use super::{NodeMap, ALT_NODE_BASE, BCACHEFS_ROOT_INO, BCACHEFS_ROOT_SUBVOL};
-    use bcachefs_kernel::opt_get;
-    use bch_bindgen::c;
+    use bcachefs_kernel::c;
     use fuser::MountOption;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -2433,7 +2442,7 @@ mod tests {
         let (opts, mount_options, ms_flags) =
             parse_fuse_mount_options("/dev/test", Some("ro,norecovery")).unwrap();
 
-        assert_eq!(opt_get!(opts, read_only), 1);
+        assert!(opts.read_only_or_default());
         assert!(ms_flags & libc::MS_RDONLY != 0);
         assert!(mount_options.contains(&MountOption::RO));
         assert!(mount_options.contains(&MountOption::FSName("/dev/test".to_string())));
@@ -2454,6 +2463,8 @@ mod tests {
     }
 
     #[test]
+    // tv_sec is a time_t: 32 bits on some targets
+    #[allow(clippy::unnecessary_cast)]
     fn timespec_systime_round_trip_including_before_1970() {
         for (sec, nsec) in [(0i64, 0u32), (1, 500_000_000), (1_700_000_000, 123),
                             (-1, 0), (-1, 500_000_000), (-2_000_000_000, 999_999_999)] {

@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! An inode's attributes, as the VFS reads and changes them: getattr, and
+//! setattr - all but a size change, which is a truncate, and C's still.
+//!
+//! getattr reads the VFS inode - its times are the VFS's, newer than the
+//! btree's under lazytime - and of ei_inode only what the VFS inode doesn't
+//! have: the creation time and the flags stat(2) reports.
+//!
+//! The iattr has uids and gids as the mount's users see them (vfsuid_t,
+//! vfsgid_t); the inode keeps them in its filesystem's user namespace. So a
+//! new one goes through the mount's idmap to a kuid, then to the number stored
+//! - from_vfsuid(), from_kuid() - as the VFS's own setattr_copy() does.
+//!
+//! The quota follows the owner: a chown is a quota transfer, made before the
+//! transaction - it can fail, and then nothing changes - and undone if the
+//! transaction fails.
+//!
+//! fileattr is the inode flags FS_IOC_GETFLAGS and FS_IOC_FSGETXATTR show,
+//! each its own bit there - FLAGS - the project, and casefolding. Setting
+//! them checks the flags against the inode as the btree has it, not i_flags:
+//! the btree's locks are what keep two setters apart.
+
+use core::ffi::c_int;
+
+use crate::acl;
+use crate::os::inode_ops::InodeAttrs;
+use crate::os::posix_acl::{AclType, PosixAcl};
+use crate::btree::iter::{lockrestart_do, BtreeIter, BtreeIterFlags, CommitFlags, TransAttempt};
+use crate::c;
+use crate::errcode::{Errcode, ret_to_c, BchError};
+use crate::inode;
+use crate::inode_opts::InodeOpt;
+use crate::quota::QuotaAcctMode;
+use crate::snapshots::subvolume;
+
+use super::dentry::Dentry;
+use crate::os::iattr::Iattr;
+use crate::os::idmap::MntIdmap;
+use super::inode::InodeInfo;
+use crate::os::iattr::{ATTR_CTIME, ATTR_SIZE};
+use crate::os::super_block::IsInode;
+
+use c::InodeFlags as F;
+
+/// Each flag's bit in FS_IOC_GETFLAGS's flags, and in FS_IOC_FSGETXATTR's.
+const FLAGS: [(F, u32, u32); 5] = [
+    (F::sync,      c::FS_SYNC_FL,      c::FS_XFLAG_SYNC),
+    (F::immutable, c::FS_IMMUTABLE_FL, c::FS_XFLAG_IMMUTABLE),
+    (F::append,    c::FS_APPEND_FL,    c::FS_XFLAG_APPEND),
+    (F::nodump,    c::FS_NODUMP_FL,    c::FS_XFLAG_NODUMP),
+    (F::noatime,   c::FS_NOATIME_FL,   c::FS_XFLAG_NOATIME),
+];
+
+/// The inode flags of @fl, each flag's bit there given by @bit - and those
+/// bits cleared from @fl, leaving any it has no flag for.
+fn flags_from(fl: &mut u32, bit: impl Fn(&(F, u32, u32)) -> u32) -> F {
+    let mut flags = F::empty();
+    for f in &FLAGS {
+        if *fl & bit(f) != 0 {
+            *fl &= !bit(f);
+            flags |= f.0;
+        }
+    }
+    flags
+}
+
+/// What a fileattr_set() changes: the inode flags of @mask to @flags, and
+/// the project and casefolding if they're Some - the project stored +1.
+#[derive(Default)]
+struct FileattrSet {
+    mask:     F,
+    flags:    F,
+    project:  Option<u32>,
+    casefold: Option<bool>,
+}
+
+impl FileattrSet {
+    fn apply(&self, t: &TransAttempt<'_, '_>, inode: &InodeInfo, bi: &mut c::bch_inode_unpacked)
+        -> Result<(), BchError>
+    {
+        let fs = t.fs();
+        let file_type = bi.bi_mode as u32 & c::S_IFMT;
+        let others_may = F::nodump | F::noatime;
+        if file_type != c::S_IFREG && file_type != c::S_IFDIR && !others_may.contains(self.flags) {
+            return fs.throw(Errcode::EINVAL_setattr_bad_file_type);
+        }
+
+        if let Some(casefold) = self.casefold.filter(|&cf| cf != bi.casefold(fs)) {
+            inode::set_casefold(t, inode.inum(), bi, casefold as u32)?;
+        }
+
+        if let Some(project) = self.project {
+            bi.bi_project = project;
+            InodeOpt::of(c::InodeOptId::project).set_own(bi, true);
+        }
+
+        bi.set_flags(bi.flags().difference(self.mask).union(self.flags));
+        bi.bi_ctime = fs.timespec_to_time(inode.vfs().current_time()) as u64;
+        Ok(())
+    }
+}
+
+impl InodeAttrs for InodeInfo {
+    fn getattr(&self, idmap: MntIdmap<'_>, stat: &mut c::kstat, request_mask: u32) {
+        let fs = self.fs();
+        let v = self.vfs();
+        let block_bytes = fs.block_bytes() as u32;
+
+        stat.dev     = self.sb().dev();
+        stat.ino     = self.inum().inum;
+        stat.mode    = v.mode();
+        stat.nlink   = v.nlink();
+        (stat.uid, stat.gid) = idmap.owner(v);
+        stat.rdev    = v.rdev();
+        stat.size    = v.size() as i64;
+        if stat.size == 0 && v.is_dir() {
+            stat.size = block_bytes as i64;
+        }
+        stat.atime   = v.atime();
+        stat.mtime   = v.mtime();
+        stat.ctime   = v.ctime();
+        stat.blksize = block_bytes;
+        stat.blocks  = v.blocks();
+
+        stat.subvol = self.inum().subvol;
+        stat.result_mask |= c::STATX_SUBVOL;
+
+        if request_mask & c::STATX_DIOALIGN != 0 && v.is_reg() {
+            stat.result_mask |= c::STATX_DIOALIGN;
+            // Not right: it should be the superblock's, and checked against
+            // the open devices' alignment
+            stat.dio_mem_align    = 512;
+            stat.dio_offset_align = block_bytes;
+        }
+
+        if request_mask & c::STATX_BTIME != 0 {
+            stat.result_mask |= c::STATX_BTIME;
+            stat.btime = fs.time_to_timespec(self.ei_inode.bi_otime.get() as i64);
+        }
+
+        let flags = self.ei_inode.bi_flags.get().flags();
+        for (flag, attr) in [(F::immutable, c::STATX_ATTR_IMMUTABLE),
+                             (F::append,    c::STATX_ATTR_APPEND),
+                             (F::nodump,    c::STATX_ATTR_NODUMP)] {
+            if flags.contains(flag) {
+                stat.attributes |= attr as u64;
+            }
+            stat.attributes_mask |= attr as u64;
+        }
+    }
+
+    fn fileattr_get(&self, fa: &mut c::file_kattr) {
+        let bi = self.inode();
+        let xflags = FLAGS.iter().filter(|f| bi.flag(f.0)).fold(0, |x, f| x | f.2);
+
+        crate::os::fileattr::fill_xflags(fa, xflags);
+        if InodeOpt::of(c::InodeOptId::project).is_own(&bi) {
+            fa.fsx_xflags |= c::FS_XFLAG_PROJINHERIT;
+        }
+        if bi.casefold(self.fs()) {
+            fa.flags |= c::FS_CASEFOLD_FL;
+        }
+        fa.fsx_projid = self.ei_quota.lock().ei_qid.q[c::QuotaType::QTYP_PRJ];
+    }
+
+    /// @dentry is this inode's.
+    fn fileattr_set(&self, dentry: Dentry<'_>, fa: &mut c::file_kattr)
+        -> Result<(), BchError>
+    {
+        let fs = self.fs();
+        let all = FLAGS.iter().fold(F::empty(), |m, f| m | f.0);
+        let mut s = FileattrSet::default();
+
+        if fa.fsx_valid() {
+            fa.fsx_xflags &= !c::FS_XFLAG_PROJINHERIT;
+            s.mask = all;
+            s.flags |= flags_from(&mut fa.fsx_xflags, |f| f.2);
+            if fa.fsx_xflags != 0 {
+                return fs.throw(Errcode::unsupported_fsx_flag);
+            }
+
+            if fa.fsx_projid >= u32::MAX {
+                return fs.throw(Errcode::projid_too_big);
+            }
+            let project = self.ei_inode.bi_project.get();
+            if (project != 0 || fa.fsx_projid != 0) && project != fa.fsx_projid + 1 {
+                s.project = Some(fa.fsx_projid + 1);
+            }
+        }
+
+        if fa.flags_valid() {
+            s.mask = all;
+            s.casefold = Some(fa.flags & c::FS_CASEFOLD_FL != 0);
+            fa.flags &= !c::FS_CASEFOLD_FL;
+            s.flags |= flags_from(&mut fa.flags, |f| f.1);
+            if fa.flags != 0 {
+                return fs.throw(Errcode::unsupported_fa_flag);
+            }
+        }
+
+        {
+            let lock = self.update_lock();
+            subvolume::is_ro(fs, self.inum().subvol as u32)?;
+            if s.project.is_some() {
+                lock.set_projid(fa.fsx_projid)?;
+            }
+            lock.write_inode(ATTR_CTIME, |t, bi| s.apply(t, self, bi))?;
+        }
+
+        if s.casefold.is_some() {
+            dentry.casefold_changed();
+        }
+        Ok(())
+    }
+
+    fn setattr(&self, idmap: MntIdmap<'_>, dentry: Dentry<'_>, attr: &mut c::iattr)
+        -> Result<(), BchError>
+    {
+        self.vfs().assert_locked();
+        subvolume::is_ro(self.fs(), self.inum().subvol as u32)?;
+        idmap.setattr_prepare(dentry, attr)?;
+
+        if attr.ia_valid & ATTR_SIZE != 0 {
+            self.truncate(idmap, attr)
+        } else {
+            self.setattr_nonsize(idmap, Iattr::of(attr))
+        }
+    }
+
+    fn get_acl(&self, ty: AclType) -> Result<Option<PosixAcl>, BchError> {
+        acl::get_acl(self, ty)
+    }
+
+    fn set_acl(&self, idmap: MntIdmap<'_>, acl: Option<&PosixAcl>, ty: AclType) -> Result<(), BchError> {
+        acl::set_acl(idmap, self, acl, ty)
+    }
+
+    fn listxattr(dentry: Dentry<'_>, buf: Option<&mut [u8]>) -> Result<usize, BchError> {
+        crate::xattr::listxattr(dentry, buf)
+    }
+}
+
+impl InodeInfo {
+    /// What @attr changes, into @bi: @uid as stored, @kgid as the
+    /// filesystem has it.
+    fn setattr_copy(&self, idmap: MntIdmap<'_>, attr: &Iattr, uid: Option<u32>,
+                    kgid: Option<c::kgid_t>, bi: &mut c::bch_inode_unpacked) {
+        let fs = self.fs();
+        let v = self.vfs();
+
+        if let Some(uid) = uid {
+            bi.bi_uid = uid;
+        }
+        if let Some(gid) = kgid {
+            bi.bi_gid = v.gid_of(gid);
+        }
+
+        if let Some(size) = attr.size() {
+            bi.bi_size = size;
+        }
+
+        for (ts, t) in [(attr.atime(), &mut bi.bi_atime), (attr.mtime(), &mut bi.bi_mtime),
+                        (attr.ctime(), &mut bi.bi_ctime)] {
+            if let Some(ts) = ts {
+                *t = fs.timespec_to_time(ts) as u64;
+            }
+        }
+
+        if let Some(mut mode) = attr.mode() {
+            // setgid stays only if the caller is in the group the file will
+            // have, or may act as if it were
+            let gid = kgid.unwrap_or_else(|| v.kgid());
+            if !idmap.in_group_or_capable(v, gid) {
+                mode &= !(c::S_ISGID as c::umode_t);
+            }
+            bi.bi_mode = mode;
+        }
+    }
+
+    /// The caller has checked it may: setattr_prepare().
+    pub(crate) fn setattr_nonsize(&self, idmap: MntIdmap<'_>, attr: &Iattr) -> Result<(), BchError> {
+        let lock = self.update_lock();
+        let fs = self.fs();
+        let v = self.vfs();
+        let uid = attr.vfsuid().map(|uid| v.uid_of(idmap.kuid(v, uid)));
+        let kgid = attr.vfsgid().map(|gid| idmap.kgid(v, gid));
+
+        let old_qid = self.ei_quota.lock().ei_qid;
+        let mut qid = old_qid;
+        if let Some(uid) = uid {
+            qid.q[c::QuotaType::QTYP_USR] = uid;
+        }
+        if let Some(gid) = kgid {
+            qid.q[c::QuotaType::QTYP_GRP] = v.gid_of(gid);
+        }
+
+        lock.quota_transfer(qid, !0, QuotaAcctMode::PREALLOC)?;
+
+        let trans = crate::btree_trans!(fs);
+        let ret = lockrestart_do(&trans, |t| {
+            let mut iter = BtreeIter::uninit(t.trans());
+            let mut bi = inode::__peek(t, &mut iter, self.inum(), BtreeIterFlags::INTENT,
+                                       Some(crate::here!()))?;
+
+            self.fold_times(&mut bi);
+            self.setattr_copy(idmap, attr, uid, kgid, &mut bi);
+
+            let acl = if attr.mode().is_some() {
+                acl::acl_chmod(t, self.inum(), &bi, bi.bi_mode)?
+            } else {
+                None
+            };
+
+            inode::write(t, &mut iter, &mut bi)?;
+            t.commit(None, CommitFlags::NO_ENOSPC)?;
+
+            self.update_after_write(t.trans(), &bi, attr.valid());
+            if acl.is_some() {
+                self.vfs().set_cached_acl(AclType::Access, acl.as_ref());
+            }
+            Ok(())
+        });
+
+        if ret.is_err() {
+            /*
+             * The btree commit failed, so the inode on disk still has the old
+             * qid: without the transfer undone, the in-memory quota counts
+             * diverge from what an inode scan would compute - generic/270
+             * catches it. NOCHECK: it's a qid we just came from, which had
+             * room.
+             */
+            let _ = lock.quota_transfer(old_qid, !0, QuotaAcctMode::NOCHECK);
+        }
+        ret
+    }
+}

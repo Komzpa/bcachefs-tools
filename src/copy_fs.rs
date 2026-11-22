@@ -9,20 +9,32 @@
 // Converted from c_src/posix_to_bcachefs.c.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use bch_bindgen::fs::FsExt;
-use bch_bindgen::c;
-use bch_bindgen::data::io::{block_on, MAX_IO_SIZE};
+use crate::wrappers::fs::FsExt;
+use bcachefs_kernel::c;
+use crate::wrappers::io::MAX_IO_SIZE;
+use bcachefs_kernel::alloc::capacity::DiskReservation;
 use bcachefs_kernel::btree;
-use bcachefs_kernel::btree::iter::{CommitFlags, CommitOpts};
+use bcachefs_kernel::btree::bkey::{spos, BkeyI, BkeyV, BKEY_U64S};
+use bcachefs_kernel::btree::iter::{CommitFlags, UpdateTriggerFlags};
+use bcachefs_kernel::data::extents::bkey_append_ptr;
+use bcachefs_kernel::data_structures::dst_room::DstRoom;
+use bcachefs_kernel::format::{BkeyType, Btree};
+use bcachefs_kernel::inode_opts::get_io_opts;
+use bcachefs_kernel::util::rcu::read_lock;
 use bcachefs_kernel::data::io_misc;
-use bcachefs_kernel::{dirent, inode, namei, str_hash, xattr};
-use bcachefs_kernel::errcode::{ret_to_result_void as ret_to_result, BchError, bch_errcode};
+use bcachefs_kernel::xattr::XattrType;
+use bcachefs_kernel::{acl, dirent, inode, namei, str_hash, xattr};
+use bcachefs_kernel::errcode::{BchError, Errcode};
 use bcachefs_kernel::fs::Fs;
 
-use crate::util::AlignedBuf;
+use bcachefs_kernel::os::kernel::PAGE_SIZE;
+use bcachefs_kernel::util::alloc::{AlignedBox, Flags};
+use bcachefs_kernel::util::bio::io_buf;
 
 const BCACHEFS_ROOT_INO: u64 = 4096;
 const BCACHEFS_ROOT_SUBVOL: u64 = 1;
@@ -32,20 +44,13 @@ const DT_DIR: u8  = 4;
 const DT_REG: u8  = 8;
 const DT_LNK: u8  = 10;
 
-/// Xattr namespace indices matching KEY_TYPE_XATTR_INDEX_* in xattr_format.h.
-const XATTR_INDEX_USER: i32     = 0;
-const XATTR_INDEX_ACL_ACCESS: i32 = 1;
-const XATTR_INDEX_ACL_DEFAULT: i32 = 2;
-const XATTR_INDEX_TRUSTED: i32  = 3;
-const XATTR_INDEX_SECURITY: i32 = 4;
-
 fn mode_to_type(mode: u32) -> u8 {
     ((mode >> 12) & 15) as u8
 }
 
 /// Convert a rustix error into a BchError.
 fn rustix_err(e: rustix::io::Errno) -> BchError {
-    BchError::from_raw(-e.raw_os_error())
+    BchError::from(e.raw_os_error())
 }
 
 /// Convert a rustix FileType to a DT_* constant.
@@ -57,17 +62,6 @@ fn file_type_to_dtype(ft: rustix::fs::FileType) -> u8 {
         FileType::Symlink         => DT_LNK,
         _                         => 0, // DT_UNKNOWN
     }
-}
-
-extern "C" {
-    fn rust_link_data(
-        c: *mut c::bch_fs,
-        dst_inum: u64,
-        sectors_delta: *mut i64,
-        logical: u64,
-        physical: u64,
-        length: u64,
-    ) -> i32;
 }
 
 /// Migrate type matching enum bch_migrate_type in posix_to_bcachefs.h.
@@ -151,13 +145,13 @@ fn unlink_and_rm(
     dir: &mut c::bch_inode_unpacked,
     child_name: &CStr,
 ) -> Result<(), BchError> {
-    let qstr = dirent::qstr(child_name.to_bytes());
+    let child_name = OsStr::from_bytes(child_name.to_bytes());
     let mut child: c::bch_inode_unpacked = Default::default();
 
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new().flags(CommitFlags::NO_ENOSPC),
+        CommitFlags::NO_ENOSPC,
         |t| {
             namei::unlink_trans(
                 t,
@@ -165,13 +159,13 @@ fn unlink_and_rm(
                 dir,
                 zeroed_subvol_inum(),
                 &mut child,
-                &qstr,
+                child_name,
                 false,
             )
         },
     )?;
 
-    if child.bi_flags & (c::bch_inode_flags::BCH_INODE_unlinked as u32) == 0 {
+    if !child.flag(c::InodeFlags::unlinked) {
         return Ok(());
     }
 
@@ -192,10 +186,10 @@ fn create_or_update_link(
 ) -> Result<(), BchError> {
     let dir_hash = str_hash::hash_info_init(fs, dir)?;
 
-    let qstr = dirent::qstr(name.to_bytes());
+    let os_name = OsStr::from_bytes(name.to_bytes());
 
-    match dirent::lookup(fs, dir_inum, &dir_hash, &qstr) {
-        Err(e) if e.matches(bch_errcode::BCH_ERR_ENOENT_str_hash_lookup) => {
+    match dirent::lookup(fs, dir_inum, &dir_hash, os_name) {
+        Err(e) if e.matches(Errcode::ENOENT_str_hash_lookup) => {
             // Fall through to create
         }
         Err(e) => return Err(e),
@@ -213,8 +207,8 @@ fn create_or_update_link(
     btree::iter::trans_commit_do(
         fs,
         None,
-        CommitOpts::new(),
-        |t| namei::link_trans(t, dir_inum, &mut dir_u, inum, &mut inode, &qstr),
+        CommitFlags::empty(),
+        |t| namei::link_trans(t, dir_inum, &mut dir_u, inum, &mut inode, os_name),
     )
 }
 
@@ -231,11 +225,11 @@ fn create_or_update_file(
 ) -> Result<c::bch_inode_unpacked, BchError> {
     let dir_hash = str_hash::hash_info_init(fs, dir)?;
 
-    let qname = dirent::qstr(name.to_bytes());
-    let child_inum = dirent::lookup(fs, dir_inum, &dir_hash, &qname);
+    let name = OsStr::from_bytes(name.to_bytes());
+    let child_inum = dirent::lookup(fs, dir_inum, &dir_hash, name);
 
     let mut child_inode: c::bch_inode_unpacked = Default::default();
-    let mut child_subvol : c::bch_subvolume = Default::default();
+    let mut child_subvol : c::Subvolume = Default::default();
 
     if let Ok(child_inum) = child_inum {
         // Already exists — update
@@ -249,7 +243,7 @@ fn create_or_update_file(
         // bch2_fsck_write_inode has its own commit_do loop internally —
         // don't wrap it in trans_commit_do or it double-nests.
         {
-            let trans = btree::BtreeTrans::new(fs);
+            let trans = bcachefs_kernel::btree_trans!(fs);
             inode::fsck_write_inode(&trans, &mut child_inode)?;
         }
     } else {
@@ -258,7 +252,7 @@ fn create_or_update_file(
         btree::iter::trans_commit_do(
             fs,
             None,
-            CommitOpts::new(),
+            CommitFlags::empty(),
             |t| {
                 namei::create_trans(
                     t,
@@ -266,11 +260,13 @@ fn create_or_update_file(
                     dir,
                     &mut child_inode,
                     &mut child_subvol,
-                    &qname,
+                    Some(name),
                     uid,
                     gid,
                     mode as _,
                     rdev as _,
+                    None,
+                    None,
                     zeroed_subvol_inum(),
                     0,
                 )
@@ -281,30 +277,15 @@ fn create_or_update_file(
     Ok(child_inode)
 }
 
-/// Resolve xattr name prefix to bcachefs xattr index.
-/// Returns (index, stripped_name) or None if unsupported.
-fn xattr_resolve_name(name: &[u8]) -> Option<(i32, &[u8])> {
-    if let Some(rest) = name.strip_prefix(b"user.") {
-        Some((XATTR_INDEX_USER, rest))
-    } else if let Some(rest) = name.strip_prefix(b"trusted.") {
-        Some((XATTR_INDEX_TRUSTED, rest))
-    } else if let Some(rest) = name.strip_prefix(b"security.") {
-        Some((XATTR_INDEX_SECURITY, rest))
-    } else if let Some(rest) = name.strip_prefix(b"system.posix_acl_access") {
-        Some((XATTR_INDEX_ACL_ACCESS, rest))
-    } else if let Some(rest) = name.strip_prefix(b"system.posix_acl_default") {
-        Some((XATTR_INDEX_ACL_DEFAULT, rest))
-    } else {
-        None
-    }
-}
-
+// st_*time is a time_t: 32 bits on some targets - where a timespec may also
+// have padding fields, which the struct update zeroes
+#[allow(clippy::unnecessary_cast, clippy::needless_update)]
 fn copy_times(fs: &Fs, dst: &mut c::bch_inode_unpacked, src: &rustix::fs::Stat) {
     let to_bch_time = |sec: i64, nsec: i64| {
         let ts = c::timespec64 {
             tv_sec: sec as _,
             tv_nsec: nsec as _,
-            ..unsafe { std::mem::zeroed() }
+            ..pin_init::zeroed()
         };
         fs.timespec_to_time(ts) as u64
     };
@@ -331,13 +312,15 @@ fn copy_xattrs(
         return Ok(()); // silently skip if xattrs not supported
     }
 
+    let mut acl_flags = Vec::new();
+
     let mut pos = 0usize;
     while pos < attrs_size {
         let end = attrs_buf[pos..attrs_size].iter().position(|&b| b == 0).unwrap() + pos;
         let attr_name = &attrs_buf[pos..end];
         pos = end + 1;
 
-        let (xattr_type, stripped) = match xattr_resolve_name(attr_name) {
+        let (xattr_type, stripped) = match XattrType::from_name(attr_name) {
             Some(v) => v,
             None => continue,
         };
@@ -349,19 +332,39 @@ fn copy_xattrs(
             Err(_) => continue,
         };
 
-        let stripped_cstr = CString::new(stripped).unwrap();
+        // POSIX ACLs come in the xattr API's format; bcachefs stores its
+        // own. bch2_get_acl() goes by the inode's flags, not the xattrs:
+        // without them the ACLs are there and ignored.
+        let acl;
+        let value = if xattr_type.is_acl() {
+            let Some(v) = acl_from_xattr(&val_buf[..val_size]) else {
+                eprintln!("{}: {} isn't a POSIX ACL, not copied",
+                          src.to_string_lossy(), String::from_utf8_lossy(attr_name));
+                continue;
+            };
+            acl = v;
+            acl_flags.push(
+                if xattr_type == XattrType::POSIX_ACL_ACCESS {
+                    c::InodeFlags::has_access_acl
+                } else {
+                    c::InodeFlags::has_default_acl
+                });
+            &acl[..]
+        } else {
+            &val_buf[..val_size]
+        };
 
         btree::iter::trans_commit_do(
             fs,
             None,
-            CommitOpts::new(),
+            CommitFlags::empty(),
             |t| {
                 xattr::set(
                     t,
                     subvol_inum(dst.bi_inum),
                     dst,
-                    &stripped_cstr,
-                    &val_buf[..val_size],
+                    OsStr::from_bytes(stripped),
+                    value,
                     xattr_type,
                     0,
                 )
@@ -369,7 +372,37 @@ fn copy_xattrs(
         )?;
     }
 
+    // Each set above reads the inode back into @dst, so a flag set before
+    // the last would be lost: set them now. Written with the rest of the
+    // inode by the caller.
+    for flag in acl_flags {
+        dst.set_flag(flag, true);
+    }
+
     Ok(())
+}
+
+/// A POSIX ACL as the xattr API gives it - <linux/posix_acl_xattr.h>: a
+/// version 2 header, then 8 byte entries - as bcachefs stores it. None if
+/// it isn't one.
+fn acl_from_xattr(value: &[u8]) -> Option<Vec<u8>> {
+    const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
+
+    let (header, entries) = value.split_at_checked(4)?;
+    if u32::from_le_bytes(header.try_into().ok()?) != POSIX_ACL_XATTR_VERSION ||
+       entries.len() % 8 != 0 {
+        return None;
+    }
+
+    let entries: Vec<c::AclEntry> = entries.chunks_exact(8)
+        .map(|e| c::AclEntry::new(u16::from_le_bytes([e[0], e[1]]),
+                                  u16::from_le_bytes([e[2], e[3]]),
+                                  u32::from_le_bytes([e[4], e[5], e[6], e[7]])).ok())
+        .collect::<Option<_>>()?;
+
+    let mut out = vec![0u8; acl::encoded_len(entries.iter().copied())];
+    acl::encode(entries.iter().copied(), &mut out);
+    Some(out)
 }
 
 fn write_data(
@@ -378,11 +411,19 @@ fn write_data(
     offset: u64,
     data: &[u8],
 ) -> Result<(), BchError> {
-    let result = block_on(
-        fs.write(dst_inode.bi_inum, offset, 1, 1, data, u64::MAX)
-    )?;
+    let result = fs.write(dst_inode.bi_inum, offset, 1, 1, data, u64::MAX)?;
     dst_inode.bi_sectors = (dst_inode.bi_sectors as i64 + result.sectors_delta) as u64;
     Ok(())
+}
+
+/// @buf, read from @src_fd at @offset - up to @len bytes, the file's - and
+/// zeroes past what the read got.
+fn pread_zero_tail<'b>(src_fd: BorrowedFd<'_>, buf: &'b mut [MaybeUninit<u8>], len: usize, offset: u64)
+    -> Result<&'b mut [u8], BchError>
+{
+    let got = rustix::io::pread(src_fd, &mut buf[..len], offset).map_err(rustix_err)?.0.len();
+    buf[got..].fill(MaybeUninit::new(0));
+    Ok(unsafe { crate::util::assume_init_mut(buf) })
 }
 
 fn copy_data(
@@ -397,13 +438,12 @@ fn copy_data(
 
     while pos < end {
         let len = std::cmp::min(end - pos, MAX_IO_SIZE as u64) as usize;
-        let padded = ((len as u64).div_ceil(block_size) * block_size) as usize;
+        let padded = (len as u64).next_multiple_of(block_size) as usize;
 
-        let mut buf = AlignedBuf::new(padded);
-        rustix::io::pread(src_fd, &mut buf[..len], pos)
-            .map_err(rustix_err)?;
+        let mut buf = io_buf(padded, Flags::empty())?;
+        let buf = pread_zero_tail(src_fd, &mut buf, len, pos)?;
 
-        write_data(fs, dst_inode, pos, &buf)?;
+        write_data(fs, dst_inode, pos, buf)?;
         pos += len as u64;
     }
 
@@ -417,12 +457,51 @@ fn link_data(
     physical: u64,
     length: u64,
 ) -> Result<(), BchError> {
-    let mut sectors_delta: i64 = 0;
-    let ret = unsafe {
-        rust_link_data(fs.raw, dst.bi_inum, &mut sectors_delta, logical, physical, length)
-    };
-    dst.bi_sectors = (dst.bi_sectors as i64 + sectors_delta) as u64;
-    ret_to_result(ret)
+    let ca = fs.dev_get(0).expect("device 0, the one migrate links data on");
+    let block_bytes = fs.block_bytes();
+
+    assert!(logical  & (block_bytes - 1) == 0, "unaligned logical offset {logical}");
+    assert!(physical & (block_bytes - 1) == 0, "unaligned physical offset {physical}");
+    assert!(length   & (block_bytes - 1) == 0, "unaligned length {length}");
+
+    let (mut logical, mut physical, mut length) = (logical >> 9, physical >> 9, length >> 9);
+    let bucket_size = u64::from(ca.mi.get().bucket_size);
+
+    assert!(physical + length <= ca.mi.get().nbuckets * bucket_size,
+            "extent at sector {physical} of {length} sectors past the device's end");
+
+    while length != 0 {
+        let b = ca.sector_to_bucket(physical);
+        let sectors = (bucket_size - (physical & (bucket_size - 1))).min(length);
+
+        let mut k = DstRoom::<BkeyI, [u64; BKEY_U64S + c::BKEY_EXTENT_VAL_U64s_MAX]>::default();
+        k.k = c::bkey {
+            type_: BkeyType::extent.0 as u8,
+            p:     spos(dst.bi_inum, logical + sectors, u32::MAX),
+            size:  sectors as u32,
+            ..c::bkey::new()
+        };
+        let generation = ca.bucket_gen(b, &read_lock()).expect("a bucket of the device");
+        bkey_append_ptr(&mut k, c::bch_extent_ptr::new().with_offset(physical).with_dev(0).with_generation(generation))
+            .expect("room for a pointer");
+
+        let res = DiskReservation::new(fs);
+        res.add(sectors, 1, c::ReservationFlags::nofail)?;
+
+        btree::iter::trans_commit_do(fs, Some(&res), CommitFlags::empty(), |t| {
+            let mut new = t.bkey_reassemble_room((&*k).into(), c::BKEY_EXTENT_U64s_MAX * size_of::<u64>())?;
+            let opts = get_io_opts(t, None, new.as_sc())?;
+            new.set_needs_reconcile(t, None, &opts, c::SetNeedsReconcileCtx::SET_NEEDS_RECONCILE_opt_change, 0)?;
+            t.insert(Btree::extents, new, UpdateTriggerFlags::empty())
+        })?;
+
+        dst.bi_sectors += sectors;
+        logical  += sectors;
+        physical += sectors;
+        length   -= sectors;
+    }
+
+    Ok(())
 }
 
 fn copy_link(
@@ -442,11 +521,11 @@ fn copy_link(
     let target_bytes = target.as_bytes();
     let link_len = target_bytes.len() as u64;
 
-    let mut buf = AlignedBuf::new(MAX_IO_SIZE);
+    let padded = link_len.next_multiple_of(block_size) as usize;
+    let mut buf = AlignedBox::<[u8], PAGE_SIZE>::try_new_zeroed_slice_gfp(padded, Flags::empty())?;
     buf[..target_bytes.len()].copy_from_slice(target_bytes);
-    let padded = (link_len.div_ceil(block_size) * block_size) as usize;
 
-    write_data(fs, dst, 0, &buf[..padded])
+    write_data(fs, dst, 0, &buf)
 }
 
 fn link_file_data(
@@ -462,7 +541,7 @@ fn link_file_data(
     // First pass: check for unknown extents and fsync if found
     let fm = fiemap::Fiemap::new(&src_fd);
     for extent in fm {
-        let extent = extent.map_err(|_| BchError::from_raw(-libc::EIO))?;
+        let extent = extent.map_err(|_| BchError::from(libc::EIO))?;
         if extent.fe_flags.contains(fiemap::FiemapExtentFlags::UNKNOWN) {
             rustix::fs::fsync(src_fd).map_err(rustix_err)?;
             break;
@@ -472,18 +551,18 @@ fn link_file_data(
     // Second pass: link or copy extents
     let fm = fiemap::Fiemap::new(&src_fd);
     for extent in fm {
-        let extent = extent.map_err(|_| BchError::from_raw(-libc::EIO))?;
+        let extent = extent.map_err(|_| BchError::from(libc::EIO))?;
 
         s.total_input += extent.fe_length;
 
-        let src_max = src_size.div_ceil(block_size) * block_size;
+        let src_max = src_size.next_multiple_of(block_size);
         let length = std::cmp::min(extent.fe_length, src_max - extent.fe_logical);
         let visible_len = std::cmp::min(src_size - extent.fe_logical, length);
 
         if (extent.fe_logical & (block_size - 1)) != 0 || (length & (block_size - 1)) != 0 {
             let msg = format!("Unaligned extent in {} - can't handle", src_path.to_string_lossy());
             eprintln!("{}", msg);
-            return Err(BchError::from_raw(-libc::EINVAL));
+            return Err(BchError::from(libc::EINVAL));
         }
 
         let needs_copy = s.migrate_type == MigrateType::Copy
@@ -510,7 +589,7 @@ fn link_file_data(
         if (extent.fe_physical & (block_size - 1)) != 0 {
             let msg = format!("Unaligned extent in {} - can't handle", src_path.to_string_lossy());
             eprintln!("{}", msg);
-            return Err(BchError::from_raw(-libc::EINVAL));
+            return Err(BchError::from(libc::EINVAL));
         }
 
         range_add(&mut s.extents, extent.fe_physical, length);
@@ -568,7 +647,7 @@ struct Range {
 fn align_range(r: Range, bs: u64) -> Range {
     Range {
         start: r.start / bs * bs,
-        end: r.end.div_ceil(bs) * bs,
+        end: r.end.next_multiple_of(bs),
     }
 }
 
@@ -640,17 +719,16 @@ fn copy_sync_file_range(
     while start != range.end {
         let b = std::cmp::min(range.end - start, MAX_IO_SIZE as u64) as usize;
 
-        let mut src_buf = AlignedBuf::new(b);
+        let mut src_buf = io_buf(b, Flags::empty())?;
         let read_len = std::cmp::min(b, (src_size - start) as usize);
-        rustix::io::pread(src_fd, &mut src_buf[..read_len], start)
-            .map_err(rustix_err)?;
+        let src_buf = pread_zero_tail(src_fd, &mut src_buf, read_len, start)?;
 
-        let mut dst_buf = AlignedBuf::new(b);
-        block_on(fs.read(dst_inum, start, dst, &mut dst_buf))?;
+        let mut dst_buf = io_buf(b, Flags::empty())?;
+        let dst_buf = fs.read(dst_inum, start, dst, &mut dst_buf)?;
 
         let mut m = Range { start: 0, end: 0 };
         loop {
-            m = seek_mismatch_aligned(&src_buf, &dst_buf, m.end as usize, b, block_size);
+            m = seek_mismatch_aligned(src_buf, dst_buf, m.end as usize, b, block_size);
             if m.end == 0 {
                 break;
             }
@@ -705,31 +783,26 @@ struct DirEntry {
     name:   CString,
 }
 
-/// Trampoline for bch2_readdir callback.
-#[repr(C)]
-struct ReadDirCtx {
-    ctx:     c::dir_context,
-    entries: *mut Vec<DirEntry>,
+/// What dirent::readdir() emits to: all of the directory's entries.
+struct DirEntries<'e> {
+    pos:     u64,
+    entries: &'e mut Vec<DirEntry>,
 }
 
-unsafe extern "C" fn readdir_actor(
-    ctx: *mut c::dir_context,
-    name: *const libc::c_char,
-    name_len: i32,
-    _pos: i64,
-    inum: u64,
-    dtype: u32,
-) -> i32 {
-    let (entries, name_slice) = unsafe {
-        let rctx = &mut *(ctx as *mut ReadDirCtx);
-        (
-            &mut *rctx.entries,
-            std::slice::from_raw_parts(name as *const u8, name_len as usize),
-        )
-    };
-    let cname = CString::new(name_slice).unwrap_or_else(|_| CString::new("?").unwrap());
-    entries.push(DirEntry { inum, dtype: dtype as u8, name: cname });
-    0
+impl dirent::DirEmit for DirEntries<'_> {
+    fn pos(&self) -> u64 {
+        self.pos
+    }
+
+    fn set_pos(&mut self, pos: u64) {
+        self.pos = pos;
+    }
+
+    fn emit(&mut self, name: &[u8], _pos: u64, inum: u64, d_type: u32) -> bool {
+        let cname = CString::new(name).unwrap_or_else(|_| CString::new("?").unwrap());
+        self.entries.push(DirEntry { inum, dtype: d_type as u8, name: cname });
+        true
+    }
 }
 
 fn simple_readdir(
@@ -740,15 +813,7 @@ fn simple_readdir(
     let mut hash_info = str_hash::hash_info_init(fs, dir)?;
 
     let mut entries = Vec::new();
-    let mut rctx = ReadDirCtx {
-        ctx: c::dir_context {
-            actor: Some(readdir_actor),
-            pos: 0,
-        },
-        entries: &mut entries,
-    };
-
-    dirent::readdir(fs, dir_inum, &mut hash_info, &mut rctx.ctx)?;
+    dirent::readdir(fs, dir_inum, &mut hash_info, DirEntries { pos: 0, entries: &mut entries })?;
 
     // Sort by (type, name) like the C code
     entries.sort_by(|a, b| {
@@ -887,7 +952,11 @@ fn copy_dir(
             continue;
         }
 
-        if s.migrate_type == MigrateType::Migrate && d.stat.st_ino as u64 == s.bcachefs_inum {
+        // an ino_t: 32 bits on some targets
+        #[allow(clippy::unnecessary_cast)]
+        let src_ino = d.stat.st_ino as u64;
+
+        if s.migrate_type == MigrateType::Migrate && src_ino == s.bcachefs_inum {
             continue;
         }
 
@@ -901,12 +970,11 @@ fn copy_dir(
 
         if s.migrate_type == MigrateType::Migrate && d.stat.st_dev != s.dev {
             eprintln!("{} does not have correct st_dev!", child_path.to_string_lossy());
-            return Err(BchError::from_raw(-libc::EINVAL));
+            return Err(BchError::from(libc::EINVAL));
         }
 
         // Hardlink handling
         if (d.stat.st_mode & libc::S_IFMT) == libc::S_IFREG && d.stat.st_nlink > 1 {
-            let src_ino = d.stat.st_ino as u64;
             if let Some(&dst_ino) = s.hardlinks.get(&src_ino) {
                 create_or_update_link(
                     fs, dir_inum, dst, &d.name,
@@ -926,7 +994,7 @@ fn copy_dir(
 
         // Record hardlink destination
         if (d.stat.st_mode & libc::S_IFMT) == libc::S_IFREG && d.stat.st_nlink > 1 {
-            s.hardlinks.insert(d.stat.st_ino as u64, inode.bi_inum);
+            s.hardlinks.insert(src_ino, inode.bi_inum);
         }
 
         let name_cstr = &d.name;
@@ -969,7 +1037,7 @@ fn copy_dir(
 
 fn first_device_total_sectors(fs: &Fs) -> u64 {
     let ca = fs.dev_get(0).expect("device 0 should exist");
-    ca.mi.nbuckets * ca.mi.bucket_size as u64
+    ca.mi.get().nbuckets * ca.mi.get().bucket_size as u64
 }
 
 fn reserve_old_fs_space(
@@ -1013,7 +1081,7 @@ pub fn copy_fs(
     let stat = rustix::fs::fstat(src_fd).map_err(rustix_err)?;
     if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
         eprintln!("{} is not a directory", src_path.to_string_lossy());
-        return Err(BchError::from_raw(-libc::ENOTDIR));
+        return Err(BchError::from(libc::ENOTDIR));
     }
 
     if s.migrate_type == MigrateType::Migrate {
@@ -1024,10 +1092,11 @@ pub fn copy_fs(
 
     rustix::process::fchdir(src_fd).map_err(rustix_err)?;
 
-    copy_times(fs, &mut root_inode, &stat);
-
+    // Xattrs first: setting each reads the inode back, over the times.
     let dot = CString::new(".").unwrap();
     copy_xattrs(fs, &mut root_inode, &dot)?;
+
+    copy_times(fs, &mut root_inode, &stat);
 
     let dup_fd = rustix::io::dup(src_fd).map_err(rustix_err)?;
     copy_dir(fs, s, &mut root_inode, dup_fd, src_path)?;
