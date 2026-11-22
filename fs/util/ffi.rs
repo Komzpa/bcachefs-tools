@@ -1,0 +1,115 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! For entry points C calls: C's objects, as references (Opaque), and C's
+//! buffers, as slices. (Names are os_str.rs's.)
+//!
+//! The buffer functions are unsafe the same way: the pointer has to be what
+//! C says it is, for as long as the slice is used - which the entry point's
+//! own contract promises, and these only restate.
+
+use core::cell::UnsafeCell;
+use core::marker::PhantomPinned;
+
+/// A C object as an entry point's argument: `&Opaque<Fs>` where C
+/// passes a `struct bch_fs *`. Same ABI; transparent. A transaction is
+/// BtreeTrans, itself over one.
+///
+/// Not a plain reference to the C struct, because Rust promises things about
+/// those that aren't true of these. `&T` says the memory doesn't change for
+/// the reference's life, and `&mut T` that nothing else touches it - LLVM's
+/// readonly and noalias. A transaction's locking state is read by other
+/// threads' deadlock detection while we run, and the filesystem is shared and
+/// changing everywhere. UnsafeCell takes away the first promise, PhantomPinned
+/// the second - as the kernel crate's Opaque<T>, which userspace doesn't have.
+///
+/// There's no constructor: only C hands these out, so one always refers to a
+/// live, initialized object of its type - what Fs::from_c() relies on. Safe
+/// code can't make one from a C struct with made-up fields. The exception is
+/// C's locks, which are Opaques as the structs C shares hold them
+/// (locking/raw.rs) - zeroed with the struct, and initialized by its init.
+#[repr(transparent)]
+pub struct Opaque<T> {
+    value: UnsafeCell<T>,
+    _pin:  PhantomPinned,
+}
+
+impl<T> Opaque<T> {
+    /// The C object, for C.
+    pub fn as_ptr(&self) -> *mut T {
+        self.value.get()
+    }
+}
+
+/// C's char, as C compiles it here. core::ffi::c_char is the platform ABI's -
+/// i8 on x86, u8 on arm64 - which is userspace's; the kernel builds with
+/// -funsigned-char, so u8 on every arch, as the kernel's own ffi::c_char. The
+/// types differ only to Rust, but that includes kCFI: a function C calls
+/// through a pointer taking `char *` as `*const i8` never hashes as C's
+/// prototype does.
+#[cfg(kernel)]
+#[allow(non_camel_case_types)]
+pub type c_char = u8;
+#[cfg(not(kernel))]
+pub use core::ffi::c_char;
+
+/// The rest of C's types, which are the same in either build: with c_char,
+/// codegen.rs's bindings' --ctypes-prefix.
+pub use core::ffi::{c_int, c_long, c_longlong, c_schar, c_short, c_uchar, c_uint, c_ulong,
+                    c_ulonglong, c_ushort, c_void};
+
+/// @size bytes at @p - nothing, for none.
+///
+/// # Safety
+/// @p is valid for @size bytes, for 'a.
+pub unsafe fn bytes<'a>(p: *const c_void, size: usize) -> &'a [u8] {
+    if size == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p as *const u8, size) } }
+}
+
+/// As bytes(), None for a NULL @p - C's way of saying there's no value.
+///
+/// # Safety
+/// As bytes().
+pub unsafe fn opt_bytes<'a>(p: *const c_void, size: usize) -> Option<&'a [u8]> {
+    (!p.is_null()).then(|| unsafe { bytes(p, size) })
+}
+
+/// The @size byte buffer at @p, None for a NULL @p - C's way of asking only
+/// how big something is.
+///
+/// # Safety
+/// @p is valid for @size bytes, and nothing else uses them, for 'a.
+pub unsafe fn opt_bytes_mut<'a>(p: *mut c_void, size: usize) -> Option<&'a mut [u8]> {
+    (!p.is_null()).then(|| unsafe { core::slice::from_raw_parts_mut(p as *mut u8, size) })
+}
+
+/// @s, NUL terminated, as a C string - for a const table of them, built from
+/// concat!(.., "\0").
+pub const fn c_str(s: &'static str) -> &'static core::ffi::CStr {
+    match core::ffi::CStr::from_bytes_with_nul(s.as_bytes()) {
+        Ok(s)  => s,
+        Err(_) => panic!("not a C string"),
+    }
+}
+
+/// The string in C char array @buf: up to its NUL, or empty if it has none.
+pub fn cstr_in(buf: &[c_char]) -> &core::ffi::CStr {
+    core::ffi::CStr::from_bytes_until_nul(crate::util::vstructs::plain_bytes(buf)).unwrap_or(c"")
+}
+
+/// C char array @buf, as the bytes it holds: to read into.
+pub fn bytes_in(buf: &mut [c_char]) -> &mut [u8] {
+    crate::util::vstructs::plain_bytes_mut(buf)
+}
+
+/// @s, up to a NUL in it, into C char array @buf - truncated to leave room
+/// for its NUL - as strscpy().
+pub fn strscpy(buf: &mut [c_char], s: &[u8]) {
+    let buf = bytes_in(buf);
+    let Some(max) = buf.len().checked_sub(1) else { return };
+    let s = &s[..s.iter().position(|&b| b == 0).unwrap_or(s.len())];
+    let n = s.len().min(max);
+
+    buf[..n].copy_from_slice(&s[..n]);
+    buf[n] = 0;
+}
+

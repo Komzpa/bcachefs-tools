@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! **Don't use this.** An intrusive list can't be made safe: linking an item
+//! is a promise about its lifetime that nothing checks, and every list that
+//! goes wrong goes wrong as use-after-free. New code wants a vector - KVVec,
+//! DArray - and the lists we have are to become vectors. This exists for
+//! what can't be one: util/task's WaitList, whose entries live in their
+//! waiters' memory so that waiting can't fail to allocate, and C's lists
+//! while C has them. Anything new needs an extremely good reason, said where
+//! it's used.
+//!
+//! include/linux/list.h's circular doubly linked list, in Rust, typed:
+//! List<T, OFFSET> is a list of T linked through the links at OFFSET in each,
+//! made by list!(T, member), which checks the member is links - ListLinks, or
+//! C's struct list_head. Laid out as C's, so C's lists are these too.
+//!
+//! What's safe, and why:
+//!
+//! - Holding the list is holding a &List or &mut List: one lives in a
+//!   Locked<R, List<T, OFFSET>>. Walking it with a cursor, and reordering it -
+//!   sort() - are safe.
+//! - An item is live, and doesn't move, while it's on the list, and after
+//!   it's taken off until the list's lock is next released: its owner takes
+//!   the lock before freeing it. So a cursor can take an item off and still
+//!   hand it back. Whoever links an item promises that: push_back() is
+//!   unsafe, and so is remove(), which needs the item, if it's on a list, to
+//!   be on this one.
+//!
+//! The links are Cells, written through shared references under the list's
+//! lock; ListLinks, what an item embeds, is Sync on that ground.
+
+use crate::c;
+use core::cell::Cell;
+use core::cmp::Ordering;
+use core::marker::PhantomData;
+use core::ptr;
+
+/// struct list_head.
+#[repr(C)]
+struct ListHead {
+    next: Cell<*const ListHead>,
+    prev: Cell<*const ListHead>,
+}
+
+const _: () = assert!(size_of::<ListHead>() == size_of::<c::list_head>() &&
+                      align_of::<ListHead>() == align_of::<c::list_head>());
+
+impl ListHead {
+    const fn new() -> Self {
+        ListHead { next: Cell::new(ptr::null()), prev: Cell::new(ptr::null()) }
+    }
+
+    /// INIT_LIST_HEAD().
+    fn init(&self) {
+        self.next.set(self);
+        self.prev.set(self);
+    }
+
+    /// As init(), for one never init()ed - zeroed: before its first add.
+    fn init_if_zeroed(&self) {
+        if self.next.get().is_null() {
+            self.init();
+        }
+    }
+
+    /// No entries - or never init()ed, which is none either.
+    fn is_empty(&self) -> bool {
+        let next = self.next.get();
+        next.is_null() || ptr::eq(next, self)
+    }
+
+    /// list_add_tail(): @new before this one.
+    ///
+    /// # Safety
+    /// The list is held; @new is on none.
+    unsafe fn add_tail(&self, new: &ListHead) {
+        let prev = self.prev.get();
+        new.next.set(self);
+        new.prev.set(prev);
+        unsafe { (*prev).next.set(new) };
+        self.prev.set(new);
+    }
+
+    /// list_del_init().
+    ///
+    /// # Safety
+    /// The list is held, and it's on it.
+    unsafe fn del_init(&self) {
+        let (prev, next) = (self.prev.get(), self.next.get());
+        unsafe {
+            (*next).prev.set(prev);
+            (*prev).next.set(next);
+        }
+        self.init();
+    }
+
+    /// list_replace_init(): this one's entries onto @new, this one left empty.
+    ///
+    /// # Safety
+    /// Both are held, and @new has nothing on it.
+    unsafe fn replace_init(&self, new: &ListHead) {
+        if self.is_empty() {
+            new.init();
+            return;
+        }
+        let (prev, next) = (self.prev.get(), self.next.get());
+        new.next.set(next);
+        new.prev.set(prev);
+        unsafe {
+            (*next).prev.set(new);
+            (*prev).next.set(new);
+        }
+        self.init();
+    }
+}
+
+/// What a list's item embeds, to be on it.
+#[repr(transparent)]
+pub struct ListLinks(ListHead);
+
+// SAFETY: touched only through its list, under the list's lock
+unsafe impl Send for ListLinks {}
+unsafe impl Sync for ListLinks {}
+
+// Null links are on no list: is_empty()'s never init()ed
+unsafe impl pin_init::Zeroable for ListLinks {}
+
+impl ListLinks {
+    pub const fn new() -> Self {
+        ListLinks(ListHead::new())
+    }
+}
+
+/// What list!() accepts as a member: links, Rust's or C's.
+pub trait IsLinks {}
+impl IsLinks for ListLinks {}
+impl IsLinks for c::list_head {}
+
+/// A list of T, linked through the links at OFFSET in each: list!().
+#[repr(transparent)]
+pub struct List<T, const OFFSET: usize> {
+    head: ListHead,
+    _t:   PhantomData<*const T>,
+}
+
+/// The List of @T through its member @member, which must be links.
+#[macro_export]
+macro_rules! list {
+    ($T:ty, $member:ident) => {
+        $crate::data_structures::list::List<$T, {
+            fn _member_is_links<'a>(t: &'a $T) -> &'a dyn $crate::data_structures::list::IsLinks { &t.$member }
+            ::core::mem::offset_of!($T, $member)
+        }>
+    };
+}
+
+// SAFETY: the thread holding it is handed &T - T: Sync
+unsafe impl<T: Sync, const OFFSET: usize> Send for List<T, OFFSET> {}
+
+// Zeroed, it's empty: see init()
+unsafe impl<T, const OFFSET: usize> pin_init::Zeroable for List<T, OFFSET> {}
+
+impl<T, const OFFSET: usize> List<T, OFFSET> {
+    const FITS: () = assert!(OFFSET + size_of::<ListHead>() <= size_of::<T>(),
+                             "List: links past the end of their item");
+
+    /// Empty: set up by its first push, as a zeroed one is.
+    pub const fn new() -> Self {
+        List { head: ListHead::new(), _t: PhantomData }
+    }
+
+    /// INIT_LIST_HEAD(): empty, whatever was on it forgotten. A zeroed list
+    /// is empty too, and set up by its first push.
+    ///
+    /// # Safety
+    /// It doesn't move while it has anything on it.
+    pub unsafe fn init(&self) {
+        self.head.init()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.head.is_empty()
+    }
+
+    fn links(item: &T) -> &ListHead {
+        let () = Self::FITS;
+        // SAFETY: list!()'s: the links at OFFSET in a T
+        unsafe { &*ptr::from_ref(item).byte_add(OFFSET).cast() }
+    }
+
+    /// # Safety
+    /// @l is on this list, or was taken off it with the list held since.
+    unsafe fn item<'a>(l: *const ListHead) -> &'a T {
+        unsafe { &*l.byte_sub(OFFSET).cast() }
+    }
+
+    /// list_add_tail().
+    ///
+    /// # Safety
+    /// The list doesn't move while it has anything on it. @item is on no list,
+    /// and is live and doesn't move until it's off this one and the list's lock
+    /// has been released since: its owner takes the lock before freeing it.
+    pub unsafe fn push_back(&mut self, item: &T) {
+        self.head.init_if_zeroed();
+        unsafe { self.head.add_tail(Self::links(item)) }
+    }
+
+    /// list_add().
+    ///
+    /// # Safety
+    /// As push_back().
+    pub unsafe fn push_front(&mut self, item: &T) {
+        self.head.init_if_zeroed();
+        unsafe { (*self.head.next.get()).add_tail(Self::links(item)) }
+    }
+
+    /// Takes @item off, if it's on: whether it was.
+    ///
+    /// # Safety
+    /// If it's on a list, it's this one.
+    pub unsafe fn remove(&mut self, item: &T) -> bool {
+        unsafe { Self::unlink(item) }
+    }
+
+    /// Takes @item off whichever list it's on, if any: for an item that can
+    /// be on any of several, all held.
+    ///
+    /// # Safety
+    /// The list it's on, if any, is held.
+    pub unsafe fn unlink(item: &T) -> bool {
+        let l = Self::links(item);
+        let on = !l.is_empty();
+        if on {
+            unsafe { l.del_init() };
+        }
+        on
+    }
+
+    /// On a list - this one or another; racy unless that list is held.
+    pub fn linked(item: &T) -> bool {
+        !Self::links(item).is_empty()
+    }
+
+    pub fn first(&self) -> Option<&T> {
+        (!self.is_empty()).then(|| unsafe { Self::item(self.head.next.get()) })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        let head: *const ListHead = &self.head;
+        let mut pos = if self.is_empty() { head } else { self.head.next.get() };
+        core::iter::from_fn(move || {
+            (!ptr::eq(pos, head)).then(|| {
+                unsafe {
+                    let item = Self::item(pos);
+                    pos = (*pos).next.get();
+                    item
+                }
+            })
+        })
+    }
+
+    /// @other's items onto the end of this one, in order, @other left empty:
+    /// list_splice_tail_init().
+    ///
+    /// # Safety
+    /// As push_back(), for each of @other's items.
+    pub unsafe fn append(&mut self, other: &mut Self) {
+        if other.is_empty() {
+            return;
+        }
+        self.head.init_if_zeroed();
+
+        let (first, last) = (other.head.next.get(), other.head.prev.get());
+        let tail = self.head.prev.get();
+        // SAFETY: on the lists, both of which we hold
+        unsafe {
+            (*first).prev.set(tail);
+            (*tail).next.set(first);
+            (*last).next.set(&self.head);
+        }
+        self.head.prev.set(last);
+        other.head.init();
+    }
+
+    /// Everything on it moved to @new, which is left holding it - this one
+    /// empty: for a list whose head moves.
+    ///
+    /// # Safety
+    /// @new is empty, and doesn't move while it has anything on it.
+    pub unsafe fn move_to(&mut self, new: &mut Self) {
+        unsafe { self.head.replace_init(&new.head) }
+    }
+
+    /// From the front: a place in the list, which can take its item off.
+    pub fn cursor_mut(&mut self) -> CursorMut<'_, T, OFFSET> {
+        let pos = if self.is_empty() { ptr::from_ref(&self.head) } else { self.head.next.get() };
+        CursorMut { list: self, pos }
+    }
+
+    /// Its items in @cmp's order, stably: an insertion sort, from the back,
+    /// for a list kept nearly in order - one in order costs a pass, and each
+    /// item out of order the distance it moves.
+    pub fn sort(&mut self, mut cmp: impl FnMut(&T, &T) -> Ordering) {
+        if self.is_empty() {
+            return;
+        }
+        let head: *const ListHead = &self.head;
+        // SAFETY: everything followed is on the list, which we hold
+        unsafe {
+            let mut cmp = |a, b| cmp(Self::item(a), Self::item(b));
+
+            // the first of the sorted run at the back
+            let mut pos = self.head.prev.get();
+            loop {
+                let e = (*pos).prev.get();
+                if ptr::eq(e, head) {
+                    break;
+                }
+                if cmp(e, pos) != Ordering::Greater {
+                    pos = e;
+                    continue;
+                }
+                // before the first in the run it isn't above - any equal to
+                // it came after it, and still do
+                (*e).del_init();
+                let mut q = (*pos).next.get();
+                while !ptr::eq(q, head) && cmp(q, e) == Ordering::Less {
+                    q = (*q).next.get();
+                }
+                (*q).add_tail(&*e);
+            }
+        }
+    }
+}
+
+/// A place in a held list.
+pub struct CursorMut<'a, T, const OFFSET: usize> {
+    list: &'a mut List<T, OFFSET>,
+    pos:  *const ListHead,
+}
+
+impl<'a, T, const OFFSET: usize> CursorMut<'a, T, OFFSET> {
+    fn at_end(&self) -> bool {
+        ptr::eq(self.pos, &self.list.head)
+    }
+
+    pub fn current(&self) -> Option<&'a T> {
+        // SAFETY: on the list, which we hold for 'a
+        (!self.at_end()).then(|| unsafe { List::<T, OFFSET>::item(self.pos) })
+    }
+
+    pub fn move_next(&mut self) {
+        if !self.at_end() {
+            // SAFETY: on the list
+            self.pos = unsafe { (*self.pos).next.get() };
+        }
+    }
+
+    /// Takes the current item off, onto the next: still live for 'a, the
+    /// list's held for that long.
+    pub fn remove_current(&mut self) -> Option<&'a T> {
+        let item = self.current()?;
+        let cur = self.pos;
+        // SAFETY: on the list, which we hold
+        unsafe {
+            self.pos = (*cur).next.get();
+            (*cur).del_init();
+        }
+        Some(item)
+    }
+}
+
+/// A walk of the list @list() picks out of @owner - its lock's guard -
+/// handing out each item with @owner, for a body that needs the rest of what
+/// it holds: list_for_each_entry_safe(). Its place is the item after the one
+/// handed out.
+pub struct Walk<'a, O, F, T, const OFFSET: usize> {
+    owner: &'a mut O,
+    list:  F,
+    pos:   *const ListHead,
+    _t:    PhantomData<&'a T>,
+}
+
+impl<'a, O, F, T, const OFFSET: usize> Walk<'a, O, F, T, OFFSET>
+where
+    F: Fn(&mut O) -> &mut List<T, OFFSET>,
+{
+    /// From the front.
+    ///
+    /// # Safety
+    /// The body takes no item off the list but the one it's handed.
+    pub unsafe fn new(owner: &'a mut O, list: F) -> Self {
+        let l = list(&mut *owner);
+        let pos = if l.is_empty() { ptr::from_ref(&l.head) } else { l.head.next.get() };
+        Walk { owner, list, pos, _t: PhantomData }
+    }
+
+    fn head(&mut self) -> *const ListHead {
+        &(self.list)(&mut *self.owner).head
+    }
+
+    /// The next item, with @owner until the step after.
+    pub fn next(&mut self) -> Option<(&mut O, &'a T)> {
+        if ptr::eq(self.pos, self.head()) {
+            return None;
+        }
+        let item = unsafe { List::<T, OFFSET>::item(self.pos) };
+        self.pos = unsafe { (*self.pos).next.get() };
+        Some((&mut *self.owner, item))
+    }
+
+    /// The list turned so the walk's next item is first, the order otherwise
+    /// kept - a CLOCK hand: list_move_tail(head, next). At the end, as it was.
+    pub fn rotate(&mut self) {
+        let head = self.head();
+        if ptr::eq(self.pos, head) {
+            return;
+        }
+        unsafe {
+            (*head).del_init();
+            (*self.pos).add_tail(&*head);
+        }
+    }
+}

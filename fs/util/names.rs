@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: GPL-2.0
+//! What an enum is named: Names, which #[bch_enum] implements for each, by
+//! its variants' names.
+//!
+//! A static description, not a visitor: ENTRIES is each variant's name and
+//! value - a flags type's, its bit - and a value with none is "(unknown 7)".
+//! Free to make, as it's only data; a dense table by
+//! value, as C's string tables are, is names_by_value!(T), made where it's
+//! wanted.
+//!
+//! What prints them is generic code over that, not code per enum: #[bch_enum]'s
+//! ToText for an open enum is a call to prt_name(), one copy, and #[inline] -
+//! an enum nothing prints costs nothing.
+
+use core::ffi::CStr;
+use core::marker::PhantomData;
+
+use crate::util::{Join, Printbuf, ToText};
+
+pub trait Names {
+    /// Each labelled variant's name and value - a flags type's, its bit - in
+    /// the list's order.
+    const ENTRIES: &'static [(&'static str, u64)];
+}
+
+/// @v's name in @entries.
+pub fn name_of(entries: &[(&'static str, u64)], v: u64) -> Option<&'static str> {
+    entries.iter().find(|&&(_, e)| e == v).map(|&(n, _)| n)
+}
+
+/// The value named @name in @entries.
+pub fn value_of(entries: &[(&'static str, u64)], name: &str) -> Option<u64> {
+    entries.iter().find(|&&(n, _)| n == name).map(|&(_, v)| v)
+}
+
+/// @v's name in @entries, or "(unknown @v)".
+pub fn prt_name(out: &mut Printbuf, entries: &[(&'static str, u64)], v: u64) {
+    match name_of(entries, v) {
+        Some(name) => write!(out, "{name}"),
+        None       => write!(out, "(unknown {v})"),
+    };
+}
+
+/// The names of the bits set in @v, comma separated.
+pub fn prt_flags(out: &mut Printbuf, entries: &[(&'static str, u64)], v: u64) {
+    let set = entries.iter().filter(|&&(_, bit)| bit < 64 && v & 1 << bit != 0);
+    write!(out, "{}", Join(",", set.map(|&(name, _)| name)));
+}
+
+/// The names of @T's values, indexed by value - "" for a value none has: a
+/// table where one's wanted, for an enum whose values are dense - an option's
+/// choices, C's string tables. Built at compile time: two names for one value
+/// fail the build.
+#[macro_export]
+macro_rules! names_by_value {
+    ($t:ty) => {{
+        const N: usize = $crate::util::names::table_len(<$t as $crate::util::names::Names>::ENTRIES);
+        const T: [&str; N] = $crate::util::names::by_value(<$t as $crate::util::names::Names>::ENTRIES);
+        &T
+    }};
+}
+
+/// The length a table of @entries needs: the largest value, plus one.
+pub const fn table_len(entries: &[(&'static str, u64)]) -> usize {
+    let mut len = 0;
+    let mut i = 0;
+    while i < entries.len() {
+        if entries[i].1 as usize + 1 > len {
+            len = entries[i].1 as usize + 1;
+        }
+        i += 1;
+    }
+    len
+}
+
+/// @entries' names, each at its value.
+pub const fn by_value<const N: usize>(entries: &[(&'static str, u64)]) -> [&'static str; N] {
+    let mut names = [""; N];
+    let mut i = 0;
+    while i < entries.len() {
+        let (name, v) = entries[i];
+        assert!(names[v as usize].is_empty(), "two names for one value");
+        names[v as usize] = name;
+        i += 1;
+    }
+    names
+}
+
+/// A flags type's bit, for @mask: a flag is one bit.
+pub const fn bit(mask: u64) -> u64 {
+    assert!(mask.is_power_of_two(), "a flag that isn't one bit");
+    mask.trailing_zeros() as u64
+}
+
+/// The values set in @mask - a bit each - by name, comma separated: a set of
+/// @T, a btree id mask's ids.
+#[inline]
+pub fn prt_set<T: Names>(out: &mut Printbuf, mask: u64) {
+    prt_flags(out, T::ENTRIES, mask)
+}
+
+/// prt_set(), for a format string: `prt!(out, "{}", set::<T>(mask))`.
+pub fn set<T: Names>(mask: u64) -> Set<T> {
+    Set(mask, PhantomData)
+}
+
+pub struct Set<T>(u64, PhantomData<T>);
+
+impl<T: Names> ToText for Set<T> {
+    fn to_text(&self, out: &mut Printbuf) {
+        prt_set::<T>(out, self.0)
+    }
+}
+
+// ── As C strings ─────────────────────────────────────────────────────────
+
+/// The length of @entries' names, each NUL terminated.
+pub const fn nul_len(entries: &[(&str, u64)]) -> usize {
+    let mut len = 0;
+    let mut i = 0;
+    while i < entries.len() {
+        len += entries[i].0.len() + 1;
+        i += 1;
+    }
+    len
+}
+
+/// @entries' names, each NUL terminated, in order.
+pub const fn nul_names<const B: usize>(entries: &[(&str, u64)]) -> [u8; B] {
+    let mut buf = [0; B];
+    let (mut i, mut at) = (0, 0);
+    while i < entries.len() {
+        let name = entries[i].0.as_bytes();
+        let mut j = 0;
+        while j < name.len() {
+            buf[at + j] = name[j];
+            j += 1;
+        }
+        at += name.len() + 1;
+        i += 1;
+    }
+    buf
+}
+
+/// @T's names as C strings, by value - "" for a value none has: for what
+/// wants &CStr, sysfs's file names. Built at compile time: the names, NUL
+/// terminated, in a static of their own, and the table into it.
+#[macro_export]
+macro_rules! cstr_names {
+    ($t:ty) => {{
+        const E: &[(&str, u64)] = <$t as $crate::util::names::Names>::ENTRIES;
+        static BUF: [u8; $crate::util::names::nul_len(E)] = $crate::util::names::nul_names(E);
+        $crate::util::names::cstr_table::<{ $crate::util::names::table_len(E) }>(&BUF, E)
+    }};
+}
+
+/// @entries' names, nul_names()'s @buf, as C strings, by value.
+pub const fn cstr_table<const N: usize>(buf: &'static [u8], entries: &[(&str, u64)]) -> [&'static CStr; N] {
+    let mut t = [c""; N];
+    let (mut i, mut at) = (0, 0);
+    while i < entries.len() {
+        t[entries[i].1 as usize] = match CStr::from_bytes_until_nul(buf.split_at(at).1) {
+            Ok(name) => name,
+            Err(_)   => panic!("nul_names() without its NUL"),
+        };
+        at += entries[i].0.len() + 1;
+        i += 1;
+    }
+    t
+}

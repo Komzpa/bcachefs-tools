@@ -7,8 +7,9 @@ use std::process;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bch_bindgen::c::bch_ioctl_query_counters;
-use bcachefs_kernel::sb::io::{COUNTERS, CounterInfo};
+use bcachefs_kernel::c::bch_ioctl_query_counters;
+use bcachefs_kernel::sb::counters::{COUNTERS, CounterInfo};
+use bcachefs_kernel::util::vstructs::Head;
 use clap::Parser;
 use crossterm::{
     cursor,
@@ -30,15 +31,14 @@ const BCH_IOCTL_QUERY_COUNTERS_MOUNT: u16 = 1 << 0;
 // ioctl query
 
 fn read_counters(fd: std::os::fd::BorrowedFd, flags: u16, nr_stable: u16) -> Result<Vec<u64>> {
-    let mut buf = IoctlBuf::<bch_ioctl_query_counters>::new::<u64>(nr_stable as usize);
+    let mut buf = IoctlBuf::<Head<bch_ioctl_query_counters>>::new(nr_stable as usize);
     let hdr = buf.hdr_mut();
     hdr.nr = nr_stable;
     hdr.flags = flags;
 
     unsafe { ioctl_ptr::<BCH_IOCTL_QUERY_COUNTERS>(fd, buf.as_mut_ptr())? };
 
-    let nr = (buf.hdr().nr as usize).min(nr_stable as usize);
-    Ok(unsafe { buf.hdr().d.as_slice(nr) }.to_vec())
+    Ok(buf.get()?.d.to_vec())
 }
 
 // Per-device IO from sysfs (io_done is JSON: {"read": {...}, "write": {...}}, values in bytes)
@@ -227,7 +227,7 @@ impl Drop for TraceView {
 }
 
 fn render_trace(tv: &mut TraceView, stdout: &mut io::Stdout) -> io::Result<()> {
-    let (_, term_h) = terminal::size().unwrap_or((120, 40));
+    let (_, term_h) = crate::util::terminal_size(io::stdout()).unwrap_or((120, 40));
     let visible = (term_h as usize).saturating_sub(3).max(1);
     let total = tv.lines.len();
 
@@ -336,7 +336,7 @@ impl TopState {
         name_mode: DeviceNameMode,
     ) -> Result<Self> {
         let ioctl_fd = handle.ioctl_fd();
-        let nr_stable = COUNTERS.iter().map(|c| c.stable_id).max().unwrap_or(0) + 1;
+        let nr_stable = bcachefs_kernel::c::PersistentCounterStable::NR as u16;
 
         let mount_vals = read_counters(ioctl_fd, BCH_IOCTL_QUERY_COUNTERS_MOUNT, nr_stable)?;
         let start_vals = read_counters(ioctl_fd, 0, nr_stable)?;
@@ -490,7 +490,7 @@ fn build_frame(state: &TopState, curr: &[u64], dev_io: &[DevIoEntry])
 fn render(state: &mut TopState, curr: &[u64], dev_io: &[DevIoEntry], stdout: &mut io::Stdout)
     -> io::Result<usize>
 {
-    let (_, term_h) = terminal::size().unwrap_or((120, 40));
+    let (_, term_h) = crate::util::terminal_size(io::stdout()).unwrap_or((120, 40));
     let visible = (term_h as usize).saturating_sub(1).max(1);
 
     let (lines, cursor_line, total_rows) = build_frame(state, curr, dev_io);
@@ -572,7 +572,7 @@ fn run_non_interactive(
     name_mode: DeviceNameMode,
 ) -> Result<()> {
     let ioctl_fd   = handle.ioctl_fd();
-    let nr_stable  = COUNTERS.iter().map(|c| c.stable_id).max().unwrap_or(0) + 1;
+    let nr_stable  = bcachefs_kernel::c::PersistentCounterStable::NR as u16;
     let mount_vals = read_counters(ioctl_fd, BCH_IOCTL_QUERY_COUNTERS_MOUNT, nr_stable)?;
     let sysfs_path = sysfs_path_from_fd(handle.sysfs_fd())?;
 
@@ -660,7 +660,7 @@ fn run_interactive(
 
         if event::poll(Duration::from_secs(state.interval_secs as u64))? {
             if let Event::Key(key) = event::read()? {
-                let (_, term_h) = terminal::size().unwrap_or((120, 40));
+                let (_, term_h) = crate::util::terminal_size(io::stdout()).unwrap_or((120, 40));
                 let page_step = (term_h as usize).saturating_sub(1).max(1);
 
                 state.status = None;    // any key clears a transient message

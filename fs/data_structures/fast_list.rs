@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! Fast, unordered lists - add, remove and walk, all lockless: a slot each,
+//! in a radix tree of item pointers. Slot numbers come from an IDA through a
+//! per-CPU cache of free ones, so only refilling or spilling a cache takes
+//! the IDA's lock.
+//!
+//! A slot can be had before its item - get_slot() - to take the allocation
+//! failure early, and filled where failing isn't an option: Slot::set().
+//! Slot 0 is never handed out: an index of 0 is no slot, which remove()
+//! ignores.
+//!
+//! A cache is changed with interrupts off - an IrqGuard - as items come off
+//! in bio completions. It holds 31: a refill gets up to 16, and a full one
+//! spills 16 back. A refill allocates with interrupts on, so the cache may
+//! have been refilled meanwhile: what doesn't fit goes back to the IDA, and
+//! the cache, full, has a slot to give.
+//!
+//! The walk is items_from(): under RCU, the slots read as they change. add() publishes the item with a
+//! release, which items_from()'s acquire pairs with; remove() is a plain
+//! store of NULL.
+
+#![allow(non_camel_case_types)]
+
+use crate::c;
+use crate::util::alloc::AllocError;
+use crate::os::percpu::{free_percpu, IrqGuard, PerCpu, PerCpuRef};
+use crate::util::rcu::ReadGuard;
+use crate::data_structures::array_vec::ArrayVec;
+use core::ffi::c_void;
+use core::iter;
+use core::mem::ManuallyDrop;
+use core::ptr::{null_mut, NonNull};
+use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use cstruct_macros::MaybeZeroable;
+use crate::data_structures::genradix::SharedGenRadix;
+use crate::data_structures::ida::Ida;
+
+#[repr(C)]
+#[derive(MaybeZeroable)]
+pub struct fast_list {
+    /* the items, by slot: allocated by any CPU at once */
+    pub items: SharedGenRadix<Item>,
+    pub slots_allocated: Ida,
+    /* set by init() and exit(), which take the list shared, as C's pointer is */
+    buffer: AtomicPtr<Cache>,
+}
+
+/// A slot's item, C's void *: other CPUs change it as it's read.
+#[repr(transparent)]
+pub struct Item(AtomicPtr<c_void>);
+
+// SAFETY: zeroed is null, no item
+unsafe impl ::pin_init::Zeroable for Item {}
+crate::genradix_entry!(Item);
+
+/// What a refill gets, and a full cache spills: half of it.
+const BATCH: usize = 16;
+
+/// A CPU's cache of free slots: with its count, 128 bytes.
+struct Cache(ArrayVec<u32, 31>);
+
+// SAFETY: zeroed is empty - an ArrayVec is its length and its elements'
+// MaybeUninits
+unsafe impl ::pin_init::Zeroable for Cache {}
+
+impl c::fast_list {
+    /// @f on this CPU's cache, interrupts off.
+    fn with_cache<R>(&self, f: impl FnOnce(&mut ArrayVec<u32, 31>) -> R) -> R {
+        let irq = IrqGuard::new();
+        // SAFETY: init()'s Caches, freed by exit() after the list's last use
+        let caches = unsafe { PerCpuRef::<Cache>::from_raw(self.buffer.load(Relaxed)) };
+        // SAFETY: only this CPU's own uses touch its copy, which interrupts
+        // off keeps to this one
+        f(&mut unsafe { caches.this_cpu(&irq).as_mut() }.0)
+    }
+
+    fn free_slots(&self, idxs: impl IntoIterator<Item = u32>) {
+        for idx in idxs {
+            self.slots_allocated.free(idx);
+        }
+    }
+
+    /// @idx's slot: get_idx() allocated its node.
+    fn slot(&self, idx: u32) -> &AtomicPtr<c_void> {
+        &self.items.get(idx as usize).expect("a fast_list slot get_idx() didn't allocate").0
+    }
+
+    /// The items from slot @idx on, with their slots. Other CPUs change the
+    /// slots as it's read: each is read once, atomically.
+    ///
+    /// XXX: an item is only safe to use if it's freed a grace period after
+    /// removal, and nothing here says so. Once the owners are Rust: fast_list<T>,
+    /// items &'g T, with an unsafe marker on T the owner asserts that with.
+    /// async_objs' items don't hold to it today: see debug/async_objs.rs.
+    pub fn items_from<'g>(&'g self, idx: usize, _rcu: &'g ReadGuard)
+        -> impl Iterator<Item = (usize, NonNull<c_void>)> + 'g
+    {
+        self.items.iter_from(idx).filter_map(|(i, slot)| NonNull::new(slot.0.load(Acquire)).map(|item| (i, item)))
+    }
+
+    /// A new slot from the IDA, its radix node allocated.
+    fn alloc_idx(&self) -> Option<u32> {
+        let idx = self.slots_allocated.alloc_range(1, i32::MAX as u32).ok()?;
+        if self.items.prealloc(idx as usize).is_err() {
+            self.free_slots([idx]);
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// A slot for an item to be set later, its allocation failing now if it's
+    /// to fail - as the caller's memalloc scope allows.
+    pub fn get_slot(&self) -> Result<Slot<'_>, AllocError> {
+        Ok(Slot { list: self, idx: self.get_idx()? })
+    }
+
+    fn get_idx(&self) -> Result<u32, AllocError> {
+        if let Some(idx) = self.with_cache(|lp| lp.pop()) {
+            return Ok(idx);
+        }
+
+        let mut got: ArrayVec<u32, BATCH> = iter::from_fn(|| self.alloc_idx()).take(BATCH).collect();
+        let idx = self.with_cache(|lp| {
+            let fit = got.len().min(lp.remaining_capacity());
+            lp.extend(got.drain(got.len() - fit..));
+            lp.pop()
+        });
+        // what didn't fit - the cache was refilled meanwhile - goes back
+        self.free_slots(got);
+        idx.ok_or(AllocError)
+    }
+
+    /// Gives back a slot get_idx() handed out, never set.
+    fn put_idx(&self, idx: u32) {
+        if idx == 0 {
+            return;
+        }
+
+        let spill = self.with_cache(|lp| {
+            let spill: ArrayVec<u32, BATCH> =
+                if lp.is_full() { lp.drain(lp.len() - BATCH..).collect() } else { ArrayVec::new() };
+            lp.push(idx);
+            spill
+        });
+        self.free_slots(spill);
+    }
+
+    /// @item in a new slot: the slot, for remove().
+    pub fn add(&self, item: NonNull<c_void>) -> Result<u32, AllocError> {
+        Ok(self.get_slot()?.set(item))
+    }
+
+    /// @item in slot @idx, a Slot's into_idx().
+    pub fn set(&self, idx: u32, item: NonNull<c_void>) {
+        self.slot(idx).store(item.as_ptr(), Release);
+    }
+
+    /// Empties slot @idx, and gives it back.
+    pub fn remove(&self, idx: u32) {
+        if idx == 0 {
+            return;
+        }
+        self.slot(idx).store(null_mut(), Relaxed);
+        self.put_idx(idx);
+    }
+
+    /// init()ed, and not exit()ed since.
+    pub fn is_made(&self) -> bool {
+        !self.buffer.load(Relaxed).is_null()
+    }
+
+    /// # Safety
+    /// Nothing else is using it: it's zeroed, or exit()ed.
+    pub unsafe fn init(&self) -> Result<(), AllocError> {
+        unsafe { self.slots_allocated.init_zeroed() };
+        self.buffer.store(PerCpu::<Cache>::alloc()?.into_raw(), Relaxed);
+        Ok(())
+    }
+
+    /// Frees what init() and the list allocated; every item should be off it.
+    ///
+    /// # Safety
+    /// Nothing is using it, or will after - but init() again.
+    pub unsafe fn exit(&self) {
+        let buffer = self.buffer.swap(null_mut(), Relaxed);
+        // never init()ed - its ida's lock not even initialized - or init()
+        // failed: no slot was handed out
+        if buffer.is_null() {
+            return;
+        }
+
+        // SAFETY: init()'s, and no CPU's using it
+        for lp in unsafe { PerCpuRef::<Cache>::from_raw(buffer) }.cpus() {
+            self.free_slots(unsafe { lp.as_mut() }.0.drain(..));
+        }
+        unsafe { free_percpu(buffer.cast()) };
+
+        // a slot still allocated is an item still on the list
+        crate::warn_on!(self.slots_allocated.find_first().is_some());
+
+        self.slots_allocated.destroy();
+        unsafe { self.items.free() };
+    }
+}
+
+/// A slot had before its item, empty: given back if it's dropped so.
+#[must_use = "a slot dropped is given back"]
+pub struct Slot<'l> {
+    list: &'l c::fast_list,
+    idx:  u32,
+}
+
+impl Slot<'_> {
+    /// @item in it: its index, for remove().
+    pub fn set(self, item: NonNull<c_void>) -> u32 {
+        let list = self.list;
+        let idx = self.into_idx();
+        list.set(idx, item);
+        idx
+    }
+
+    /// Its index, the slot kept: for an owner that set()s or remove()s it
+    /// by index, later.
+    pub fn into_idx(self) -> u32 {
+        ManuallyDrop::new(self).idx
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.list.put_idx(self.idx)
+    }
+}

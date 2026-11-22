@@ -1,15 +1,13 @@
 use std::ops::ControlFlow;
 
 use anyhow::{bail, Result};
-use bcachefs_kernel::{btree_id, c};
-use bcachefs_kernel::btree::bkey::BkeySC;
+use bcachefs_kernel::c;
+use bcachefs_kernel::btree::bkey::prelude::*;
 use bcachefs_kernel::btree::iter::BtreeIter;
 use bcachefs_kernel::btree::iter::BtreeIterFlags;
 use bcachefs_kernel::btree::iter::BtreeNodeIter;
-use bcachefs_kernel::btree::iter::BtreeTrans;
 use bcachefs_kernel::fs::Fs;
-use bcachefs_kernel::opt_set;
-use bch_bindgen::c::bch_degraded_actions;
+use bcachefs_kernel::c::DegradedAction;
 use clap::Parser;
 use std::io::{stdout, IsTerminal};
 
@@ -17,9 +15,10 @@ use crate::logging;
 use crate::device_scan::OpenedFs;
 use crate::wrappers::handle::BcachefsHandle;
 use crate::wrappers::online_iter::{OnlineBtreeIter, OnlineIterFlags};
+use bcachefs_kernel::format::{Bpos, Btree, BkeyType};
 
 fn list_keys(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
-    let trans = BtreeTrans::new(fs);
+    let trans = bcachefs_kernel::btree_trans!(fs);
 
     let mut flags = BtreeIterFlags::PREFETCH;
 
@@ -35,27 +34,27 @@ fn list_keys(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
         flags,
     );
 
-    iter.for_each(&trans, |k| {
+    iter.for_each(&trans, |_, _, k| {
         if k.k.p > opt.end {
-            return ControlFlow::Break(());
+            return Ok(ControlFlow::Break(()));
         }
 
         if let Some(ty) = opt.bkey_type {
             if k.k.type_ != ty.0 as u8 {
-                return ControlFlow::Continue(());
+                return Ok(ControlFlow::Continue(()));
             }
         }
 
         println!("{}", k.to_text(fs));
-        ControlFlow::Continue(())
+        Ok(ControlFlow::Continue(()))
     })?;
 
     Ok(())
 }
 
 fn list_btree_formats(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
-    let trans = BtreeTrans::new(fs);
-    for level in opt.level..(c::BTREE_MAX_DEPTH as u32) {
+    let trans = bcachefs_kernel::btree_trans!(fs);
+    for level in opt.level..c::BTREE_MAX_DEPTH {
         let mut iter = BtreeNodeIter::new(
             &trans,
             opt.btree,
@@ -66,12 +65,13 @@ fn list_btree_formats(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
         );
 
         iter.for_each(&trans, |b| {
-            if b.key.k.p > opt.end {
-                return ControlFlow::Break(());
+            let contents = b.contents();
+            if contents.key.k.p > opt.end {
+                return Ok(ControlFlow::Break(()));
             }
 
             println!("{}", b.to_text(fs));
-            ControlFlow::Continue(())
+            Ok(ControlFlow::Continue(()))
         })?;
     }
 
@@ -79,8 +79,8 @@ fn list_btree_formats(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
 }
 
 fn list_btree_nodes(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
-    let trans = BtreeTrans::new(fs);
-    for level in opt.level..(c::BTREE_MAX_DEPTH as u32) {
+    let trans = bcachefs_kernel::btree_trans!(fs);
+    for level in opt.level..c::BTREE_MAX_DEPTH {
         let mut iter = BtreeNodeIter::new(
             &trans,
             opt.btree,
@@ -91,12 +91,13 @@ fn list_btree_nodes(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
         );
 
         iter.for_each(&trans, |b| {
-            if b.key.k.p > opt.end {
-                return ControlFlow::Break(());
+            let contents = b.contents();
+            if contents.key.k.p > opt.end {
+                return Ok(ControlFlow::Break(()));
             }
 
-            println!("{}", BkeySC::from(&b.key).to_text(fs));
-            ControlFlow::Continue(())
+            println!("{}", contents.key_i().to_text(fs));
+            Ok(ControlFlow::Continue(()))
         })?;
     }
 
@@ -104,8 +105,8 @@ fn list_btree_nodes(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
 }
 
 fn list_nodes_ondisk(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
-    let trans = BtreeTrans::new(fs);
-    for level in opt.level..(c::BTREE_MAX_DEPTH as u32) {
+    let trans = bcachefs_kernel::btree_trans!(fs);
+    for level in opt.level..c::BTREE_MAX_DEPTH {
         let mut iter = BtreeNodeIter::new(
             &trans,
             opt.btree,
@@ -116,12 +117,13 @@ fn list_nodes_ondisk(fs: &Fs, opt: &Cli) -> anyhow::Result<()> {
         );
 
         iter.for_each(&trans, |b| {
-            if b.key.k.p > opt.end {
-                return ControlFlow::Break(());
+            let contents = b.contents();
+            if contents.key.k.p > opt.end {
+                return Ok(ControlFlow::Break(()));
             }
 
             println!("{}", b.ondisk_to_text(fs));
-            ControlFlow::Continue(())
+            Ok(ControlFlow::Continue(()))
         })?;
     }
 
@@ -197,12 +199,12 @@ pub struct Cli {
     mode: Mode,
 
     /// Btree to list from
-    #[arg(short, long, default_value_t=btree_id::extents)]
-    btree: c::btree_id,
+    #[arg(short, long, default_value_t=Btree::extents)]
+    btree: Btree,
 
     /// Bkey type to list
     #[arg(short = 'k', long)]
-    bkey_type: Option<c::bch_bkey_type>,
+    bkey_type: Option<BkeyType>,
 
     /// Btree depth to descend to (0 == leaves)
     #[arg(short, long, default_value_t = 0)]
@@ -210,11 +212,11 @@ pub struct Cli {
 
     /// Start position to list from
     #[arg(short, long, default_value = "POS_MIN")]
-    start: c::bpos,
+    start: Bpos,
 
     /// End position
     #[arg(short, long, default_value = "SPOS_MAX")]
-    end: c::bpos,
+    end: Bpos,
 
     /// Check (fsck) the filesystem first
     #[arg(short, long)]
@@ -236,28 +238,20 @@ pub struct Cli {
 fn cmd_list_inner(opt: &Cli) -> anyhow::Result<()> {
     let mut fs_opts = c::bch_opts::default();
 
-    opt_set!(fs_opts, noexcl, 1);
-    opt_set!(fs_opts, nochanges, 1);
-    opt_set!(fs_opts, read_only, 1);
-    opt_set!(fs_opts, norecovery, 1);
-    opt_set!(fs_opts, degraded, bch_degraded_actions::BCH_DEGRADED_very as u8);
-    opt_set!(
-        fs_opts,
-        errors,
-        c::bch_error_actions::BCH_ON_ERROR_continue as u8
-    );
+    fs_opts.set_noexcl(true);
+    fs_opts.set_nochanges(true);
+    fs_opts.set_read_only(true);
+    fs_opts.set_norecovery(true);
+    fs_opts.set_degraded(DegradedAction::very);
+    fs_opts.set_errors(c::ErrorAction::continue_);
 
     if opt.fsck {
-        opt_set!(
-            fs_opts,
-            fix_errors,
-            c::fsck_err_opts::FSCK_FIX_yes as u8
-        );
-        opt_set!(fs_opts, norecovery, 0);
+        fs_opts.set_fix_errors(c::FsckErrOpt::yes as u8);
+        fs_opts.set_norecovery(false);
     }
 
     if opt.verbose > 0 {
-        opt_set!(fs_opts, verbose, 1);
+        fs_opts.set_verbose(true);
     }
 
     match crate::device_scan::open_online_or_offline(&opt.devices, fs_opts)? {
@@ -274,7 +268,7 @@ fn cmd_list_inner(opt: &Cli) -> anyhow::Result<()> {
             let devs = handle.member_devices()
                 .map_err(|e| anyhow::anyhow!("getting member devices from sysfs: {}", e))?;
 
-            opt_set!(fs_opts, nostart, 1);
+            fs_opts.set_nostart(true);
             let fs = crate::device_scan::open_scan(&devs, fs_opts)
                 .map_err(|e| anyhow::anyhow!(
                     "opening {:?} (noexcl/nostart, for formatting keys): {}", devs, e))?;

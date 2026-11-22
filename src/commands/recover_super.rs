@@ -1,31 +1,21 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::os::fd::AsFd;
 use anyhow::{anyhow, bail, Result};
+use bcachefs_kernel::btree::bkey::ValidateFlags;
+use bcachefs_kernel::os::blkdev;
 use bcachefs_kernel::c;
-use bcachefs_kernel::opt_set;
-use bch_bindgen::sb::io as sb_io;
-use bch_bindgen::sb::sb_field_type;
+use bcachefs_kernel::util::vstructs::Head;
+use bcachefs_kernel::sb::SbFieldType;
 use clap::Parser;
 
-use crate::util::{file_size, parse_human_size};
-use bcachefs_kernel::sb::io::{SbBuf, SbParseError, BCACHE_MAGIC, BCHFS_MAGIC};
-use bcachefs_kernel::util::printbuf::Printbuf;
-use crate::wrappers::super_io::{self, SUPERBLOCK_SIZE_DEFAULT};
-
-// bch2_sb_validate's flags parameter is a bch_validate_flags enum in bindgen,
-// but C passes 0 (no flags). Since 0 isn't a valid Rust enum variant, declare
-// our own FFI binding with the correct ABI type.
-extern "C" {
-    fn bch2_sb_validate(
-        sb: *mut c::bch_sb,
-        opts: *mut c::bch_opts,
-        offset: u64,
-        flags: u32,
-        err: *mut c::printbuf,
-    ) -> i32;
-}
+use crate::util::parse_human_size;
+use bcachefs_kernel::sb::io::{read_super, SbBuf, BCACHE_MAGIC, BCHFS_MAGIC};
+use bcachefs_kernel::util::vstructs::Unvalidated;
+use bcachefs_kernel::sb::members::sb_member;
+use bcachefs_kernel::util::{HumanReadable, Printbuf};
+use crate::commands::format_util::{self, SUPERBLOCK_SIZE_DEFAULT};
+use bcachefs_kernel::sb::io::SbResize;
 
 /// Attempt to recover an overwritten superblock from backups
 #[derive(Parser, Debug)]
@@ -67,24 +57,17 @@ pub struct RecoverSuperCli {
 fn sb_last_mount_time(sb: &c::bch_sb) -> u64 {
     (0..sb.nr_devices as i32)
         .map(|i| {
-            let m = unsafe { c::bch2_sb_member_get(sb as *const _ as *mut _, i) };
-            u64::from_le(m.last_mount as u64)
+            let m = sb_member(sb, i as u32).unwrap_or_else(pin_init::zeroed);
+            m.last_mount.get()
         })
         .max()
         .unwrap_or(0)
 }
 
-fn validate_sb(sb: &mut c::bch_sb, offset_sectors: u64) -> (i32, Printbuf) {
+fn validate_sb(sb: SbBuf<Unvalidated>, offset_sectors: u64) -> Result<SbBuf, Printbuf> {
     let mut err = Printbuf::new();
-    let mut opts = c::bch_opts::default();
-    let ret = unsafe { bch2_sb_validate(sb, &mut opts, offset_sectors, 0, err.as_raw()) };
-    (ret, err)
-}
-
-fn prt_offset(offset: u64) -> Printbuf {
-    let mut hr = Printbuf::new();
-    hr.human_readable_u64(offset);
-    hr
+    sb.validate(&c::bch_opts::default(), offset_sectors, ValidateFlags::empty(), &mut err)
+        .map_err(|_| err)
 }
 
 fn probe_one_super(dev: &File, sb_size: usize, offset: u64, verbose: bool) -> Option<SbBuf> {
@@ -94,14 +77,10 @@ fn probe_one_super(dev: &File, sb_size: usize, offset: u64, verbose: bool) -> Op
         return None;
     }
 
-    let mut sb = SbBuf::from_bytes(&buf).ok()?;
-    let (ret, _err) = validate_sb(sb.sb_mut(), offset >> 9);
-    if ret != 0 {
-        return None;
-    }
+    let sb = validate_sb(SbBuf::from_bytes(&buf).ok()?, offset >> 9).ok()?;
 
     if verbose {
-        println!("found superblock at {}", prt_offset(offset));
+        println!("found superblock at {}", HumanReadable(offset));
     }
 
     Some(sb)
@@ -118,7 +97,7 @@ fn probe_sb_range(dev: &File, start: u64, end: u64, verbose: bool) -> Vec<SbBuf>
         return Vec::new();
     }
 
-    let magic_off = std::mem::offset_of!(c::bch_sb, magic);
+    let magic_off = std::mem::offset_of!(Head<c::bch_sb>, magic);
     let mut results = Vec::new();
     let mut offset = 0usize;
 
@@ -130,30 +109,26 @@ fn probe_sb_range(dev: &File, start: u64, end: u64, verbose: bool) -> Vec<SbBuf>
             continue;
         }
 
-        let mut sb = match SbBuf::from_bytes(&buf[offset..]) {
+        let sb = match SbBuf::from_bytes(&buf[offset..]) {
             Ok(sb) => sb,
-            Err(e @ (SbParseError::ExtentBeyondBuffer { .. } |
-                     SbParseError::FieldBeyondSb { .. } |
-                     SbParseError::FieldBadU64s { .. })) => {
+            Err(e) => {
                 eprintln!("found sb {} {}", start + offset as u64, e);
-                offset += 512;
-                continue;
-            }
-            Err(_) => {
                 offset += 512;
                 continue;
             }
         };
 
-        let (ret, err) = validate_sb(sb.sb_mut(), (start + offset as u64) >> 9);
-        if ret != 0 {
-            eprintln!("found sb {} that failed to validate: {}", start + offset as u64, err);
-            offset += 512;
-            continue;
-        }
+        let sb = match validate_sb(sb, (start + offset as u64) >> 9) {
+            Ok(sb) => sb,
+            Err(err) => {
+                eprintln!("found sb {} that failed to validate: {}", start + offset as u64, err);
+                offset += 512;
+                continue;
+            }
+        };
 
         if verbose {
-            println!("found superblock at {}", prt_offset(start + offset as u64));
+            println!("found superblock at {}", HumanReadable(start + offset as u64));
         }
 
         results.push(sb);
@@ -190,10 +165,10 @@ fn recover_from_scan(
 
 fn recover_from_member(src_device: &str, dev_idx: i32, dev_size: u64) -> Result<SbBuf> {
     let mut opts = c::bch_opts::default();
-    opt_set!(opts, noexcl, 1);
-    opt_set!(opts, nochanges, 1);
+    opts.set_noexcl(true);
+    opts.set_nochanges(true);
 
-    let mut src_sb = sb_io::read_super_opts(Path::new(src_device), opts)
+    let mut src_sb = read_super(&bcachefs_kernel::path_to_cstr(src_device), &mut opts, None)
         .map_err(|e| anyhow!("Error opening {}: {}", src_device, e))?;
 
     let nr_devices = src_sb.sb().nr_devices as i32;
@@ -202,22 +177,22 @@ fn recover_from_member(src_device: &str, dev_idx: i32, dev_size: u64) -> Result<
                            dev_idx, nr_devices));
     }
 
-    let m = unsafe { c::bch2_sb_member_get(src_sb.sb, dev_idx) };
+    let m = sb_member(src_sb.sb(), dev_idx as u32).unwrap_or_else(pin_init::zeroed);
     if m.uuid.b == [0u8; 16] {
         return Err(anyhow!("Member {} does not exist in source superblock", dev_idx));
     }
 
-    src_sb.field_delete(sb_field_type::journal);
-    src_sb.field_delete(sb_field_type::journal_v2);
+    src_sb.field_delete(SbFieldType::journal);
+    src_sb.field_delete(SbFieldType::journal_v2);
     src_sb.sb_mut().dev_idx = dev_idx as u8;
 
     // Read fields safely before layout mutation
     let sb = src_sb.sb();
-    let block_size = u16::from_le(sb.block_size) as u32;
-    let bucket_size = u16::from_le(m.bucket_size) as u32;
+    let block_size = sb.block_size.get() as u32;
+    let bucket_size = m.bucket_size.get() as u32;
     let sb_max_size = 1u32 << sb.layout.sb_max_size_bits;
 
-    super_io::sb_layout_init(
+    format_util::sb_layout_init(
         &mut src_sb.sb_mut().layout,
         block_size << 9,
         bucket_size << 9,
@@ -228,8 +203,7 @@ fn recover_from_member(src_device: &str, dev_idx: i32, dev_size: u64) -> Result<
     )?;
 
     // Copy to an owned buffer; src_sb's Drop will free the C allocation
-    SbBuf::from_bytes(src_sb.sb_bytes())
-        .map_err(|e| anyhow!("copying superblock from {}: {}", src_device, e))
+    Ok(SbBuf::from_sb(src_sb.sb()))
 }
 
 fn cmd_recover_super(cli: RecoverSuperCli) -> Result<()> {
@@ -264,7 +238,7 @@ fn cmd_recover_super(cli: RecoverSuperCli) -> Result<()> {
 
     let dev_size = match &cli.dev_size {
         Some(s) => parse_human_size(s)?,
-        None => file_size(&dev_file)?,
+        None => blkdev::size(dev_file.as_fd())?,
     };
 
     let mut sb_buf = if let Some(ref src) = cli.src_device {
@@ -274,14 +248,7 @@ fn cmd_recover_super(cli: RecoverSuperCli) -> Result<()> {
     };
 
     let mut buf = Printbuf::new();
-    unsafe {
-        buf.sb_to_text(
-            std::ptr::null_mut(),
-            sb_buf.sb(),
-            true,
-            sb_field_type::members_v2.bit(),
-        );
-    }
+    bcachefs_kernel::sb::io::sb_to_text(&mut buf, None, sb_buf.sb().as_unvalidated(), true, SbFieldType::members_v2.bit());
     println!("Found superblock:\n{}", buf);
 
     if cli.yes {
@@ -290,13 +257,11 @@ fn cmd_recover_super(cli: RecoverSuperCli) -> Result<()> {
         print!("Recover? ");
     }
 
-    if cli.yes || unsafe { bch_bindgen::c::ask_yn() } {
-        crate::wrappers::super_io::bch2_super_write(dev_file.as_raw_fd(), &mut sb_buf);
+    if cli.yes || crate::util::ask_yn() {
+        format_util::bch2_super_write(dev_file.as_fd(), sb_buf.sb_mut());
     }
 
-    let _ = std::process::Command::new("udevadm")
-        .args(["trigger", "--settle", &cli.device])
-        .status();
+    crate::commands::format_util::trigger_udev_for_paths(&[&cli.device]);
 
     if cli.src_device.is_some() {
         println!("Recovered device will no longer have a journal, please run fsck");

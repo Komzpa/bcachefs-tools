@@ -1,1282 +1,2428 @@
+#![allow(non_camel_case_types)]
+
+/* DOC_LATEX(btree-programmer-interface)
+ *
+ * This section describes the btree interface from a programmer's perspective:
+ * how to look up keys, iterate, and perform updates.
+ *
+ * \paragraph{Btrees and keys}
+ *
+ * Keys are indexed in a small number of btrees: one for extents, another for
+ * inodes, another for directory entries, and so on. New btree types can be
+ * added for new features without on-disk format changes---many features were
+ * added this way (e.g.\ erasure coding stripes, backpointers, accounting).
+ *
+ * The btree interface is iteration-oriented rather than lookup-oriented.
+ * Lookup is not exposed as a primitive because most usage involves iterating
+ * from a given position. The fundamental operation is: position an iterator,
+ * then peek at or advance through keys.
+ *
+ * \paragraph{Transactions}
+ *
+ * All btree operations go through a transaction (\texttt{struct btree\_trans}).
+ * A transaction provides:
+ *
+ * \begin{itemize}
+ * \item Atomic multi-key updates across any combination of btrees
+ * \item Automatic lock management and deadlock avoidance
+ * \item Restart handling when locks are contended
+ * \end{itemize}
+ *
+ * Transactions are allocated with \texttt{bch2\_trans\_get()} and released with
+ * \texttt{bch2\_trans\_put()}. Within a transaction, iterators are created with
+ * \texttt{bch2\_trans\_iter\_init()} specifying the btree ID and starting
+ * position.
+ *
+ * \paragraph{Basic iteration}
+ *
+ * The core iteration pattern:
+ *
+ * \begin{verbatim}
+ *     struct btree_iter iter;
+ *     struct bkey_s_c k;
+ *
+ *     bch2_trans_iter_init(trans, &iter, BTREE_ID_extents,
+ *                          POS(inode, offset), 0);
+ *
+ *     while ((k = bch2_btree_iter_peek(&iter)).k) {
+ *         // process key
+ *         bch2_btree_iter_advance(&iter);
+ *     }
+ *
+ *     bch2_trans_iter_exit(trans, &iter);
+ * \end{verbatim}
+ *
+ * The convenience macro \texttt{for\_each\_btree\_key()} wraps this pattern:
+ *
+ * \begin{verbatim}
+ *     for_each_btree_key(trans, iter, BTREE_ID_extents,
+ *                        POS(inode, 0), 0, k, ret)
+ *         printk("extent at %llu:%llu\n",
+ *                k.k->p.inode, k.k->p.offset);
+ * \end{verbatim}
+ *
+ * \paragraph{Lookup}
+ *
+ * Lookup can be implemented via iteration: position an iterator, peek, and
+ * check if the returned key matches:
+ *
+ * \begin{verbatim}
+ *     bch2_trans_iter_init(trans, &iter, BTREE_ID_inodes,
+ *                          POS(inum, 0), 0);
+ *     k = bch2_btree_iter_peek_slot(&iter);
+ *     if (k.k && k.k->type == KEY_TYPE_inode)
+ *         // found it
+ * \end{verbatim}
+ *
+ * The \texttt{peek\_slot()} variant returns a key at exactly the requested
+ * position, synthesizing a deleted key if no key exists there. This is useful
+ * for checking whether a specific slot is occupied.
+ *
+ * \paragraph{Updates}
+ *
+ * Updates are staged in the transaction and committed atomically:
+ *
+ * \begin{verbatim}
+ *     struct bkey_i_inode *inode = ...;
+ *
+ *     ret = bch2_trans_update(trans, &iter, &inode->k_i, 0);
+ *     if (ret)
+ *         return ret;
+ *
+ *     ret = bch2_trans_commit(trans, NULL, NULL, 0);
+ * \end{verbatim}
+ *
+ * Multiple updates can be staged before a single commit, and they will all
+ * be applied atomically. Updates to different btrees within the same
+ * transaction are also atomic.
+ *
+ * \paragraph{Restarts}
+ *
+ * Transactions may need to restart due to lock contention or other conflicts.
+ * The standard pattern uses \texttt{lockrestart\_do()}:
+ *
+ * \begin{verbatim}
+ *     ret = lockrestart_do(trans,
+ *         do_something(trans) ?:
+ *         bch2_trans_commit(trans, NULL, NULL, 0));
+ * \end{verbatim}
+ *
+ * This automatically retries the operation if a restart is needed. All code
+ * within the retry block must be idempotent---it may execute multiple times.
+ */
+
+/* DOC(btree-iterators)
+ *
+ * A btree iterator (`struct btree_iter`) maintains a full path from the root
+ * of a btree down to a specific key in a leaf node. At each level, the
+ * iterator holds a pointer to the btree node, a node-level iterator (which
+ * merges across the multiple sorted bsets within that node), and a lock
+ * sequence number for efficient relock-after-restart.
+ *
+ * The fundamental invariant is that `iter.pos` must always be consistent with
+ * the node iterators: at every level, the node iterator points to the first
+ * key >= `iter.pos`, and the previous key compares strictly less. This is the
+ * correct position for inserting a new key at `iter.pos`.
+ *
+ * Iterators support several modes: `peek()` returns the next key and advances
+ * `iter.pos` to match; `peek_slot()` returns the key at exactly `iter.pos`
+ * (synthesizing a deleted key for empty slots); `peek_prev()` iterates
+ * backwards. Extent iterators have special semantics: extents are indexed by
+ * their end position, so the first extent covering a range starting at
+ * `iter.pos` is found by searching for the first key strictly greater than
+ * `iter.pos`. When iterating over extents by slots, holes between extents are
+ * synthesized, guaranteeing that the returned keys exactly cover the keyspace
+ * with monotonically increasing positions.
+ *
+ * Multiple iterators within a transaction coexist without invalidating each
+ * other. On transaction restart, each iterator's saved position allows it to
+ * resume from where it left off.
+ */
+
 use super::bkey::*;
-use crate::alloc::buckets::DiskReservation;
+pub use super::types::{BtreeIter, BtreeTrans};
+pub use super::for_each::*;
+pub use super::trans_attempt::*;
+use crate::btree::journal_overlay;
+use crate::btree::node::BtreeNode;
+use crate::btree::path::{btree_path_level, BtreePath, KeyVal, LockedNode, Paths};
 use crate::c;
-use crate::errcode::{
-    BchError,
-    bch_err_throw,
-    bch_errcode,
-    errptr_to_result,
-    errptr_to_result_c,
-    ret_to_result_void as ret_to_result,
-};
+use crate::data::extents::{bch2_cut_back_s, bch2_cut_front_s};
+use crate::debug::params::debug_check_iterators;
+use crate::debug::trace::events;
+use crate::errcode::{BchError, Errcode};
 use crate::fs::Fs;
-#[cfg(feature = "std")]
-use crate::printbuf_to_formatter;
+use crate::prt;
+use crate::snapshots::snapshot::is_ancestor;
+use crate::util::{max_of, Printbuf};
 use crate::SPOS_MAX;
 use bitflags::bitflags;
-#[cfg(feature = "std")]
-use core::fmt;
+use core::cell::Cell;
+use core::ffi::c_ulong;
 use core::marker::PhantomData;
-use core::mem::{size_of, MaybeUninit};
-use core::ptr::NonNull;
-use core::slice;
-use core::ops::{ControlFlow, Deref};
-
-use c::bpos;
-
-pub struct BtreeTrans<'f> {
-    raw: *mut c::btree_trans,
-    fs:  &'f Fs,
-}
-
-impl<'f> BtreeTrans<'f> {
-    pub fn new(fs: &'f Fs) -> BtreeTrans<'f> {
-        unsafe {
-            BtreeTrans {
-                raw: &mut *c::__bch2_trans_get(fs.raw, 0),
-                fs,
-            }
-        }
-    }
-
-    fn begin_raw(&self) -> u32 {
-        unsafe { c::bch2_trans_begin(self.raw) }
-    }
-
-    pub fn begin<'a>(&'a self) -> TransAttempt<'a, 'f> {
-        TransAttempt {
-            trans:         self,
-            restart_count: self.begin_raw(),
-            t:             PhantomData,
-        }
-    }
-
-    pub fn verify_not_restarted(&self, restart_count: u32) {
-        unsafe {
-            if (*self.raw).restart_count != restart_count {
-                c::bch2_trans_restart_error(self.raw, restart_count);
-            }
-        }
-    }
-
-    /// Get the raw transaction pointer for passing to C functions.
-    pub fn raw(&self) -> *mut c::btree_trans {
-        self.raw
-    }
-
-    pub(crate) fn fs(&self) -> &'f Fs {
-        self.fs
-    }
-
-    pub fn unlock(&self) {
-        unsafe { c::bch2_trans_unlock(self.raw) };
-    }
-
-    pub fn unlock_long(&self) {
-        unsafe { c::bch2_trans_unlock_long(self.raw) };
-    }
-
-    /// Commit the transaction.
-    ///
-    /// Equivalent to the static inline bch2_trans_commit() which sets
-    /// disk_res/journal_seq then calls __bch2_trans_commit().
-    pub fn commit(
-        &self,
-        disk_res: Option<&DiskReservation<'_>>,
-        flags: CommitOpts,
-    ) -> Result<(), BchError> {
-        unsafe {
-            (*self.raw).disk_res = disk_res.map_or(core::ptr::null_mut(), |r| r.as_mut_ptr());
-        }
-        let ret = unsafe {
-            c::__bch2_trans_commit(self.raw, flags.to_c(), false)
-        };
-        crate::errcode::ret_to_result(ret).map(|_| ())
-    }
-}
-
-impl<'f> Drop for BtreeTrans<'f> {
-    fn drop(&mut self) {
-        unsafe {
-            // Clear any pending restart state — bch2_trans_put() BUG_ONs
-            // if the transaction is in restart, which can happen if Rust
-            // code propagates a restart error via ? and unwinds.
-            self.begin_raw();
-            c::bch2_trans_put(&mut *self.raw)
-        }
-    }
-}
-
-pub struct TransAttempt<'a, 't> {
-    trans:         &'a BtreeTrans<'t>,
-    restart_count: u32,
-    t:             PhantomData<&'a mut ()>,
-}
-
-pub enum TransError {
-    Restart(BchError),
-    Error(BchError),
-}
-
-pub type TransResult<'a, 't, T = ()> = Result<(TransAttempt<'a, 't>, T), TransError>;
-
-impl From<BchError> for TransError {
-    fn from(error: BchError) -> Self {
-        if error.matches(bch_errcode::BCH_ERR_transaction_restart) {
-            TransError::Restart(error)
-        } else {
-            TransError::Error(error)
-        }
-    }
-}
-
-fn retry_restart<T>(result: Result<T, TransError>) -> Result<Option<T>, BchError> {
-    match result {
-        Ok(v)                       => Ok(Some(v)),
-        Err(TransError::Restart(_)) => Ok(None),
-        Err(TransError::Error(e))   => Err(e),
-    }
-}
-
-pub struct TransBkey<'a, 't> {
-    ptr:      NonNull<c::bkey_i>,
-    buf_u64s: u32,
-    t:        PhantomData<&'a mut TransAttempt<'a, 't>>,
-}
-
-pub(crate) struct BtreeNodeRef {
-    raw: NonNull<c::btree>,
-}
-
-impl BtreeNodeRef {
-    pub(crate) fn level(&self) -> u32 {
-        unsafe { self.raw.as_ref().c.level.into() }
-    }
-
-    pub(crate) fn key(&self) -> &c::bkey_i {
-        unsafe { &self.raw.as_ref().key }
-    }
-
-    pub(crate) fn key_sc(&self) -> BkeySC<'_> {
-        self.key().into()
-    }
-
-    fn as_ptr(&self) -> *mut c::btree {
-        self.raw.as_ptr()
-    }
-}
-
-impl<'a, 't> TransAttempt<'a, 't> {
-    pub fn trans(&self) -> &'a BtreeTrans<'t> {
-        self.trans
-    }
-
-    /// Get the raw transaction pointer for passing to C functions.
-    pub fn raw(&self) -> *mut c::btree_trans {
-        self.trans.raw()
-    }
-
-    pub(crate) fn fs(&self) -> &Fs {
-        self.trans.fs()
-    }
-
-    pub fn verify_not_restarted(&self) {
-        self.trans.verify_not_restarted(self.restart_count);
-    }
-
-    pub fn commit(
-        self,
-        disk_res: Option<&DiskReservation<'_>>,
-        flags:    CommitOpts,
-    ) -> Result<Self, TransError> {
-        unsafe {
-            (*self.raw()).disk_res = disk_res.map_or(core::ptr::null_mut(), |r| r.as_mut_ptr());
-        }
-        // `lazy = false`: this is the regular commit, mirroring the C
-        // bch2_trans_commit() inline (the lazy variant is a separate path).
-        let ret = unsafe { c::__bch2_trans_commit(self.raw(), flags.to_c(), false) };
-        self.result(ret)
-    }
-
-    pub fn result(self, ret: i32) -> Result<Self, TransError> {
-        ret_to_result(ret)?;
-        Ok(self)
-    }
-
-    pub fn restart(self, error: bch_errcode) -> TransError {
-        TransError::Restart(bch_err_throw(error))
-    }
-
-    pub fn done<T>(self, value: T) -> TransResult<'a, 't, T> {
-        Ok((self, value))
-    }
-
-    pub fn result_value<T>(self, result: Result<T, BchError>) -> TransResult<'a, 't, T> {
-        self.done(result?)
-    }
-
-    pub fn try_do<F>(self, f: F) -> Result<Self, TransError>
-    where
-        F: FnOnce(&BtreeTrans<'t>) -> Result<(), BchError>,
-    {
-        f(self.trans)?;
-        Ok(self)
-    }
-
-    pub fn bkey_alloc(&self, u64s: u32) -> Result<TransBkey<'a, 't>, BchError> {
-        let bytes = u64s as usize * size_of::<u64>();
-        let ptr = unsafe { c::bch2_trans_kmalloc(self.raw(), bytes) };
-        let ptr = errptr_to_result(ptr)? as *mut c::bkey_i;
-
-        Ok(TransBkey {
-            ptr:      NonNull::new(ptr).expect("bch2_trans_kmalloc returned NULL"),
-            buf_u64s: u64s,
-            t:        PhantomData,
-        })
-    }
-
-    pub fn bkey_alloc_typed<K: BkeyInit>(&self) -> Result<TransBkey<'a, 't>, BchError> {
-        debug_assert_eq!(size_of::<K>() % size_of::<u64>(), 0);
-
-        let u64s = (size_of::<K>() / size_of::<u64>()) as u32;
-        let mut k = self.bkey_alloc(u64s)?;
-
-        unsafe {
-            let raw = k.as_mut() as *mut c::bkey_i as *mut K;
-            (*raw).init();
-        }
-
-        Ok(k)
-    }
-
-    pub fn bkey_copy(&self, k: &c::bkey_i) -> Result<TransBkey<'a, 't>, BchError> {
-        let mut dst = self.bkey_alloc(k.k.u64s as u32)?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                k as *const c::bkey_i as *const u8,
-                dst.as_mut() as *mut c::bkey_i as *mut u8,
-                k.k.u64s as usize * size_of::<u64>(),
-            );
-        }
-        Ok(dst)
-    }
-
-    pub fn bkey_reassemble(&self, k: BkeySC<'_>) -> Result<TransBkey<'a, 't>, BchError> {
-        const BKEY_U64S: usize = size_of::<c::bkey>() / size_of::<u64>();
-
-        let mut dst = self.bkey_alloc(k.k.u64s as u32)?;
-        let dst_key: &mut c::bkey_i = dst.as_mut();
-
-        unsafe {
-            core::ptr::copy_nonoverlapping(k.k, &mut dst_key.k, 1);
-            core::ptr::copy_nonoverlapping(
-                k.v as *const c::bch_val as *const u64,
-                &mut dst.as_mut_u64s()[BKEY_U64S] as *mut u64,
-                k.k.u64s as usize - BKEY_U64S,
-            );
-        }
-
-        Ok(dst)
-    }
-
-    /// bkey_reassemble() into a buffer with `val_u64s` of value space:
-    /// the copied value is zero-extended (or truncated) to the new size.
-    pub fn bkey_reassemble_resized(&self, k: BkeySC<'_>, val_u64s: usize)
-        -> Result<TransBkey<'a, 't>, BchError>
-    {
-        const BKEY_U64S: usize = size_of::<c::bkey>() / size_of::<u64>();
-
-        let mut dst = self.bkey_alloc((BKEY_U64S + val_u64s) as u32)?;
-        dst.as_mut_u64s().fill(0);
-
-        let copy_val = (k.k.u64s as usize - BKEY_U64S).min(val_u64s);
-        unsafe {
-            core::ptr::copy_nonoverlapping(k.k, &mut dst.k_i_mut().k, 1);
-            core::ptr::copy_nonoverlapping(
-                k.v as *const c::bch_val as *const u64,
-                &mut dst.as_mut_u64s()[BKEY_U64S] as *mut u64,
-                copy_val,
-            );
-        }
-        dst.k_mut().u64s = (BKEY_U64S + val_u64s) as u8;
-
-        Ok(dst)
-    }
-
-    /// A fresh key: bkey_init()ed header with `type_` at `pos`, and
-    /// `val_u64s` of zeroed value space.
-    pub fn bkey_alloc_init(&self, val_u64s: usize, type_: u8, pos: c::bpos)
-        -> Result<TransBkey<'a, 't>, BchError>
-    {
-        const BKEY_U64S: usize = size_of::<c::bkey>() / size_of::<u64>();
-
-        let mut k = self.bkey_alloc((BKEY_U64S + val_u64s) as u32)?;
-        k.as_mut_u64s().fill(0);
-        unsafe { c::bkey_init(k.k_mut()) };
-        k.k_mut().u64s = (BKEY_U64S + val_u64s) as u8;
-        k.k_mut().type_ = type_;
-        k.k_mut().p = pos;
-        Ok(k)
-    }
-
-    pub fn bkey_make_mut_noupdate(&self, k: BkeySC<'_>) -> Result<TransBkey<'a, 't>, BchError> {
-        let raw = c::bkey_s_c {
-            k: k.k,
-            v: k.v,
-        };
-        let ptr = unsafe { c::bch2_bkey_make_mut_noupdate(self.raw(), raw) };
-        let ptr = errptr_to_result(ptr)?;
-        let u64s = unsafe { (*ptr).k.u64s as u32 };
-
-        Ok(TransBkey {
-            ptr:      NonNull::new(ptr).expect("bch2_bkey_make_mut_noupdate returned NULL"),
-            buf_u64s: u64s,
-            t:        PhantomData,
-        })
-    }
-
-    pub fn update(
-        self,
-        iter:  &mut BtreeIter<'t>,
-        key:   TransBkey<'_, 't>,
-        flags: UpdateTriggerFlags,
-    ) -> Result<Self, TransError> {
-        let ret = unsafe {
-            c::bch2_trans_update_buf(
-                self.raw(),
-                &mut iter.raw,
-                key.as_ptr(),
-                key.buf_u64s,
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            )
-        };
-        self.result(ret)
-    }
-
-    pub fn insert(
-        self,
-        btree: impl Into<u32>,
-        key:   TransBkey<'_, 't>,
-        flags: UpdateTriggerFlags,
-    ) -> Result<Self, TransError> {
-        let ret = unsafe {
-            c::bch2_btree_insert_trans(
-                self.raw(),
-                c::btree_id::from_raw(btree.into()).expect("invalid btree id"),
-                key.as_ptr(),
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            )
-        };
-        self.result(ret)
-    }
-
-    pub fn insert_nonextent(
-        self,
-        btree: impl Into<u32>,
-        key:   TransBkey<'_, 't>,
-        flags: UpdateTriggerFlags,
-    ) -> Result<Self, TransError> {
-        let key_ref: &c::bkey_i = key.as_ref();
-        let ret = unsafe {
-            c::bch2_btree_insert_nonextent(
-                self.raw(),
-                c::btree_id::from_raw(btree.into()).expect("invalid btree id"),
-                key.as_ptr(),
-                key_ref.k.u64s as u32,
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            )
-        };
-        self.result(ret)
-    }
-
-    pub fn delete_at(
-        self,
-        iter:  &mut BtreeIter<'t>,
-        flags: UpdateTriggerFlags,
-    ) -> Result<Self, TransError> {
-        let ret = unsafe {
-            c::bch2_btree_delete_at(
-                self.raw(),
-                iter.raw_mut(),
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            )
-        };
-        self.result(ret)
-    }
-
-    pub(crate) fn btree_node_update_key(
-        self,
-        iter:          &mut BtreeIter<'t>,
-        node:          BtreeNodeRef,
-        key:           TransBkey<'_, 't>,
-        flags:         CommitOpts,
-        iter_searched: bool,
-    ) -> Result<Self, TransError> {
-        let ret = unsafe {
-            c::bch2_btree_node_update_key(
-                self.raw(),
-                iter.raw_mut(),
-                node.as_ptr(),
-                key.as_ptr(),
-                flags.bits(),
-                iter_searched,
-            )
-        };
-        self.result(ret)
-    }
-
-    pub fn delete(
-        self,
-        btree: impl Into<u32>,
-        pos:   c::bpos,
-        flags: UpdateTriggerFlags,
-    ) -> Result<Self, TransError> {
-        let ret = unsafe {
-            c::bch2_btree_delete(
-                self.raw(),
-                c::btree_id::from_raw(btree.into()).expect("invalid btree id"),
-                pos,
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            )
-        };
-        self.result(ret)
-    }
-
-    pub fn snapshot_node_create(
-        self,
-        parent:           u32,
-        new_snapids:      &mut [u32],
-        snapshot_subvols: &[u32],
-    ) -> Result<Self, TransError> {
-        if new_snapids.len() != snapshot_subvols.len() {
-            self.fs().throw(crate::errcode::invalid_snapshot_node)?;
-        }
-
-        let ret = unsafe {
-            c::bch2_snapshot_node_create(
-                self.raw(),
-                parent,
-                new_snapids.as_mut_ptr(),
-                snapshot_subvols.as_ptr() as *mut u32,
-                new_snapids.len() as u32,
-            )
-        };
-        self.result(ret)
-    }
-
-    pub fn iter_traverse(self, iter: &mut BtreeIter<'t>) -> Result<Self, TransError> {
-        let ret = unsafe { c::bch2_btree_iter_traverse(iter.raw_mut()) };
-        self.result(ret)
-    }
-}
-
-impl<'a, 't> TransBkey<'a, 't> {
-    pub fn as_ptr(&self) -> *mut c::bkey_i {
-        self.ptr.as_ptr()
-    }
-
-    pub fn k(&self) -> &c::bkey {
-        let k: &c::bkey_i = self.as_ref();
-        &k.k
-    }
-
-    pub fn k_mut(&mut self) -> &mut c::bkey {
-        let k: &mut c::bkey_i = self.as_mut();
-        &mut k.k
-    }
-
-    pub fn k_i(&self) -> &c::bkey_i {
-        AsRef::<c::bkey_i>::as_ref(self)
-    }
-
-    pub fn k_i_mut(&mut self) -> &mut c::bkey_i {
-        AsMut::<c::bkey_i>::as_mut(self)
-    }
-
-    pub fn as_u64s(&self) -> &[u64] {
-        self.as_ref()
-    }
-
-    pub fn as_mut_u64s(&mut self) -> &mut [u64] {
-        self.as_mut()
-    }
-}
-
-impl AsRef<c::bkey_i> for TransBkey<'_, '_> {
-    fn as_ref(&self) -> &c::bkey_i {
-        unsafe { self.ptr.as_ref() }
-    }
-}
-
-impl AsMut<c::bkey_i> for TransBkey<'_, '_> {
-    fn as_mut(&mut self) -> &mut c::bkey_i {
-        unsafe { self.ptr.as_mut() }
-    }
-}
-
-impl AsRef<[u64]> for TransBkey<'_, '_> {
-    fn as_ref(&self) -> &[u64] {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr() as *const u64, self.buf_u64s as usize) }
-    }
-}
-
-impl AsMut<[u64]> for TransBkey<'_, '_> {
-    fn as_mut(&mut self) -> &mut [u64] {
-        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u64, self.buf_u64s as usize) }
-    }
-}
-
-impl<'a, 't> Deref for TransAttempt<'a, 't> {
-    type Target = BtreeTrans<'t>;
-
-    fn deref(&self) -> &Self::Target {
-        self.trans
-    }
+use core::ptr::{self, NonNull};
+use crate::data::ptrs::BtreePtrs;
+use cstruct_macros::MaybeZeroable;
+use crate::format::{Bpos, Btree, BkeyType};
+
+/*
+ * Exempt bch2_trans_begin() from the dropped-updates warning for a scope (see
+ * begin_may_drop_updates), restoring the previous value on exit, so exemptions
+ * nest: an inner one ending doesn't end the outer.
+ */
+#[repr(C)]
+#[derive(Clone, Copy, MaybeZeroable)]
+pub struct trans_may_drop_updates {
+    pub trans: *mut BtreeTrans<'static>,
+    pub old: bool,
 }
 
 bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct BtreeIterFlags: u32 {
-        const SLOTS = c::btree_iter_update_trigger_flags::BTREE_ITER_slots.0;
-        const INTENT = c::btree_iter_update_trigger_flags::BTREE_ITER_intent.0;
-        const PREFETCH = c::btree_iter_update_trigger_flags::BTREE_ITER_prefetch.0;
-        const IS_EXTENTS = c::btree_iter_update_trigger_flags::BTREE_ITER_is_extents.0;
-        const NOT_EXTENTS = c::btree_iter_update_trigger_flags::BTREE_ITER_not_extents.0;
-        const CACHED = c::btree_iter_update_trigger_flags::BTREE_ITER_cached.0;
-        const KEY_CACHED = c::btree_iter_update_trigger_flags::BTREE_ITER_with_key_cache.0;
-        const WITH_JOURNAL = c::btree_iter_update_trigger_flags::BTREE_ITER_with_journal.0;
-        const SNAPSHOT_FIELD = c::btree_iter_update_trigger_flags::BTREE_ITER_snapshot_field.0;
-        const ALL_SNAPSHOTS = c::btree_iter_update_trigger_flags::BTREE_ITER_all_snapshots.0;
-        const FILTER_SNAPSHOTS = c::btree_iter_update_trigger_flags::BTREE_ITER_filter_snapshots.0;
-        const NOFILTER_WHITEOUTS = c::btree_iter_update_trigger_flags::BTREE_ITER_nofilter_whiteouts.0;
-        const NOPRESERVE = c::btree_iter_update_trigger_flags::BTREE_ITER_nopreserve.0;
-        const CACHED_NOFILL = c::btree_iter_update_trigger_flags::BTREE_ITER_cached_nofill.0;
-        const KEY_CACHE_FILL = c::btree_iter_update_trigger_flags::BTREE_ITER_key_cache_fill.0;
+        const SLOTS = c::BtreeIterUpdateTriggerFlags::slots.bits();
+        const PREV = c::BtreeIterUpdateTriggerFlags::prev.bits();
+        const INTENT = c::BtreeIterUpdateTriggerFlags::intent.bits();
+        const PREFETCH = c::BtreeIterUpdateTriggerFlags::prefetch.bits();
+        const IS_EXTENTS = c::BtreeIterUpdateTriggerFlags::is_extents.bits();
+        const NOT_EXTENTS = c::BtreeIterUpdateTriggerFlags::not_extents.bits();
+        const CACHED = c::BtreeIterUpdateTriggerFlags::cached.bits();
+        const KEY_CACHED = c::BtreeIterUpdateTriggerFlags::with_key_cache.bits();
+        const WITH_JOURNAL = c::BtreeIterUpdateTriggerFlags::with_journal.bits();
+        const SNAPSHOT_FIELD = c::BtreeIterUpdateTriggerFlags::snapshot_field.bits();
+        const ALL_SNAPSHOTS = c::BtreeIterUpdateTriggerFlags::all_snapshots.bits();
+        const FILTER_SNAPSHOTS = c::BtreeIterUpdateTriggerFlags::filter_snapshots.bits();
+        const NOFILTER_WHITEOUTS = c::BtreeIterUpdateTriggerFlags::nofilter_whiteouts.bits();
+        const NOPRESERVE = c::BtreeIterUpdateTriggerFlags::nopreserve.bits();
+        const NOFILL = c::BtreeIterUpdateTriggerFlags::nofill.bits();
+        const CACHED_NOFILL = c::BtreeIterUpdateTriggerFlags::cached_nofill.bits();
+        const KEY_CACHE_FILL = c::BtreeIterUpdateTriggerFlags::key_cache_fill.bits();
+        const COMMITTED = c::BtreeIterUpdateTriggerFlags::committed.bits();
+        /// Extents: a peek returns its key cut to the window - [position, end),
+        /// or backwards [min, position) - the iterator's key with it, so a walk
+        /// steps to the window's edge at most, where it ends. An update of
+        /// what's returned replaces only the window.
+        const TRIM = c::BtreeIterUpdateTriggerFlags::trim.bits();
+        /// A node that failed to read is had, held, as any other - its
+        /// level's iterator empty, its keys never looked at: for topology
+        /// repair, to evict it through the path that holds it.
+        const READ_ERRORS = c::BtreeIterUpdateTriggerFlags::read_errors.bits();
     }
 }
 
 bitflags! {
-    /// The `BTREE_UPDATE_*` / `BTREE_TRIGGER_*` half of the C
-    /// `btree_iter_update_trigger_flags` enum: the flags that control how an
-    /// update commits and which triggers it runs. These combine freely with each
-    /// other but never with the iter/str_hash half (verified against the C tree),
-    /// so they get their own type. (The str_hash flags, which *do* combine with
-    /// iter flags, belong with `BtreeIterFlags` and will join it when str_hash is
-    /// converted to Rust.)
+    /// The BTREE_UPDATE_* and BTREE_TRIGGER_* half of C's
+    /// BtreeIterUpdateTriggerFlags: how an update commits, and which
+    /// triggers it runs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct UpdateTriggerFlags: u32 {
-        const INTERNAL_SNAPSHOT_NODE   = c::btree_iter_update_trigger_flags::BTREE_UPDATE_internal_snapshot_node.0;
-        const NOJOURNAL                = c::btree_iter_update_trigger_flags::BTREE_UPDATE_nojournal.0;
-        const KEY_CACHE_RECLAIM        = c::btree_iter_update_trigger_flags::BTREE_UPDATE_key_cache_reclaim.0;
-        const NORUN                    = c::btree_iter_update_trigger_flags::BTREE_TRIGGER_norun.0;
-        const TRANSACTIONAL            = c::btree_iter_update_trigger_flags::BTREE_TRIGGER_transactional.0;
-        const ATOMIC                   = c::btree_iter_update_trigger_flags::BTREE_TRIGGER_atomic.0;
-        const GC                       = c::btree_iter_update_trigger_flags::BTREE_TRIGGER_gc.0;
-        const INSERT                   = c::btree_iter_update_trigger_flags::BTREE_TRIGGER_insert.0;
-        const OVERWRITE                = c::btree_iter_update_trigger_flags::BTREE_TRIGGER_overwrite.0;
-        const IS_DISCARD               = c::btree_iter_update_trigger_flags::BTREE_TRIGGER_is_discard.0;
-        const SET_NEEDS_RECONCILE_DONE = c::btree_iter_update_trigger_flags::BTREE_TRIGGER_set_needs_reconcile_done.0;
+        const INTERNAL_SNAPSHOT_NODE   = c::BtreeIterUpdateTriggerFlags::internal_snapshot_node.bits();
+        const NOJOURNAL                = c::BtreeIterUpdateTriggerFlags::nojournal.bits();
+        const KEY_CACHE_RECLAIM        = c::BtreeIterUpdateTriggerFlags::key_cache_reclaim.bits();
+        const OVERWRITE_TRIGGERED      = c::BtreeIterUpdateTriggerFlags::overwrite_triggered.bits();
+        const NORUN                   = c::BtreeIterUpdateTriggerFlags::norun.bits();
+        const TRANSACTIONAL            = c::BtreeIterUpdateTriggerFlags::transactional.bits();
+        const ATOMIC                   = c::BtreeIterUpdateTriggerFlags::atomic.bits();
+        const GC                       = c::BtreeIterUpdateTriggerFlags::gc.bits();
+        const INSERT                   = c::BtreeIterUpdateTriggerFlags::inserting.bits();
+        const OVERWRITE                = c::BtreeIterUpdateTriggerFlags::overwriting.bits();
+        const IS_DISCARD               = c::BtreeIterUpdateTriggerFlags::is_discard.bits();
+        const SET_NEEDS_RECONCILE_DONE = c::BtreeIterUpdateTriggerFlags::set_needs_reconcile_done.bits();
     }
 }
 
 bitflags! {
-    /// The flag half of the C `bch_trans_commit_flags` word — the bits above the
-    /// watermark. Composed onto a [`CommitOpts`] via [`CommitOpts::flags`].
+    /// The bits of TransCommitFlags above the watermark.
+    #[derive(Clone, Copy)]
     pub struct CommitFlags: u32 {
-        const NO_ENOSPC             = c::bch_trans_commit_flags::BCH_TRANS_COMMIT_no_enospc.0;
-        const NO_CHECK_RW           = c::bch_trans_commit_flags::BCH_TRANS_COMMIT_no_check_rw.0;
-        const NO_JOURNAL_RES        = c::bch_trans_commit_flags::BCH_TRANS_COMMIT_no_journal_res.0;
-        const NO_SKIP_NOOPS         = c::bch_trans_commit_flags::BCH_TRANS_COMMIT_no_skip_noops.0;
-        const JOURNAL_RECLAIM       = c::bch_trans_commit_flags::BCH_TRANS_COMMIT_journal_reclaim.0;
-        const JOURNAL_REPLAY        = c::bch_trans_commit_flags::BCH_TRANS_COMMIT_journal_replay.0;
-        const SKIP_ACCOUNTING_APPLY = c::bch_trans_commit_flags::BCH_TRANS_COMMIT_skip_accounting_apply.0;
+        const NO_ENOSPC             = c::TransCommitFlags::no_enospc.bits();
+        const NO_CHECK_RW           = c::TransCommitFlags::no_check_rw.bits();
+        const NO_JOURNAL_RES        = c::TransCommitFlags::no_journal_res.bits();
+        const NO_SKIP_NOOPS         = c::TransCommitFlags::no_skip_noops.bits();
+        const JOURNAL_RECLAIM       = c::TransCommitFlags::journal_reclaim.bits();
+        const JOURNAL_REPLAY        = c::TransCommitFlags::journal_replay.bits();
+        const SKIP_ACCOUNTING_APPLY = c::TransCommitFlags::skip_accounting_apply.bits();
     }
 }
 
-/// Allocation watermark — the low bits of the commit-flags word, selecting how
-/// deep into the reserves the commit may dip. Unset (`stripe`/0) the commit path
-/// treats the same as `normal` for the ENOSPC gate, so it usually isn't set.
-#[derive(Clone, Copy)]
-pub struct Watermark(c::bch_watermark);
-
-impl Watermark {
-    pub const STRIPE:           Self = Watermark(c::bch_watermark::BCH_WATERMARK_stripe);
-    pub const NORMAL:           Self = Watermark(c::bch_watermark::BCH_WATERMARK_normal);
-    pub const COPYGC:           Self = Watermark(c::bch_watermark::BCH_WATERMARK_copygc);
-    pub const BTREE:            Self = Watermark(c::bch_watermark::BCH_WATERMARK_btree);
-    pub const BTREE_COPYGC:     Self = Watermark(c::bch_watermark::BCH_WATERMARK_btree_copygc);
-    pub const RECLAIM:          Self = Watermark(c::bch_watermark::BCH_WATERMARK_reclaim);
-    pub const INTERIOR_UPDATES: Self = Watermark(c::bch_watermark::BCH_WATERMARK_interior_updates);
-}
-
-/// A commit-flags word, built from a [`Watermark`] (defaulting to `stripe`/0) and
-/// a set of [`CommitFlags`]. The watermark usually isn't set, so the common path
-/// is `CommitOpts::new()` or `CommitOpts::new().flags(...)`.
-#[derive(Clone, Copy, Default)]
-pub struct CommitOpts(u32);
-
-impl CommitOpts {
-    /// Mask of the watermark bits: everything below the lowest flag bit.
-    const WATERMARK_MASK: u32 = CommitFlags::NO_ENOSPC.bits() - 1;
-
-    pub const fn new() -> Self {
-        CommitOpts(0)
-    }
-
-    pub const fn flags(self, flags: CommitFlags) -> Self {
-        CommitOpts(self.0 | flags.bits())
-    }
-
-    pub const fn watermark(self, w: Watermark) -> Self {
-        CommitOpts((self.0 & !Self::WATERMARK_MASK) | (w.0 as u32 & Self::WATERMARK_MASK))
-    }
-
-    pub(crate) const fn bits(self) -> u32 {
-        self.0
-    }
-
-    pub(crate) const fn to_c(self) -> c::bch_trans_commit_flags {
-        c::bch_trans_commit_flags(self.0)
+/// @k as a @K, its value in place, if it's one: ENOENT_bkey_type_mismatch if
+/// it isn't.
+fn bkey_arm<'k, K: BkeyFamily + ?Sized>(fs: &Fs, k: BkeySC<'k>) -> Result<BkeySC<'k, K::Validated>, BchError> {
+    match k.arm::<K>() {
+        Some(k) => Ok(k),
+        None    => fs.throw(Errcode::ENOENT_bkey_type_mismatch),
     }
 }
 
-pub fn lockrestart_do<'t, T, F>(trans: &BtreeTrans<'t>, mut f: F) -> Result<T, BchError>
-where
-    F: for<'a> FnMut(TransAttempt<'a, 't>) -> TransResult<'a, 't, T>
-{
-    loop {
-        let t = trans.begin();
-
-        let Some((t, v)) = retry_restart(f(t))? else {
-            continue;
-        };
-
-        t.verify_not_restarted();
-        return Ok(v);
+/*
+ * The iterator's own: what C has as static inlines, in Rust for Rust - and
+ * the raw peeks, which the loops below wrap.
+ */
+impl BtreeIter<'_> {
+    pub(crate) fn iter_flags(&self) -> BtreeIterFlags {
+        BtreeIterFlags::from_bits_retain(self.flags)
     }
-}
 
-/// Run a closure inside a transaction commit loop.
-///
-/// Equivalent to the C `commit_do` macro: runs the closure, and if it
-/// succeeds, commits the transaction. Retries on transaction restart.
-pub fn commit_do<'t, F>(
-    trans: &BtreeTrans<'t>,
-    disk_res: Option<&DiskReservation<'_>>,
-    flags: CommitOpts,
-    mut f: F,
-) -> Result<(), BchError>
-where
-    F: for<'a> FnMut(TransAttempt<'a, 't>) -> Result<TransAttempt<'a, 't>, TransError>,
-{
-    lockrestart_do(trans, |t| {
-        let t = f(t)?;
-        let t = t.commit(disk_res, flags)?;
-        t.done(())
-    })
-}
+    /// Its path isn't wanted after this: not preserved, and - if only this
+    /// iterator holds it - not needing to stay locked.
+    pub fn set_dontneed(&mut self) {
+        let trans = self.trans;
+        self.set_dontneed_in(&mut trans.paths());
+    }
 
-/// Create a transaction and run a closure with commit retry.
-///
-/// Equivalent to the C `bch2_trans_commit_do` macro.
-pub fn trans_commit_do<'t, F>(
-    fs: &'t Fs,
-    disk_res: Option<&DiskReservation<'_>>,
-    flags: CommitOpts,
-    f: F,
-) -> Result<(), BchError>
-where
-    F: for<'a> FnMut(TransAttempt<'a, 't>) -> Result<TransAttempt<'a, 't>, TransError>,
-{
-    let trans = BtreeTrans::new(fs);
-    commit_do(&trans, disk_res, flags, f)
-}
-
-/// Create a transaction and run a closure with restart retry (no commit).
-///
-/// Equivalent to the C `bch2_trans_run` macro.
-pub fn trans_run<'t, T, F>(fs: &'t Fs, f: F) -> Result<T, BchError>
-where
-    F: for<'a> FnMut(TransAttempt<'a, 't>) -> TransResult<'a, 't, T>,
-{
-    let trans = BtreeTrans::new(fs);
-    lockrestart_do(&trans, f)
-}
-
-pub struct BtreeIter<'t> {
-    raw:   c::btree_iter,
-    trans: PhantomData<&'t BtreeTrans<'t>>,
-}
-
-fn bkey_s_c_to_result<'i>(k: c::bkey_s_c) -> Result<Option<BkeySC<'i>>, BchError> {
-    errptr_to_result_c(k.k).map(|_| {
-        if !k.k.is_null() {
-            unsafe {
-                Some(BkeySC {
-                    k:    &*k.k,
-                    // Hole slots (peek_slot) return a deleted key with a NULL
-                    // val; bch_val is zero-sized, so a dangling well-aligned
-                    // reference is legal - the val is never read through (a
-                    // deleted key's val length is zero).
-                    v:    if !k.v.is_null() {
-                        &*k.v
-                    } else {
-                        NonNull::dangling().as_ref()
-                    },
-                    iter: PhantomData,
-                })
-            }
-        } else {
-            None
+    /// Move to @pos - in the iterator's own snapshot, unless it's
+    /// all_snapshots - with no key there yet: the next peek finds it. Drops the
+    /// update path, which was for the old position. The static inline
+    /// bch2_btree_iter_set_pos().
+    pub fn set_pos(&mut self, pos: Bpos) {
+        if self.update_path != 0 {
+            let trans = self.trans;
+            self.put_update_path(&mut trans.paths());
         }
-    })
+        self.set_pos_noput(pos);
+    }
+
+    pub(super) fn set_pos_in(&mut self, paths: &mut Paths<'_>, pos: Bpos) {
+        self.put_update_path(paths);
+        self.set_pos_noput(pos);
+    }
+
+    fn put_update_path(&mut self, paths: &mut Paths<'_>) {
+        if self.update_path != 0 {
+            self.trans.path_put(paths, self.update_path, self.intent());
+        }
+        self.update_path = 0;
+    }
+
+    fn set_pos_noput(&mut self, mut pos: Bpos) {
+        if !self.iter_flags().contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+            pos.snapshot = self.snapshot;
+        }
+
+        self.k.set_key_type(BkeyType::deleted);
+        self.k.p.assign_fieldwise_fixme_rustc(&pos);
+        self.k.size  = 0;
+        self.pos.assign_fieldwise_fixme_rustc(&pos);
+    }
+
+    fn intent(&self) -> bool {
+        self.iter_flags().contains(BtreeIterFlags::INTENT)
+    }
+
+    /// The next key up to @end, walking as @flags say: backwards with prev, a
+    /// slot at a time - holes included - with slots. The static inline
+    /// bch2_btree_iter_peek_max_type().
+    pub(super) fn peek_max_type_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, end: Bpos,
+                                   flags: BtreeIterFlags) -> Peeked {
+        let slots = flags.contains(BtreeIterFlags::SLOTS);
+        let prev  = flags.contains(BtreeIterFlags::PREV);
+
+        match (prev, slots) {
+            (false, false) => self.peek_max_in(t, paths, end),
+            (true,  false) => self.peek_prev_min_in(t, paths, end),
+            (true,  true)  =>
+                if bkey_lt(self.pos, end) { Ok(None) }
+                else { self.peek_prev_type_in(t, paths, flags) },
+            // trimming, a slot is cut to the window, and an extents window
+            // ends where @end starts: the slot there is past it
+            (false, true) if self.trims() =>
+                if bkey_ge(self.pos, end) { Ok(None) }
+                else { self.peek_slot_max_in(t, paths, end) },
+            (false, true) =>
+                if bkey_gt(self.pos, end) { Ok(None) }
+                else { self.peek_slot_in(t, paths) },
+        }
+    }
+
+    /// The previous key, or with slots the slot here: the static inline
+    /// bch2_btree_iter_peek_prev_type().
+    fn peek_prev_type_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, flags: BtreeIterFlags) -> Peeked {
+        if flags.contains(BtreeIterFlags::SLOTS) {
+            // reverse slots aren't defined for extents: peek_slot() is the slot from @pos on
+            assert!(!self.is_extents(), "reverse slots on an extents iterator");
+            self.peek_slot_in(t, paths)
+        } else {
+            self.peek_prev_min_in(t, paths, POS_MIN)
+        }
+    }
+}
+
+/// A key, none past the end, or an error.
+pub(super) type Peeked = Result<Option<KeyVal>, BchError>;
+
+/// # Safety
+/// @v is @k's value - NULL for a hole - valid for 'k.
+unsafe fn key_from_parts<'k>(k: &'k c::bkey, v: *const c::bch_val) -> BkeySC<'k> {
+    BkeySC {
+        k,
+        // a hole's NULL value: a dangling, aligned one instead, as val_bytes()
+        // makes a slice of it - empty, but a slice's pointer is never null
+        v:    if !v.is_null() { v } else { NonNull::dangling().as_ptr() },
+        iter: PhantomData,
+        val:  PhantomData,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn peek_trace(out: &mut Printbuf, fs: &Fs, k: Result<Option<BkeySC<'_>>, BchError>) {
+    match k {
+        Err(e)      => prt!(out, "{}", e),
+        Ok(Some(k)) => bkey_val_to_text(out, Some(fs), k),
+        Ok(None)    => prt!(out, "(null)"),
+    }
+}
+
+enum FilterSnapshots {
+    /* accept *k, exit caller's loop */
+    Ok,
+    /* search_key updated, retry */
+    Continue,
+    /* out of range, terminate scan */
+    End,
+}
+
+pub(crate) fn btree_id_cached(btree: Btree) -> bool {
+    matches!(btree, Btree::alloc | Btree::inodes | Btree::logged_ops | Btree::stripes | Btree::subvolumes)
+}
+
+/// Btree @id of @trans's filesystem: any it has, as C's iterators take - one
+/// a newer version made, that this one doesn't know, included.
+fn alive_btree(trans: &BtreeTrans<'_>, id: u32) -> Btree {
+    let nr = trans.fs().btree_id_nr_alive();
+    assert!(id < nr, "an iterator on btree {id}, of a filesystem with {nr}");
+    Btree(id)
+}
+
+fn btree_iter_flags(trans: &BtreeTrans<'_>, btree: Btree, level: u32, mut flags: BtreeIterFlags) -> BtreeIterFlags {
+    if level != 0 || !btree_id_cached(btree) {
+        flags.remove(BtreeIterFlags::CACHED | BtreeIterFlags::KEY_CACHED);
+    } else if !flags.contains(BtreeIterFlags::CACHED) {
+        flags |= BtreeIterFlags::KEY_CACHED;
+    }
+
+    if !flags.intersects(BtreeIterFlags::ALL_SNAPSHOTS | BtreeIterFlags::NOT_EXTENTS) && btree.is_extents() {
+        flags |= BtreeIterFlags::IS_EXTENTS;
+    }
+
+    if !flags.contains(BtreeIterFlags::SNAPSHOT_FIELD) && !btree.has_snapshot_field() {
+        flags.remove(BtreeIterFlags::ALL_SNAPSHOTS);
+    }
+
+    /*
+     * Without snapshot semantics a snapshot field is just part of the key:
+     * advancing past a key at (inode, offset, snapshot) must not skip the
+     * others at (inode, offset).
+     */
+    if btree.has_snapshot_field() && !btree.has_snapshots() {
+        flags |= BtreeIterFlags::ALL_SNAPSHOTS;
+    }
+
+    if !flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) && btree.has_snapshots() {
+        flags |= BtreeIterFlags::FILTER_SNAPSHOTS;
+    }
+
+    if trans.journal_replay_not_finished() {
+        flags |= BtreeIterFlags::WITH_JOURNAL;
+    }
+
+    flags
 }
 
 impl<'t> BtreeIter<'t> {
-    pub fn uninit() -> BtreeIter<'t> {
-        BtreeIter {
-            raw:   Default::default(),
-            trans: PhantomData,
+    fn trims(&self) -> bool {
+        self.iter_flags().contains(BtreeIterFlags::TRIM | BtreeIterFlags::IS_EXTENTS)
+    }
+
+    fn ip_allocated(&self) -> c_ulong {
+        #[cfg(any(CONFIG_BCACHEFS_LOCK_TIME_STATS, CONFIG_BCACHEFS_DEBUG))]
+        return self.ip_allocated;
+        #[cfg(not(any(CONFIG_BCACHEFS_LOCK_TIME_STATS, CONFIG_BCACHEFS_DEBUG)))]
+        0
+    }
+
+    fn successor(&self, p: Bpos) -> Bpos {
+        /* Are we iterating over keys in all snapshots? */
+        if self.iter_flags().contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+            p.successor()
+        } else {
+            Bpos { snapshot: self.snapshot, ..p.nosnap_successor() }
         }
     }
 
-    pub(crate) fn raw_mut(&mut self) -> *mut c::btree_iter {
-        &mut self.raw
+    fn predecessor(&self, p: Bpos) -> Bpos {
+        /* Are we iterating over keys in all snapshots? */
+        if self.iter_flags().contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+            p.predecessor()
+        } else {
+            Bpos { snapshot: self.snapshot, ..p.nosnap_predecessor() }
+        }
     }
 
+    fn search_key(&self) -> Bpos {
+        if self.is_extents() && !bkey_eq(self.pos, POS_MAX) {
+            self.successor(self.pos)
+        } else {
+            self.pos
+        }
+    }
+
+    /// The key @k found: iter->k, and its value in what the iterator's paths
+    /// hold, or the transaction's.
+    pub(super) fn key_of(&self, k: Option<KeyVal>) -> Option<BkeySC<'_>> {
+        k.map(|KeyVal(v)| unsafe { key_from_parts(&self.k, v) })
+    }
+
+    /// @k - a journal key, or an update's - is what's found: its header ours.
+    fn found_i(&mut self, k: &BkeyI) -> KeyVal {
+        self.k = k.k;
+        KeyVal((&raw const k.v).cast())
+    }
+
+    /* Debug: */
+
+    fn verify_now(&self, paths: &mut Paths<'_>) {
+        let trans = self.trans;
+        let flags = self.iter_flags();
+
+        assert_eq!(flags.contains(BtreeIterFlags::CACHED), paths[self.path].cached(),
+                   "iterator and its path disagree on cached");
+
+        assert!(!flags.contains(BtreeIterFlags::IS_EXTENTS | BtreeIterFlags::ALL_SNAPSHOTS),
+                "an extents iterator over all snapshots");
+
+        assert!(flags.contains(BtreeIterFlags::SNAPSHOT_FIELD) ||
+                !flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) ||
+                self.btree().has_snapshot_field(),
+                "all_snapshots on {}, which has no snapshot field", self.btree());
+
+        if self.update_path != 0 {
+            trans.path_verify_now(paths, self.update_path);
+        }
+        trans.path_verify_now(paths, self.path);
+    }
+
+    fn verify_entry_exit_now(&self) {
+        let flags = self.iter_flags();
+
+        assert!(!flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) || self.pos.snapshot != 0,
+                "filtering snapshots at {}, in snapshot 0", self.pos);
+
+        assert!(flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) || self.pos.snapshot == self.snapshot,
+                "iterator at {}, outside its snapshot {}", self.pos, self.snapshot);
+
+        assert!(if flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+            self.pos == self.k.p
+        } else if !flags.contains(BtreeIterFlags::IS_EXTENTS) {
+            bkey_eq(self.pos, self.k.p)
+        } else {
+            !bkey_lt(self.pos, self.k.start_pos()) && !bkey_gt(self.pos, self.k.p)
+        }, "iterator at {}, its key {}", self.pos, self.k);
+    }
+
+    fn verify_ret_now(&self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, k: Peeked) -> Result<(), BchError> {
+        let trans = self.trans;
+
+        if !self.iter_flags().contains(BtreeIterFlags::FILTER_SNAPSHOTS) {
+            return Ok(());
+        }
+
+        let Ok(Some(_)) = k else {
+            return Ok(());
+        };
+        let k = self.k;
+
+        assert!(is_ancestor(t, self.snapshot, k.p.snapshot),
+                "iter snap {} returned {}, not visible in it", self.snapshot, k);
+
+        let mut copy = BtreeIter::init_in(trans, paths, self.btree(), self.pos,
+                                          BtreeIterFlags::NOPRESERVE | BtreeIterFlags::ALL_SNAPSHOTS,
+                                          crate::ret_ip!());
+        let ret = copy.prev_in(t, paths).map(|prev| {
+            if prev.is_none() {
+                return;
+            }
+            let prev = copy.k;
+
+            if bkey_eq(prev.p, k.p) && is_ancestor(t, self.snapshot, prev.p.snapshot) {
+                panic!("iter snap {}\nk    {}\nprev {}\n", self.snapshot, k, prev);
+            }
+        });
+        copy.exit_in(paths);
+        ret
+    }
+
+    fn checks() -> bool {
+        cfg!(CONFIG_BCACHEFS_DEBUG) && debug_check_iterators()
+    }
+
+    fn verify(&self, paths: &mut Paths<'_>) {
+        if Self::checks() {
+            self.verify_now(paths);
+        }
+    }
+
+    fn verify_entry_exit(&self) {
+        if Self::checks() {
+            self.verify_entry_exit_now();
+        }
+    }
+
+    fn verify_ret(&self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, k: Peeked) -> Result<(), BchError> {
+        if Self::checks() {
+            self.verify_ret_now(t, paths, k)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn set_dontneed_in(&mut self, paths: &mut Paths<'_>) {
+        let trans = self.trans;
+
+        if self.path == 0 || trans.restarted().0 != 0 {
+            return;
+        }
+
+        let path = &mut paths[self.path];
+        path.bits.set_preserve(false);
+        if path.ref_ == 1 {
+            path.bits.set_should_be_locked(false);
+        }
+    }
+
+    /* Btree iterators: */
+
+    pub(super) fn traverse_at_pos_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>) -> Result<(), BchError> {
+        self.trans.path_traverse(t, paths, self.path, self.iter_flags())
+    }
+
+    pub(super) fn traverse_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>) -> Result<(), BchError> {
+        let trans = self.trans;
+        let search_key = self.search_key();
+
+        trans.verify_not_unlocked_or_in_restart();
+
+        self.path = trans.path_set_pos(paths, self.path, search_key, self.intent(), self.ip_allocated());
+
+        trans.path_traverse(t, paths, self.path, self.iter_flags())?;
+
+        let level = paths[self.path].level() as usize;
+        if !paths[self.path].node(level).is_null() {
+            trans.path_set_should_be_locked(paths, self.path);
+        }
+        Ok(())
+    }
+
+    /// The node, held by the iterator's path while the iterator's borrowed.
+    pub(super) fn peek_node_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>)
+        -> Result<Option<LockedNode<'_, BtreeNode>>, BchError>
+    {
+        let trans = self.trans;
+
+        ebug_assert!(!paths[self.path].cached());
+        self.verify(paths);
+
+        let b = self.traverse_in(t, paths).and_then(|()| {
+            let path = &paths[self.path];
+            let b = path.l[path.level() as usize].b.get()?;
+            Ok(b.map(|b| unsafe { LockedNode::new(b.cast::<BtreeNode>().as_ref()) }))
+        });
+
+        if let Ok(Some(n)) = &b {
+            let max_key = n.contents().key_i().k.p;
+            assert!(max_key >= self.pos, "node ending at {}, before the iterator's position {}", max_key, self.pos);
+
+            /* unread, had under READ_ERRORS: no data to start from */
+            let min_key = if n.flags.read_error() { self.pos } else { n.contents().data().min_key };
+            self.k = c::bkey::new();
+            self.k.p = min_key;
+            self.pos = min_key;
+
+            self.path = trans.path_set_pos(paths, self.path, max_key, self.intent(), self.ip_allocated());
+            trans.path_set_should_be_locked(paths, self.path);
+        }
+
+        self.verify_entry_exit();
+        self.verify(paths);
+        b
+    }
+
+    /* Iterate across keys (in leaf nodes only) */
+
+    pub(super) fn advance_in(&mut self, paths: &mut Paths<'_>) -> bool {
+        let mut pos = self.k.p;
+        let ret = !if self.iter_flags().contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+            pos == SPOS_MAX
+        } else {
+            bkey_eq(pos, SPOS_MAX)
+        };
+
+        if ret && !self.is_extents() {
+            pos = self.successor(pos);
+        }
+        self.set_pos_in(paths, pos);
+        ret
+    }
+
+    pub(super) fn rewind_in(&mut self, paths: &mut Paths<'_>) -> bool {
+        let mut pos = if self.is_extents() { self.k.start_pos() } else { self.k.p };
+        let ret = !if self.iter_flags().contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+            pos == POS_MIN
+        } else {
+            bkey_eq(pos, POS_MIN)
+        };
+
+        if ret && !self.is_extents() {
+            pos = self.predecessor(pos);
+        }
+        self.set_pos_in(paths, pos);
+        ret
+    }
+
+    #[inline(never)]
+    fn trans_peek_prev_updates(&mut self, paths: &Paths<'_>, search_key: Bpos, k: &mut Option<KeyVal>) {
+        let path = &paths[self.path];
+        let b = path.locked_btree_node(path.level() as usize).expect("a path peeked is locked");
+        let end = b.contents().data().min_key;
+        let btree = self.btree();
+
+        for (i, u) in paths.update_keys() {
+
+            if !i.bits.key_cache_already_flushed() && i.bits.btree_id() == btree &&
+               u.k.p <= search_key && u.k.p >= if k.is_some() { self.k.p } else { end } {
+                *k = Some(self.found_i(u));
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn trans_peek_updates(&mut self, paths: &Paths<'_>, search_key: Bpos, k: &mut Option<KeyVal>) {
+        let path = &paths[self.path];
+        let b = path.locked_btree_node(path.level() as usize).expect("a path peeked is locked");
+        let end = b.contents().key_i().k.p;
+        let btree = self.btree();
+        let level = u32::from(self.min_depth);
+
+        for (i, u) in paths.update_keys() {
+
+            if !i.bits.key_cache_already_flushed() && i.bits.btree_id() == btree &&
+               u32::from(i.bits.level()) == level &&
+               u.k.p >= search_key && u.k.p <= if k.is_some() { self.k.p } else { end } {
+                *k = Some(self.found_i(u));
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn trans_peek_slot_updates(&mut self, paths: &Paths<'_>, k: &mut Option<KeyVal>) {
+        let btree = self.btree();
+        let level = u32::from(self.min_depth);
+
+        for (i, u) in paths.update_keys() {
+
+            if !i.bits.key_cache_already_flushed() && i.bits.btree_id() == btree &&
+               u32::from(i.bits.level()) == level &&
+               u.k.p == self.pos {
+                *k = Some(self.found_i(u));
+            }
+        }
+    }
+
+    fn journal_peek<'k>(&mut self, t: &TransAttempt<'k, '_>, paths: &Paths<'_>, search_pos: Bpos, end_pos: Bpos)
+        -> Option<&'k BkeyI>
+    {
+        /*
+         * BTREE_ITER_with_journal is the iterator's from its init; trans_begin()
+         * puts the transaction's ref on the journal keys once replay is done,
+         * and can't clear the flag on iterators it can't see - so the
+         * transaction's ref, not the iterator's flag, says the keys are there:
+         */
+        let jk = t.journal_keys()?;
+        let level = u32::from(paths[self.path].level());
+
+        journal_overlay::peek_max(jk, self.btree(), level, search_pos, end_pos, &mut self.journal_idx)
+    }
+
+    #[inline(never)]
+    fn trans_peek_slot_journal(&mut self, t: &TransAttempt<'_, '_>, paths: &Paths<'_>) -> Option<KeyVal> {
+        let pos = paths[self.path].pos;
+
+        self.journal_peek(t, paths, pos, pos).map(|k| self.found_i(k))
+    }
+
+    #[inline(never)]
+    fn trans_peek_journal(&mut self, t: &TransAttempt<'_, '_>, paths: &Paths<'_>, search_key: Bpos,
+                          k: &mut Option<KeyVal>) {
+        let end = if k.is_some() {
+            self.k.p
+        } else {
+            let path = &paths[self.path];
+            path.locked_btree_node(path.level() as usize).expect("a path peeked is locked").contents().key_i().k.p
+        };
+        if let Some(next_journal) = self.journal_peek(t, paths, search_key, end) {
+            *k = Some(self.found_i(next_journal));
+        }
+    }
+
+    fn journal_peek_prev<'k>(&mut self, t: &TransAttempt<'k, '_>, paths: &Paths<'_>, search_key: Bpos,
+                             end_pos: Bpos) -> Option<&'k BkeyI>
+    {
+        let jk = t.journal_keys()?;
+        let level = u32::from(paths[self.path].level());
+
+        journal_overlay::peek_prev_min(jk, self.btree(), level, search_key, end_pos, &mut self.journal_idx)
+    }
+
+    #[inline(never)]
+    fn trans_peek_prev_journal(&mut self, t: &TransAttempt<'_, '_>, paths: &Paths<'_>, search_key: Bpos,
+                               k: &mut Option<KeyVal>) {
+        let end = if k.is_some() {
+            self.k.p
+        } else {
+            let path = &paths[self.path];
+            path.locked_btree_node(path.level() as usize).expect("a path peeked is locked")
+                .contents().data().min_key
+        };
+        if let Some(next_journal) = self.journal_peek_prev(t, paths, search_key, end) {
+            *k = Some(self.found_i(next_journal));
+        }
+    }
+
+    /*
+     * Checks btree key cache for key at iter->pos and returns it if present, or
+     * bkey_s_c_null:
+     */
+    #[inline(never)]
+    fn trans_peek_key_cache(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, k: &mut Option<KeyVal>)
+        -> Result<(), BchError>
+    {
+        if k.is_none() || self.k.key_type().is_deleted() {
+            return Ok(());
+        }
+        let kp = self.k.p;
+
+        let trans = self.trans;
+        let flags = self.iter_flags();
+
+        trans.verify_not_unlocked_or_in_restart();
+
+        if flags.contains(BtreeIterFlags::KEY_CACHE_FILL) && self.pos == kp {
+            return Ok(());
+        }
+
+        if trans.btree_key_cache_find(self.btree(), kp).is_none() {
+            return Ok(());
+        }
+
+        if self.key_cache_path.get() == 0 {
+            self.key_cache_path.set(trans.path_get(paths, self.btree(), kp, self.intent().into(), 0,
+                                                   flags | BtreeIterFlags::CACHED | BtreeIterFlags::CACHED_NOFILL,
+                                                   crate::ret_ip!()));
+        }
+
+        self.key_cache_path.set(trans.path_set_pos(paths, self.key_cache_path.get(), kp, self.intent(),
+                                                   self.ip_allocated()));
+
+        let ret = trans.path_traverse(t, paths, self.key_cache_path.get(), flags | BtreeIterFlags::CACHED)
+            .and_then(|()| trans.path_relock(paths, self.path));
+        if let Err(e) = ret {
+            self.set_pos_in(paths, self.pos);
+            return Err(e);
+        }
+
+        let mut u = c::bkey::new();
+        let Some(k2) = paths[self.key_cache_path.get()].peek_slot(&mut u) else {
+            return Ok(());
+        };
+
+        if flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) && kp != u.p {
+            return Ok(());
+        }
+
+        self.k = u;
+        *k = Some(k2);
+        trans.path_set_should_be_locked(paths, self.key_cache_path.get());
+        Ok(())
+    }
+
+    fn __peek(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, search_key: &mut Bpos, end: Bpos) -> Peeked {
+        let trans = self.trans;
+        let flags = self.iter_flags();
+
+        ebug_assert!(!paths[self.path].cached());
+        self.verify(paths);
+
+        /*
+         * The last leaf a key we want can be in: an extent is in the leaf its end
+         * is in, and one starting before @end can end anywhere in @end's inode
+         */
+        let last_leaf = if flags.contains(BtreeIterFlags::IS_EXTENTS) {
+            Bpos { inode: end.inode, offset: u64::MAX, snapshot: 0 }
+        } else {
+            end
+        };
+
+        let k = loop {
+            self.path = trans.path_set_pos(paths, self.path, *search_key, self.intent(), self.ip_allocated());
+
+            if let Err(e) = trans.path_traverse(t, paths, self.path, flags) {
+                /* ensure that iter->k is consistent with iter->pos: */
+                self.set_pos_in(paths, self.pos);
+                break Err(e);
+            }
+
+            let level = paths[self.path].level() as usize;
+            if paths[self.path].l[level].b.is_null() {
+                /* No btree nodes at requested level: */
+                self.set_pos_in(paths, SPOS_MAX);
+                break Ok(None);
+            }
+
+            trans.path_set_should_be_locked(paths, self.path);
+
+            let mut k = paths[self.path].level_peek_all(&mut self.k);
+
+            if flags.contains(BtreeIterFlags::KEY_CACHED) {
+                if let Err(e) = self.trans_peek_key_cache(t, paths, &mut k) {
+                    break Err(e);
+                }
+            }
+
+            if flags.contains(BtreeIterFlags::WITH_JOURNAL) {
+                self.trans_peek_journal(t, paths, *search_key, &mut k);
+            }
+
+            if trans.nr_updates.get() != 0 && !flags.contains(BtreeIterFlags::COMMITTED) {
+                self.trans_peek_updates(paths, *search_key, &mut k);
+            }
+
+            if k.is_some() {
+                if !self.k.key_type().is_deleted() {
+                    break Ok(k);
+                }
+
+                /*
+                 * If we've got a whiteout, and it's after the search
+                 * key, advance the search key to the whiteout instead
+                 * of just after the whiteout - it might be a btree
+                 * whiteout, with a real key at the same position, since
+                 * in the btree deleted keys sort before non deleted.
+                 */
+                let p = self.k.p;
+                *search_key = if *search_key != p { p } else { p.successor() };
+
+                /* in BTREE_ITER_filter_snapshots mode, we don't want a
+                 * precise comparison against @end */
+            } else {
+                let path = &paths[self.path];
+                let node_max = path.locked_btree_node(level).expect("a path peeked is locked").contents().key_i().k.p;
+
+                if bkey_le(node_max, last_leaf) && node_max < SPOS_MAX {
+                    /* Advance to next leaf node: */
+                    *search_key = node_max.successor();
+                } else {
+                    /* End of btree: */
+                    self.set_pos_in(paths, SPOS_MAX);
+                    break Ok(None);
+                }
+            }
+        };
+
+        self.verify(paths);
+
+        let fs = trans.fs();
+        fs.event_trace(events::__btree_iter_peek, |out| peek_trace(out, fs, k.map(|k| self.key_of(k))));
+
+        k
+    }
+
+    #[inline(never)]
+    fn filter_snapshots(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, search_key: &mut Bpos, end: Bpos)
+        -> Result<FilterSnapshots, BchError>
+    {
+        let trans = self.trans;
+        let flags = self.iter_flags();
+        let kk = self.k;
+
+        /*
+         * We need to check against @end before FILTER_SNAPSHOTS because
+         * if we get to a different inode than requested we might be
+         * seeing keys for a different snapshot tree that will all be
+         * filtered out.
+         *
+         * But we can't do the full check here, because bkey_start_pos()
+         * isn't monotonically increasing before FILTER_SNAPSHOTS, and
+         * that's what we check against in extents mode:
+         */
+        if if !flags.contains(BtreeIterFlags::IS_EXTENTS) {
+            bkey_gt(kk.p, end)
+        } else {
+            kk.p.inode > end.inode
+        } {
+            return Ok(FilterSnapshots::End);
+        }
+
+        /*
+         * If we want an update path we want to do this up front; also more
+         * efficient than letting !bch2_snapshot_is_ancestor() skip these:
+         */
+        if kk.p.snapshot < self.snapshot {
+            *search_key = Bpos { snapshot: self.snapshot, ..kk.p };
+            return Ok(FilterSnapshots::Continue);
+        }
+
+        if self.update_path != 0 && !bkey_eq(paths[self.update_path].pos, kk.p) {
+            trans.path_put(paths, self.update_path, self.intent());
+            self.update_path = 0;
+        }
+
+        if flags.contains(BtreeIterFlags::INTENT) &&
+           !flags.contains(BtreeIterFlags::IS_EXTENTS) &&
+           self.update_path == 0 {
+            /*
+             * We may have to skip over keys in unrelated snapshot branches
+             * before finding the key to return; that will not be the
+             * update position for iter->snapshot - cache that:
+             */
+            paths.get_ll(self.path, self.intent());
+            self.update_path = self.path;
+
+            let with_snapshot = Bpos { snapshot: self.snapshot, ..kk.p };
+            self.update_path = trans.path_set_pos(paths, self.update_path, with_snapshot, self.intent(),
+                                                  crate::ret_ip!());
+            trans.path_traverse(t, paths, self.update_path, flags)?;
+        }
+
+        /*
+         * We can never have a key in a leaf node at POS_MAX, so we don't have
+         * to check these successor() calls:
+         */
+        if !is_ancestor(t, self.snapshot, kk.p.snapshot) {
+            *search_key = kk.p.successor();
+            return Ok(FilterSnapshots::Continue);
+        }
+
+        if !flags.contains(BtreeIterFlags::NOFILTER_WHITEOUTS) && kk.key_type().is_extent_whiteout() {
+            /*
+             * KEY_TYPE_extent_whiteout indicates that there are no extents
+             * overlapping with this whiteout - meaning bkey_start_pos() is
+             * monotonically increasing when including KEY_TYPE_extent_whiteout.
+             * Without this @end wouldn't be able to terminate searches and
+             * we'd have to scan through tons of whiteouts.
+             */
+            if kk.key_type() == BkeyType::extent_whiteout && bkey_ge(kk.p, end) {
+                return Ok(FilterSnapshots::End);
+            }
+
+            /*
+             * Advance iter->pos incrementally, so on transaction restart we
+             * don't restart scanning over large numbers of whiteouts. For
+             * extent iterators, callers use iter->pos to mean "remaining
+             * range we are processing", so we only advance on
+             * KEY_TYPE_extent_whiteout.
+             */
+            if !flags.contains(BtreeIterFlags::IS_EXTENTS) || kk.key_type() == BkeyType::extent_whiteout {
+                self.pos = Bpos { snapshot: self.snapshot, ..kk.p };
+            }
+
+            *search_key = self.successor(kk.p);
+            return Ok(FilterSnapshots::Continue);
+        }
+
+        Ok(FilterSnapshots::Ok)
+    }
+
+    /*
+     * BTREE_ITER_trim: an extent straddling the window [@start, @end) is returned
+     * cut to it, and iter->k is cut with it: stepping by it stops at the window's
+     * edge, where the walk ends. A key with no value is only its header, cut in
+     * iter->k; one with a value - pointers, a reflink_p's idx, inline data, which
+     * move with a cut - is cut in a copy in transaction memory. An update of what's
+     * returned replaces only the window.
+     */
+    #[inline(never)]
+    fn trim(&mut self, v: KeyVal, start: Bpos, end: Bpos) -> Result<KeyVal, BchError> {
+        let u = &mut self.k;
+
+        if bkey_le(start, u.start_pos()) && bkey_le(u.p, end) {
+            return Ok(v);
+        }
+
+        if u.val_bytes() == 0 {
+            if bkey_lt(u.start_pos(), start) {
+                u.size = (u.p.offset - start.offset) as u32;
+            }
+            if bkey_gt(u.p, end) {
+                u.resize((end.offset - u.start_pos().offset) as u32);
+            }
+            return Ok(v);
+        }
+
+        let trans = self.trans;
+        let t = trans.kmalloc_in(self.k.bytes())?.cast::<c::bkey_i>();
+
+        let t = unsafe {
+            (*t).k = self.k;
+            ptr::copy_nonoverlapping(v.0.cast::<u8>(), (&raw mut (*t).v).cast::<u8>(), self.k.val_bytes());
+            &mut *BkeyI::from_raw_mut(t)
+        };
+        bch2_cut_front_s(trans.fs(), start, BkeyS::from(&mut *t));
+        bch2_cut_back_s(end, BkeyS::from(&mut *t));
+        Ok(self.found_i(t))
+    }
+
+    fn maybe_trim(&mut self, k: Peeked, start: Bpos, end: Bpos) -> Peeked {
+        let v = match k {
+            Ok(Some(v)) if self.trims() => v,
+            k => return k,
+        };
+
+        let v = self.trim(v, start, end)?;
+        /* what trimming promises: all of it in the window, and something */
+        ebug_assert!(self.k.size != 0 && !bkey_lt(self.k.start_pos(), start) && !bkey_gt(self.k.p, end),
+                     "trimmed to {}, outside the window {}-{}", self.k, start, end);
+        Ok(Some(v))
+    }
+
+    /// peek_max()'s search: None past @end.
+    fn peek_max_search(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, end: Bpos) -> Peeked {
+        let trans = self.trans;
+        let flags = self.iter_flags();
+        let mut search_key = POS_MIN;
+        search_key.assign_fieldwise_fixme_rustc(&self.search_key());
+
+        if self.update_path != 0 {
+            trans.path_put(paths, self.update_path, self.intent());
+            self.update_path = 0;
+        }
+
+        let v = loop {
+            let Some(v) = self.__peek(t, paths, &mut search_key, end)? else {
+                return Ok(None);
+            };
+
+            if flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) &&
+               (self.k.p.snapshot != self.snapshot || self.k.key_type().is_extent_whiteout() ||
+                self.update_path != 0) {
+                match self.filter_snapshots(t, paths, &mut search_key, end)? {
+                    FilterSnapshots::Ok       => {}
+                    FilterSnapshots::Continue => continue,
+                    FilterSnapshots::End      => return Ok(None),
+                }
+            }
+
+            break v;
+        };
+
+        let kk = self.k;
+
+        /*
+         * iter->pos should be mononotically increasing, and always be
+         * equal to the key we just returned - except extents can
+         * straddle iter->pos:
+         */
+        if !flags.contains(BtreeIterFlags::IS_EXTENTS) {
+            self.pos = kk.p;
+        } else if !bkey_gt(self.pos, kk.start_pos()) {
+            self.pos = kk.start_pos();
+        }
+
+        if !flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+            self.pos.snapshot = self.snapshot;
+        }
+
+        if if flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+            self.pos > end
+        } else if flags.contains(BtreeIterFlags::IS_EXTENTS) {
+            bkey_ge(self.pos, end)
+        } else {
+            bkey_gt(self.pos, end)
+        } {
+            return Ok(None);
+        }
+
+        self.path = trans.path_set_pos(paths, self.path, kk.p, self.intent(), self.ip_allocated());
+
+        trans.path_set_should_be_locked(paths, self.path);
+        Ok(Some(v))
+    }
+
+    pub(super) fn peek_max_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, end: Bpos) -> Peeked {
+        let trans = self.trans;
+        let flags = self.iter_flags();
+
+        trans.verify_not_unlocked_or_in_restart();
+        self.verify_entry_exit();
+        ebug_assert!(!flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) ||
+                     flags.contains(BtreeIterFlags::NOFILTER_WHITEOUTS) ||
+                     !bkey_eq(end, POS_MAX),
+                     "filtering whiteouts to POS_MAX: the filter peeks past @end");
+
+        let mut k = trans.maybe_inject_restart(crate::ret_ip!())
+            .and_then(|()| self.peek_max_search(t, paths, end));
+        if let Ok(None) = k {
+            self.set_pos_in(paths, end);
+        }
+
+        if self.update_path != 0 {
+            match trans.path_relock(paths, self.update_path) {
+                Err(e) => k = Err(e),
+                Ok(()) => trans.path_set_should_be_locked(paths, self.update_path),
+            }
+        }
+
+        if let Err(e) = self.verify_ret(t, paths, k) {
+            self.set_pos_in(paths, self.pos);
+            k = Err(e);
+        }
+
+        self.verify_entry_exit();
+
+        let k = self.maybe_trim(k, self.pos, end);
+
+        let fs = trans.fs();
+        fs.event_trace(events::btree_iter_peek_max, |out| peek_trace(out, fs, k.map(|k| self.key_of(k))));
+
+        k
+    }
+
+    fn __peek_prev(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, mut search_key: Bpos) -> Peeked {
+        let trans = self.trans;
+        let flags = self.iter_flags();
+
+        self.verify(paths);
+
+        let k = loop {
+            self.path = trans.path_set_pos(paths, self.path, search_key, self.intent(), self.ip_allocated());
+
+            if let Err(e) = trans.path_traverse(t, paths, self.path, flags) {
+                /* ensure that iter->k is consistent with iter->pos: */
+                self.set_pos_in(paths, self.pos);
+                break Err(e);
+            }
+
+            let level = paths[self.path].level() as usize;
+            if paths[self.path].l[level].b.is_null() {
+                /* No btree nodes at requested level: */
+                self.set_pos_in(paths, SPOS_MAX);
+                break Ok(None);
+            }
+            self.path = trans.path_make_mut(paths, self.path, self.intent(), self.ip_allocated());
+
+            trans.path_set_should_be_locked(paths, self.path);
+
+            let mut k = paths[self.path].level_peek_all(&mut self.k);
+
+            if k.is_none() || self.k.p > search_key {
+                k = trans.path_level_prev(paths, self.path, &mut self.k);
+
+                ebug_assert!(k.is_none() || self.k.p <= search_key,
+                             "stepped back to {}, past the search key {}", self.k.p, search_key);
+            }
+
+            if flags.contains(BtreeIterFlags::KEY_CACHED) {
+                if let Err(e) = self.trans_peek_key_cache(t, paths, &mut k) {
+                    break Err(e);
+                }
+            }
+
+            if flags.contains(BtreeIterFlags::WITH_JOURNAL) {
+                self.trans_peek_prev_journal(t, paths, search_key, &mut k);
+            }
+
+            if trans.nr_updates.get() != 0 && !flags.contains(BtreeIterFlags::COMMITTED) {
+                self.trans_peek_prev_updates(paths, search_key, &mut k);
+            }
+
+            if k.is_some() && !self.k.key_type().is_deleted() {
+                break Ok(k);
+            } else if k.is_some() {
+                search_key = self.k.p.predecessor();
+            } else {
+                let path = &paths[self.path];
+                let min_key = path.locked_btree_node(level).expect("a path peeked is locked")
+                    .contents().data().min_key;
+
+                if min_key != POS_MIN {
+                    /* Advance to previous leaf node: */
+                    search_key = min_key.predecessor();
+                } else {
+                    /* Start of btree: */
+                    self.set_pos_in(paths, POS_MIN);
+                    break Ok(None);
+                }
+            }
+        };
+
+        /*
+         * TODO: unlike bch2_btree_iter_peek_max(), which does a normalizing
+         * bch2_btree_path_set_pos(&k.k->p) on return, peek_prev sets path->pos
+         * directly (bch2_btree_path_level_prev / the k.k->p store above) and never
+         * re-runs up_until_good_node - so on return path->pos may be
+         * inconsistent with path->l[level].b above the leaf. The only guard is
+         * bch2_btree_iter_verify (static-branch gated, runs rarely in CI), so
+         * the inconsistency escapes to the always-on
+         * bch2_trans_node_verify_not_in_iters() BUG in a later node split
+         * (seen: copygc_torture_no_checksum, inject_transaction_restarts=1).
+         * Fix likely mirrors peek_max's trailing set_pos, but the reverse-
+         * iteration pos semantics need thought first.
+         */
+        self.verify(paths);
+        k
+    }
+
+    /*
+     * The key visible in @iter->snapshot at exactly @pos - for an extents
+     * iterator, the extent ending at @pos - or bkey_s_c_null if nothing is: the
+     * nearest version among iter->snapshot and its ancestors, unless that's a
+     * whiteout.
+     *
+     * Resolved forwards, as peek_slot() does: our own snapshot's version comes
+     * first, then each ancestor's in turn, so the first one visible is the
+     * answer, journal keys and the transaction's updates included. Searching
+     * backwards meets the furthest ancestor first and would have to remember
+     * candidates.
+     *
+     * Done on a copy without is_extents, so the lookup is of exactly @pos: an
+     * extents peek_slot() of the extent containing @pos - 1 would scan on to the
+     * next visible extent, and a backward search calling this at each position
+     * through a run of whiteouts would rescan it from each.
+     *
+     * On success iter->path is the copy's, at the key, and iter->k holds it.
+     */
+    fn peek_visible_at(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, pos: Bpos) -> Peeked {
+        let mut iter2 = self.copy_in(paths);
+        iter2.clear_flags(BtreeIterFlags::IS_EXTENTS | BtreeIterFlags::NOFILTER_WHITEOUTS);
+
+        iter2.set_pos_in(paths, Bpos { snapshot: self.snapshot, ..pos });
+
+        let k = match iter2.peek_slot_in(t, paths) {
+            /* A hole, or a whiteout - and it points into iter2: */
+            Ok(Some(_)) if iter2.k.key_type().is_deleted() => Ok(None),
+            Ok(Some(v)) => {
+                core::mem::swap(&mut self.path, &mut iter2.path);
+                self.key_cache_path.swap(&iter2.key_cache_path);
+                self.k = iter2.k;
+                Ok(Some(v))
+            }
+            k => k,
+        };
+        iter2.exit_in(paths);
+        k
+    }
+
+    /// peek_prev_min()'s search: None past @end.
+    fn peek_prev_min_search(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, end: Bpos) -> Peeked {
+        let flags = self.iter_flags();
+        let mut search_key = self.pos;
+
+        /*
+         * Every snapshot's key at this position: an ancestor's sorts after
+         * iter->snapshot's, and searching back from iter->pos would skip it -
+         * for extents, the one ending here:
+         */
+        if flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) {
+            search_key.snapshot = u32::MAX;
+        }
+
+        let v = loop {
+            let Some(mut v) = self.__peek_prev(t, paths, search_key)? else {
+                return Ok(None);
+            };
+
+            if flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) {
+                let pos = self.k.p;
+
+                /*
+                 * We need to check against @end before FILTER_SNAPSHOTS because
+                 * if we get to a different inode that requested we might be
+                 * seeing keys for a different snapshot tree that will all be
+                 * filtered out.
+                 */
+                if bkey_lt(pos, end) {
+                    return Ok(None);
+                }
+
+                if !is_ancestor(t, self.snapshot, pos.snapshot) {
+                    search_key = pos.predecessor();
+                    continue;
+                }
+
+                /*
+                 * A version visible in iter->snapshot is at this
+                 * position: which one we see - if any - is decided
+                 * forwards, from iter->snapshot's own up:
+                 */
+                v = match self.peek_visible_at(t, paths, pos) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => {
+                        if !bkey_gt(pos, end) {
+                            return Ok(None);
+                        }
+
+                        search_key = self.predecessor(pos);
+                        search_key.snapshot = u32::MAX;
+                        continue;
+                    }
+                    Err(e) => {
+                        /*
+                         * iter->k still holds the version
+                         * __bch2_btree_iter_peek_prev() found: make it
+                         * consistent with iter->pos, as its own error
+                         * path does:
+                         */
+                        self.set_pos_in(paths, self.pos);
+                        return Err(e);
+                    }
+                };
+            }
+
+            let kk = self.k;
+
+            ebug_assert!(if flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+                kk.p <= self.pos
+            } else if flags.contains(BtreeIterFlags::IS_EXTENTS) {
+                bkey_lt(kk.start_pos(), self.pos)
+            } else {
+                bkey_le(kk.p, self.pos)
+            }, "peeking back from {}, found {}", self.pos, kk);
+
+            if if flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+                kk.p < end
+            } else if flags.contains(BtreeIterFlags::IS_EXTENTS) {
+                bkey_le(kk.p, end)
+            } else {
+                bkey_lt(kk.p, end)
+            } {
+                return Ok(None);
+            }
+
+            break v;
+        };
+
+        /* Extents can straddle iter->pos: */
+        self.pos = core::cmp::min(self.pos, self.k.p);
+
+        if flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) {
+            self.pos.snapshot = self.snapshot;
+        }
+
+        self.maybe_trim(Ok(Some(v)), end, self.pos)
+    }
+
+    pub(super) fn peek_prev_min_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, end: Bpos) -> Peeked {
+        let flags = self.iter_flags();
+
+        /* trimming, the window is [@end, iter->pos): nothing in an empty one */
+        if self.trims() && bkey_le(self.pos, end) {
+            self.set_pos_in(paths, end);
+            return Ok(None);
+        }
+
+        if flags.intersects(BtreeIterFlags::IS_EXTENTS | BtreeIterFlags::FILTER_SNAPSHOTS) &&
+           !bkey_eq(self.pos, POS_MAX) &&
+           !(flags.contains(BtreeIterFlags::IS_EXTENTS) && self.pos.offset == u64::MAX) {
+            /*
+             * bkey_start_pos(), for extents, is not monotonically
+             * increasing until after filtering for snapshots:
+             *
+             * Thus, for extents we need to search forward until we find a
+             * real visible extents - easiest to just use peek_slot() (which
+             * internally uses peek() for extents) - untrimmed, as that would
+             * cut it to the wrong side of iter->pos
+             */
+            let k = self.__peek_slot(t, paths, SPOS_MAX, crate::ret_ip!())?;
+
+            if k.is_some() && !self.k.key_type().is_deleted() &&
+               (!flags.contains(BtreeIterFlags::IS_EXTENTS) || bkey_lt(self.k.start_pos(), self.pos)) {
+                return self.maybe_trim(Ok(k), end, self.pos);
+            }
+        }
+
+        let trans = self.trans;
+
+        trans.verify_not_unlocked_or_in_restart();
+        self.verify_entry_exit();
+        ebug_assert!(!flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) || self.pos.inode == end.inode,
+                     "filtered iteration back from {} to {}: one inode only", self.pos, end);
+
+        let k = trans.maybe_inject_restart(crate::ret_ip!())
+            .and_then(|()| self.peek_prev_min_search(t, paths, end));
+        if let Ok(None) = k {
+            self.set_pos_in(paths, end);
+        }
+
+        self.verify_entry_exit();
+        self.verify(paths);
+
+        let fs = trans.fs();
+        fs.event_trace(events::btree_iter_peek_prev_min, |out| peek_trace(out, fs, k.map(|k| self.key_of(k))));
+
+        k
+    }
+
+    pub(super) fn prev_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>) -> Peeked {
+        if !self.rewind_in(paths) {
+            return Ok(None);
+        }
+
+        self.peek_prev_min_in(t, paths, POS_MIN)
+    }
+
+    fn __peek_slot(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, end: Bpos, ip: c_ulong) -> Peeked {
+        let trans = self.trans;
+        let flags = self.iter_flags();
+        let mut k: Peeked;
+
+        trans.verify_not_unlocked_or_in_restart();
+        self.verify(paths);
+        self.verify_entry_exit();
+        ebug_assert!(paths[self.path].level() == 0 || !flags.contains(BtreeIterFlags::KEY_CACHED),
+                     "a key cache iterator above the leaves");
+
+        'out2: {
+            'out: {
+                if let Err(e) = trans.maybe_inject_restart(ip) {
+                    k = Err(e);
+                    break 'out;
+                }
+
+                /* extents can't span inode numbers: */
+                if flags.contains(BtreeIterFlags::IS_EXTENTS) && self.pos.offset == u64::MAX {
+                    if self.pos.inode == u64::MAX {
+                        k = Ok(None);
+                        break 'out2;
+                    }
+
+                    self.set_pos_in(paths, self.pos.nosnap_successor());
+                }
+
+                let search_key = self.search_key();
+                self.path = trans.path_set_pos(paths, self.path, search_key, self.intent(), self.ip_allocated());
+
+                if let Err(e) = trans.path_traverse(t, paths, self.path, flags) {
+                    k = Err(e);
+                    break 'out;
+                }
+
+                let level = paths[self.path].level() as usize;
+                if paths[self.path].node(level).is_null() {
+                    k = Ok(None);
+                    break 'out2;
+                }
+
+                trans.path_set_should_be_locked(paths, self.path);
+
+                if flags.contains(BtreeIterFlags::CACHED) ||
+                   !flags.intersects(BtreeIterFlags::IS_EXTENTS | BtreeIterFlags::FILTER_SNAPSHOTS) {
+                    /*
+                     * Consult sources in the same order as bch2_btree_iter_peek_max():
+                     * btree, then key cache, then journal, then the transaction's own
+                     * updates - each overlaying the last, so an in-transaction update
+                     * wins. Crucially the key cache is peeked before trans updates, so
+                     * the key_cache_path is established even when we already have an
+                     * update for this key; otherwise a second update to the same cached
+                     * key in one transaction would skip the cache and livelock against
+                     * a dirty cached entry in bch2_trans_update_get_key_cache().
+                     */
+                    let mut v = paths[self.path].peek_slot(&mut self.k);
+
+                    if flags.contains(BtreeIterFlags::KEY_CACHED) {
+                        if let Err(e) = self.trans_peek_key_cache(t, paths, &mut v) {
+                            k = Err(e);
+                            break 'out;
+                        }
+                    }
+
+                    if flags.contains(BtreeIterFlags::WITH_JOURNAL) {
+                        if let Some(j) = self.trans_peek_slot_journal(t, paths) {
+                            v = Some(j);
+                        }
+                    }
+
+                    if trans.nr_updates.get() != 0 && !flags.contains(BtreeIterFlags::COMMITTED) {
+                        self.trans_peek_slot_updates(paths, &mut v);
+                    }
+
+                    if v.is_some() &&
+                       self.k.key_type().is_extent_whiteout() &&
+                       flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) &&
+                       !flags.contains(BtreeIterFlags::NOFILTER_WHITEOUTS) {
+                        self.k.set_key_type(BkeyType::deleted);
+                    }
+                    k = Ok(v);
+                } else {
+                    let mut search_end = self.pos;
+
+                    /*
+                     * To the inode's end, not @end: an extent is in the leaf its end is
+                     * in, and one starting before @end can end past the leaf a peek to
+                     * @end stops in
+                     */
+                    if flags.contains(BtreeIterFlags::IS_EXTENTS) {
+                        search_end.offset = u64::MAX;
+                    }
+
+                    ebug_assert!(paths[self.path].level() == 0);
+
+                    let mut iter2 = self.copy_in(paths);
+                    iter2.set_flags(BtreeIterFlags::NOFILTER_WHITEOUTS);
+                    /* k below is iter2's value under iter->k, a copy of iter2.k: untrimmed, they agree */
+                    iter2.clear_flags(BtreeIterFlags::TRIM);
+
+                    k = loop {
+                        let k = iter2.peek_max_in(t, paths, search_end);
+                        if iter2.is_extents() && matches!(k, Ok(Some(_))) &&
+                           iter2.k.key_type() == BkeyType::whiteout {
+                            iter2.set_pos_in(paths, iter2.k.p);
+                            continue;
+                        }
+
+                        break k;
+                    };
+
+                    if let Ok(Some(_)) = k {
+                        self.key_cache_path.swap(&iter2.key_cache_path);
+                        self.k = iter2.k;
+                    }
+                    iter2.exit_in(paths);
+
+                    let Ok(v) = k else {
+                        break 'out;
+                    };
+
+                    if v.is_some() &&
+                       self.k.key_type().is_extent_whiteout() &&
+                       flags.contains(BtreeIterFlags::FILTER_SNAPSHOTS) &&
+                       !flags.contains(BtreeIterFlags::NOFILTER_WHITEOUTS) {
+                        self.k.set_key_type(BkeyType::deleted);
+                    }
+
+                    let mut next = if v.is_some() { self.k.start_pos() } else { POS_MAX };
+                    /* a hole ends at @end at the latest */
+                    if flags.contains(BtreeIterFlags::IS_EXTENTS) && bkey_lt(end, next) {
+                        next = end;
+                    }
+
+                    if bkey_lt(self.pos, next) {
+                        self.k = c::bkey::new();
+                        self.k.p = self.pos;
+
+                        if flags.contains(BtreeIterFlags::IS_EXTENTS) {
+                            let to = if next.inode == self.pos.inode { next.offset } else { u64::MAX };
+                            self.k.resize((to - self.pos.offset).min(u64::from(max_of(&self.k.size))) as u32);
+                            ebug_assert!(self.k.size != 0);
+                        }
+
+                        k = Ok(Some(KeyVal(ptr::null())));
+                    }
+                }
+            }
+
+            self.verify_entry_exit();
+            self.verify(paths);
+            if let Err(e) = self.verify_ret(t, paths, k) {
+                k = Err(e);
+            }
+        }
+
+        let fs = trans.fs();
+        fs.event_trace(events::btree_iter_peek_slot, |out| peek_trace(out, fs, k.map(|k| self.key_of(k))));
+
+        k
+    }
+
+    pub(super) fn peek_slot_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>) -> Peeked {
+        let k = self.__peek_slot(t, paths, SPOS_MAX, crate::ret_ip!());
+
+        self.maybe_trim(k, self.pos, SPOS_MAX)
+    }
+
+    pub(super) fn peek_slot_max_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>, end: Bpos) -> Peeked {
+        ebug_assert!(!self.is_extents() || bkey_lt(self.pos, end),
+                     "an extents slot at {}, not before its end {}", self.pos, end);
+
+        let k = self.__peek_slot(t, paths, end, crate::ret_ip!());
+
+        self.maybe_trim(k, self.pos, end)
+    }
+
+    pub(super) fn prev_slot_in(&mut self, t: &TransAttempt<'_, '_>, paths: &mut Paths<'_>) -> Peeked {
+        /* reverse slots aren't defined for extents: peek_slot() is the slot from @pos on */
+        assert!(!self.is_extents(), "reverse slots on an extents iterator");
+
+        if !self.rewind_in(paths) {
+            return Ok(None);
+        }
+
+        self.peek_slot_in(t, paths)
+    }
+
+    /// The key, the root node's, held by the iterator's path.
+    pub(super) fn peek_root_in(&mut self, t: &TransAttempt<'t, '_>, paths: &mut Paths<'_>, btree: Btree,
+                               level: u32) -> Result<Option<NonNull<BkeyI>>, BchError> {
+        let trans = t.trans();
+        let fs = trans.fs();
+
+        while fs.btree.cache.roots.node(btree.0).is_some_and(|root| level == u32::from(root.c.level.get()) + 1) {
+            self.exit_in(paths);
+            *self = BtreeIter::node_iter_init_in(trans, paths, btree, POS_MIN, 0, level - 1,
+                                                 BtreeIterFlags::NOT_EXTENTS | BtreeIterFlags::ALL_SNAPSHOTS,
+                                                 crate::ret_ip!());
+            let b =self.peek_node_in(t, paths)?.expect("a root's level has a node");
+
+            if fs.btree.cache.roots.node(btree.0).is_none_or(|r| !ptr::eq(r, b.node())) {
+                continue;
+            }
+
+            if b.is_fake() {
+                break;
+            }
+
+            return Ok(Some(NonNull::from(b.contents().key_i())));
+        }
+
+        Ok(None)
+    }
+
+    fn holds_paths(&self) -> bool {
+        self.path != 0 || self.update_path != 0 || self.key_cache_path.get() != 0
+    }
+
+    pub(super) fn exit_in(&mut self, paths: &mut Paths<'_>) {
+        if self.holds_paths() {
+            let trans = self.trans;
+            let intent = self.intent();
+
+            if self.update_path != 0 {
+                trans.path_put(paths, self.update_path, intent);
+            }
+            if self.path != 0 {
+                trans.path_put(paths, self.path, intent);
+            }
+            if self.key_cache_path.get() != 0 {
+                trans.path_put(paths, self.key_cache_path.get(), intent);
+            }
+        }
+        self.path = 0;
+        self.update_path = 0;
+        self.key_cache_path.set(0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn init_common(trans: &'t BtreeTrans<'t>, paths: &mut Paths<'_>, btree: Btree, pos: Bpos,
+                   locks_want: u32, depth: u32, flags: BtreeIterFlags, ip: c_ulong) -> Self {
+        let mut iter = BtreeIter::uninit(trans);
+
+        iter.set_btree(btree);
+        iter.flags = flags.bits();
+        iter.snapshot = pos.snapshot;
+        iter.pos = pos;
+        iter.k = c::bkey { p: pos, ..c::bkey::new() };
+        #[cfg(any(CONFIG_BCACHEFS_LOCK_TIME_STATS, CONFIG_BCACHEFS_DEBUG))]
+        {
+            iter.ip_allocated = ip;
+        }
+        iter.path = trans.path_get(paths, btree, pos, locks_want, depth, flags, ip);
+        iter
+    }
+
+    pub(super) fn init_in(trans: &'t BtreeTrans<'t>, paths: &mut Paths<'_>, btree: Btree, pos: Bpos,
+                          flags: BtreeIterFlags, ip: c_ulong) -> Self {
+        Self::init_common(trans, paths, btree, pos, 0, 0, btree_iter_flags(trans, btree, 0, flags), ip)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn init_ll_in(trans: &'t BtreeTrans<'t>, paths: &mut Paths<'_>, btree: Btree, pos: Bpos,
+                  locks_want: u32, depth: u32, flags: BtreeIterFlags, ip: c_ulong) -> Self {
+        let mut iter = Self::init_common(trans, paths, btree, pos, locks_want, depth,
+                                         btree_iter_flags(trans, btree, depth, flags), ip);
+
+        iter.min_depth = depth as u8;
+        #[cfg(CONFIG_BCACHEFS_DEBUG)]
+        {
+            let path = &paths[iter.path];
+            assert!(u32::from(path.locks_want()) >= locks_want.min(c::BTREE_MAX_DEPTH));
+            assert!(u32::from(path.level()) == depth);
+            assert!(u32::from(iter.min_depth) == depth);
+        }
+        iter
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn node_iter_init_in(trans: &'t BtreeTrans<'t>, paths: &mut Paths<'_>, btree: Btree, pos: Bpos,
+                         locks_want: u32, depth: u32, mut flags: BtreeIterFlags, ip: c_ulong) -> Self {
+        flags |= BtreeIterFlags::NOT_EXTENTS;
+        flags |= BtreeIterFlags::SNAPSHOT_FIELD;
+        flags |= BtreeIterFlags::ALL_SNAPSHOTS;
+
+        if depth == 0 && btree_id_cached(btree) {
+            flags |= BtreeIterFlags::KEY_CACHED;
+        }
+
+        Self::init_ll_in(trans, paths, btree, pos, locks_want, depth, flags, ip)
+    }
+
+    pub(super) fn copy_in(&self, paths: &mut Paths<'_>) -> Self {
+        let mut dst = unsafe { ptr::read(self) };
+
+        #[cfg(any(CONFIG_BCACHEFS_LOCK_TIME_STATS, CONFIG_BCACHEFS_DEBUG))]
+        {
+            dst.ip_allocated = crate::ret_ip!();
+        }
+        if self.path != 0 {
+            paths.get_ll(self.path, self.intent());
+        }
+        if self.update_path != 0 {
+            paths.get_ll(self.update_path, self.intent());
+        }
+        dst.key_cache_path = Cell::new(0);
+        dst
+    }
+}
+
+/*
+ * Check iterator parameters from an untrusted source (e.g. an ioctl) against
+ * the preconditions the iterator code enforces with assertions. Kernel
+ * callers know these rules; user-controlled (btree, level, range, flags)
+ * combinations must be validated first:
+ */
+pub fn btree_iter_params_valid(btree: Btree, level: u32, start: Bpos, end: Bpos, flags: BtreeIterFlags)
+    -> bool
+{
+    if btree.0 >= Btree::NR {
+        return false;
+    }
+
+    if level >= c::BTREE_MAX_DEPTH {
+        return false;
+    }
+
+    /* Interior nodes span snapshots; filtering only makes sense at level 0: */
+    if level != 0 && !flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+        return false;
+    }
+
+    if btree.has_snapshots() && !flags.contains(BtreeIterFlags::ALL_SNAPSHOTS) {
+        /* No snapshot to filter against: */
+        if start.snapshot == 0 {
+            return false;
+        }
+
+        /* Whiteout filtering peeks ahead of the end pos: */
+        if end == POS_MAX {
+            return false;
+        }
+
+        /* Backwards filtered iteration requires a single inode: */
+        if flags.contains(BtreeIterFlags::PREV) && start.inode != end.inode {
+            return false;
+        }
+    }
+
+    /* Reverse slots aren't defined for extents: */
+    if flags.contains(BtreeIterFlags::PREV | BtreeIterFlags::SLOTS) &&
+       !flags.intersects(BtreeIterFlags::ALL_SNAPSHOTS | BtreeIterFlags::NOT_EXTENTS) &&
+       btree.is_extents() {
+        return false;
+    }
+
+    true
+}
+
+// ── For C ───────────────────────────────────────────────────────────────────
+
+/**
+ * bch2_btree_iter_peek_max() - returns first key greater than or equal to
+ * iterator's current position
+ * @iter:	iterator to peek from
+ * @end:	search limit: returns keys less than or equal to @end
+ *
+ * Returns:	key if found, or an error extractable with bkey_err().
+ */
+
+/**
+ * bch2_btree_iter_peek_prev_min() - returns first key less than or equal to
+ * iterator's current position
+ * @iter:	iterator to peek from
+ * @end:	search limit: returns keys greater than or equal to @end
+ *
+ * With BTREE_ITER_filter_snapshots: the greatest key visible in
+ * iter->snapshot at or below iter->pos - for extents, starting before it -
+ * and at or above @end. What's visible at a position is the version there of
+ * the nearest of iter->snapshot and its ancestors, unless that's a whiteout:
+ * then nothing is.
+ *
+ * Snapshot IDs decrease from the root down, so searching backwards meets a
+ * position's versions furthest ancestor first; the nearest is found forwards
+ * instead (btree_iter_peek_visible_at()), once per position that has one.
+ *
+ * With BTREE_ITER_trim, an extent is cut to [@end, iter->pos), and iter->pos
+ * is left at the end of what's returned.
+ *
+ * Returns:	key if found, or an error extractable with bkey_err().
+ */
+
+/**
+ * bch2_btree_iter_peek_slot() - the key at the iterator's position, or a hole
+ * there - a deleted key - if there's none
+ * @iter:	iterator to peek from
+ *
+ * Returns:	key if found, or an error extractable with bkey_err().
+ */
+
+/**
+ * bch2_btree_iter_peek_slot_max() - bch2_btree_iter_peek_slot() with an end:
+ * for extents, a hole ends at @end at the latest, and with BTREE_ITER_trim the
+ * key is cut to [iter->pos, @end)
+ * @iter:	iterator to peek from
+ * @end:	the end of the window, past the iterator's position
+ *
+ * Returns:	key if found, or an error extractable with bkey_err().
+ */
+
+
+/*
+ * Low-level iterator init: takes level and flags exactly as given - no
+ * defaulting of not_extents/snapshot_field/all_snapshots (the node iterator
+ * conventions). For callers that need per-level iteration with caller-chosen
+ * snapshot semantics, e.g. the query_btree_keys ioctl; validate untrusted
+ * parameters with bch2_btree_iter_params_valid() first:
+ */
+
+/// XXX polonius: NLL problem case #3. A loop that returns the key it stops
+/// at, borrowed from its iterator, and advances otherwise:
+///
+/// ```ignore
+/// let (iter, k) = self.peek_with(..)?;
+/// if f(iter, k)? { return Ok(Some(k)) }
+/// self.advance();
+/// ```
+///
+/// is sound - the key's borrow is dead on the path that advances - but NLL
+/// sees a borrow returned on one path as live on all of them, and rejects
+/// it; Polonius accepts it (nightly does, as of 2026-10). Until it's
+/// stable, the loop returns the key through this, which gives it the
+/// lifetime the loop's caller borrowed the iterator for.
+///
+/// The same goes for a function that returns a key it found on one path,
+/// and goes on to use the iterator on another.
+///
+/// Delete this once Polonius is stable: each use becomes a plain `k`.
+///
+/// # Safety
+/// The iterator @k borrows mustn't be touched again before the caller
+/// returns @k - which ends its use of it.
+pub(crate) unsafe fn polonius_key<'i, V: ?Sized + BkeyVal>(k: BkeySC<'_, V>) -> BkeySC<'i, V> {
+    BkeySC { k: unsafe { &*(k.k as *const c::bkey) }, v: k.v, iter: PhantomData, val: PhantomData }
+}
+
+/// Btrees walked in parallel, by position: each of @iters peeked from where it
+/// is, and the positions they're at compared - each as @to_walk has it, for a
+/// btree the walk keys apart from the others - giving where the walk is, the
+/// least of them, and each iterator with its key there: None for one that's
+/// ahead. The keys are borrowed from their iterators, shared, as the
+/// iterators are from here.
+pub fn peek_parallel<'k, 't, const N: usize>(
+    t:       &'k TransAttempt<'_, 't>,
+    mut iters: [&'k mut BtreeIter<'t>; N],
+    to_walk:   impl Fn(usize, &BtreeIter<'t>) -> Bpos,
+) -> Result<(Bpos, [(&'k BtreeIter<'t>, Option<BkeySC<'k>>); N]), BchError>
+{
+    // Stop at the first error: it may be a restart, and nothing may peek in a
+    // transaction that's restarting
+    let mut found = [None; N];
+    {
+        let mut paths = t.trans().paths();
+        for (iter, k) in iters.iter_mut().zip(&mut found) {
+            *k = iter.peek_max_in(t, &mut paths, SPOS_MAX)?;
+        }
+    }
+    let iters = iters.map(|iter| -> &'k BtreeIter<'t> { iter });
+
+    let pos: [Bpos; N] = core::array::from_fn(|i| to_walk(i, iters[i]));
+    let at = pos.iter().copied().min().expect("an iterator to walk");
+
+    Ok((at, core::array::from_fn(|i| (iters[i], if at < pos[i] { None } else { iters[i].key_of(found[i]) }))))
+}
+
+impl<'t> BtreeIter<'t> {
+    /// An iterator with no paths - whose exit, its drop, puts none.
+    pub fn uninit(trans: &'t BtreeTrans<'t>) -> BtreeIter<'t> {
+        BtreeIter {
+            trans,
+            path:           0,
+            update_path:    0,
+            key_cache_path: Default::default(),
+            bits:           ::pin_init::zeroed(),
+            min_depth:      0,
+            flags:          0,
+            snapshot:       0,
+            pos:            Default::default(),
+            k:              c::bkey::new(),
+            journal_idx:    0,
+            #[cfg(any(CONFIG_BCACHEFS_LOCK_TIME_STATS, CONFIG_BCACHEFS_DEBUG))]
+            ip_allocated:   0,
+        }
+    }
+
+    /// The key pointing to @btree's root - none unless the root's just below
+    /// @level - with this iterator initialized at it, and given back shared
+    /// with the key: bch2_btree_iter_peek_root(), for BtreeLevels.
+    pub(super) fn peek_root<'i>(&'i mut self, t: &TransAttempt<'t, '_>, btree: Btree, level: u32)
+        -> Result<Option<(&'i BtreeIter<'t>, BkeySC<'i>)>, BchError>
+    {
+        let k = self.peek_root_in(t, &mut t.trans().paths(), btree, level)?;
+        // SAFETY: the key, in the iterator's path, for as long as it's borrowed
+        Ok(k.map(|k| (&*self, BkeySC::from(unsafe { k.as_ref() }))))
+    }
+
+    /// Whether the iterator's path holds a node at its level - a btree node,
+    /// or a cached path's key cache entry: btree_path_node().
+    pub(crate) fn has_node_at_iter_level(&self, t: &TransAttempt<'_, 't>) -> bool {
+        let paths = t.trans().paths();
+        let path = &paths[self.path];
+        matches!(path.l[path.level() as usize].b.get(), Ok(Some(_)))
+    }
+
+    /// The node the iterator's path holds at its level, if it has one - a
+    /// level without one holds NULL or an error pointer, as IS_ERR_OR_NULL().
     pub(crate) fn node_at_iter_level<'a>(
-        &mut self,
+        &self,
         t: &TransAttempt<'a, 't>,
     ) -> Option<BtreeNodeRef> {
-        unsafe {
-            let path = c::btree_iter_path(t.raw(), self.raw_mut());
-            let node = (*path).l[(*path).level() as usize].b;
+        let paths = t.trans().paths();
+        let path = paths[self.path].downcast::<BtreeNode>()
+            .expect("node_at_iter_level() of a cached iterator, which holds no btree node");
+        path.l[path.level() as usize].b.get().ok()?.map(|raw| BtreeNodeRef { raw })
+    }
 
-            NonNull::new(node).map(|raw| BtreeNodeRef { raw })
+    /// The btree's key at the iterator's path's position - not the journal
+    /// keys over it, which a peek sees - unpacked into @u if it's packed.
+    pub(crate) fn path_peek_slot<'k>(&'k self, t: &TransAttempt<'_, 't>, u: &'k mut c::bkey) -> BkeySC<'k> {
+        let paths = t.trans().paths();
+        let KeyVal(v) = paths[self.path].peek_slot(u).expect("a slot always has a key");
+        unsafe { key_from_parts(u, v) }
+    }
+
+    /// btree_iter_path()->l[0]: None with no node there.
+    ///
+    /// # Safety
+    /// The transaction doesn't unlock while it's used - the borrow of @t
+    /// doesn't see to that, as unlock() takes &self.
+    pub unsafe fn leaf<'a>(&self, t: &'a TransAttempt<'_, 't>) -> Option<PathLeaf<'a>> {
+        unsafe {
+            // an iterator's path isn't cached: its key cache path is
+            let path = t.trans().paths.get().add(self.path as usize).cast::<BtreePath<BtreeNode>>();
+            let l = &raw mut (*path).l[0];
+            // NULL above the root, or an error pointer
+            (*l).b.get().ok()??;
+            Some(PathLeaf { l, _trans: PhantomData })
         }
     }
 
-    pub fn pos(&self) -> c::bpos {
-        self.raw.pos
+    pub fn pos(&self) -> Bpos {
+        self.pos
     }
 
-    pub fn set_pos(&mut self, pos: c::bpos) {
-        unsafe { c::bch2_btree_iter_set_pos(&mut self.raw, pos) };
+    /// @k is a key at the iterator's level, above the leaves.
+    pub fn prefetch_child(&self, t: &TransAttempt<'_, 't>, k: &BkeyI) -> Result<(), BchError> {
+        let trans = t.trans();
+        let mut paths = trans.paths();
+        let path = &paths[self.path];
+        assert!(path.level() != 0, "prefetching below the leaves");
+        let (btree, level) = (path.btree_id(), path.level() as usize);
+        trans.btree_node_prefetch(&mut paths, Some(self.path), k, btree, level - 1)
     }
 
+    /// For an extents iterator: back to the start of the key it's at.
     pub fn set_pos_to_extent_start(&mut self) {
-        unsafe { c::bch2_btree_iter_set_pos_to_extent_start(&mut self.raw) };
+        debug_assert!(self.is_extents());
+        self.pos = self.k.start_pos();
+    }
+
+    /// Look in @snapshot, at the same position.
+    pub fn set_snapshot(&mut self, snapshot: u32) {
+        self.snapshot = snapshot;
+        self.set_pos(Bpos { snapshot, ..self.pos });
+    }
+
+    pub(super) fn set_snapshot_in(&mut self, paths: &mut Paths<'_>, snapshot: u32) {
+        self.snapshot = snapshot;
+        self.set_pos_in(paths, Bpos { snapshot, ..self.pos });
+    }
+
+    pub fn snapshot(&self) -> u32 {
+        self.snapshot
+    }
+
+    /// Whether it walks extents - keys covering a range, ending at their
+    /// position.
+    pub fn is_extents(&self) -> bool {
+        self.iter_flags().contains(BtreeIterFlags::IS_EXTENTS)
+    }
+
+    /// Turn on @flags: for walking an iterator with flags it wasn't made
+    /// with - the loops peek with the iterator's own - as C's _continue
+    /// loops pass theirs.
+    pub fn set_flags(&mut self, flags: BtreeIterFlags) {
+        self.flags |= flags.bits();
+    }
+
+    /// Turn off @flags: for an iterator going on with flags it was made
+    /// without.
+    pub fn clear_flags(&mut self, flags: BtreeIterFlags) {
+        self.flags &= !flags.bits();
+    }
+
+    /// A second iterator at the same position, sharing this one's paths.
+    pub fn copy(&self) -> BtreeIter<'t> {
+        let trans = self.trans;
+        self.copy_in(&mut trans.paths())
     }
 
     pub fn new(
-        trans: &BtreeTrans<'t>,
+        trans: impl TransRef<'t>,
         btree: impl Into<u32>,
-        pos: bpos,
+        pos: Bpos,
         flags: BtreeIterFlags,
     ) -> BtreeIter<'t> {
-        unsafe {
-            let mut iter: MaybeUninit<c::btree_iter> = MaybeUninit::uninit();
+        let trans = trans.trans();
 
-            c::bch2_trans_iter_init_outlined(
-                trans.raw,
-                iter.as_mut_ptr(),
-                c::btree_id::from_raw(btree.into()).expect("invalid btree id"),
-                pos,
-                c::btree_iter_update_trigger_flags(flags.bits()),
-                0
-            );
-
-            BtreeIter {
-                raw:   iter.assume_init(),
-                trans: PhantomData,
-            }
-        }
+        BtreeIter::init_in(trans, &mut trans.paths(), alive_btree(trans, btree.into()), pos, flags, 0)
     }
 
     pub fn new_level(
-        trans: &BtreeTrans<'t>,
+        trans: impl TransRef<'t>,
         btree: impl Into<u32>,
-        pos: bpos,
+        pos: Bpos,
         level: u32,
         flags: BtreeIterFlags,
     ) -> BtreeIter<'t> {
-        unsafe {
-            let mut iter: MaybeUninit<c::btree_iter> = MaybeUninit::uninit();
+        let trans = trans.trans();
 
-            c::__bch2_trans_node_iter_init(
-                trans.raw,
-                iter.as_mut_ptr(),
-                c::btree_id::from_raw(btree.into()).expect("invalid btree id"),
-                pos,
-                0,
-                level,
-                c::btree_iter_update_trigger_flags(flags.bits())
-            );
-
-            BtreeIter {
-                raw:   iter.assume_init(),
-                trans: PhantomData,
-            }
-        }
+        BtreeIter::node_iter_init_in(trans, &mut trans.paths(), alive_btree(trans, btree.into()),
+                                     pos, 0, level, flags, crate::ret_ip!())
     }
 
-    pub fn peek_max<'i>(&'i mut self, end: bpos) -> Result<Option<BkeySC<'i>>, BchError> {
-        unsafe {
-            bkey_s_c_to_result(c::bch2_btree_iter_peek_max(&mut self.raw, &end))
-        }
-    }
+    // ── Peeking ──────────────────────────────────────────────────────────
+    //
+    // A key peeked borrows the iterator - its header is in it, iter->k, and
+    // its value in the node the iterator's path holds - and the attempt it
+    // was peeked in, @t: the next trans_begin() unlocks, and it's only the
+    // loop driving the attempt that begins again.
+    //
+    // Not expressed: a key is also stale after a commit, which changes the
+    // leaf nodes it wrote in place - a rule about order within the attempt,
+    // as "no work after a restart" is.
 
-    pub fn peek_max_flags<'i>(&'i mut self, end: bpos, flags: BtreeIterFlags) ->
-            Result<Option<BkeySC<'i>>, BchError> {
-        unsafe {
-            if flags.contains(BtreeIterFlags::SLOTS) {
-                if bkey_le(self.raw.pos, end) {
-                    bkey_s_c_to_result(c::bch2_btree_iter_peek_slot(&mut self.raw))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                bkey_s_c_to_result(c::bch2_btree_iter_peek_max(&mut self.raw, &end))
-            }
-        }
-    }
-
-    pub fn peek_max_type<'i>(&'i mut self, end: bpos, flags: BtreeIterFlags) ->
-            Result<Option<BkeySC<'i>>, BchError> {
-        unsafe {
-            bkey_s_c_to_result(c::bch2_btree_iter_peek_max_type(
-                &mut self.raw,
-                end,
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            ))
-        }
-    }
-
-    pub fn peek(&mut self) -> Result<Option<BkeySC<'_>>, BchError> {
-        self.peek_max(SPOS_MAX)
-    }
-
-    pub fn peek_prev_min<'i>(&'i mut self, min: bpos) -> Result<Option<BkeySC<'i>>, BchError> {
-        unsafe {
-            bkey_s_c_to_result(c::bch2_btree_iter_peek_prev_min(&mut self.raw, min))
-        }
-    }
-
-    pub fn peek_prev_type<'i>(&'i mut self, flags: BtreeIterFlags) ->
-            Result<Option<BkeySC<'i>>, BchError> {
-        unsafe {
-            bkey_s_c_to_result(c::bch2_btree_iter_peek_prev_type(
-                &mut self.raw,
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            ))
-        }
-    }
-
-    pub fn peek_prev(&mut self) -> Result<Option<BkeySC<'_>>, BchError> {
-        self.peek_prev_min(c::bpos { inode: 0, offset: 0, snapshot: 0 })
-    }
-
-    pub fn traverse<'a>(
-        &mut self,
-        t: TransAttempt<'a, 't>,
-    ) -> Result<TransAttempt<'a, 't>, TransError> {
-        let ret = unsafe { c::bch2_btree_iter_traverse(self.raw_mut()) };
-        t.result(ret)
-    }
-
-    pub fn for_each_max<F>(&mut self, trans: &BtreeTrans<'_>, end: bpos, mut f: F)
-        -> Result<(), BchError>
-    where
-        F: for<'a> FnMut(BkeySC<'a>) -> ControlFlow<()>,
+    /// Peek with @peek, under attempt @t.
+    fn peek_in<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>,
+                   peek: impl FnOnce(&mut Self, &TransAttempt<'_, '_>, &mut Paths<'_>) -> Peeked)
+        -> Result<Option<BkeySC<'k>>, BchError>
     {
-        // Respect the iterator's SLOTS flag: a slots iterator must visit every
-        // slot — including holes — via peek_slot, not skip ahead to the next
-        // present key via peek_max. Mirrors `peek_max_flags`.
-        let slots = (self.raw.flags as u32) & BtreeIterFlags::SLOTS.bits() != 0;
-        let raw = &mut self.raw as *mut c::btree_iter;
-        loop {
-            let t = trans.begin();
-            let res = unsafe {
-                if slots {
-                    if bkey_le((*raw).pos, end) {
-                        bkey_s_c_to_result(c::bch2_btree_iter_peek_slot(raw))
-                    } else {
-                        Ok(None)
-                    }
-                } else {
-                    bkey_s_c_to_result(c::bch2_btree_iter_peek_max(raw, &end))
-                }
-            };
-
-            match res {
-                Err(e) if e.matches(bch_errcode::BCH_ERR_transaction_restart) => continue,
-                Err(e) => return Err(e),
-                Ok(None) => return Ok(()),
-                Ok(Some(k)) => {
-                    t.verify_not_restarted();
-                    if let ControlFlow::Break(()) = f(k) {
-                        return Ok(());
-                    }
-                }
-            }
-            // advance() returns false when the key just visited ended at
-            // SPOS_MAX and the position can't move forward — true for the
-            // rightmost key of any interior node level. Looping again would
-            // peek the same key forever.
-            if !unsafe { c::bch2_btree_iter_advance(raw) } {
-                return Ok(());
-            }
-        }
+        let k = peek(self, t, &mut t.trans().paths())?;
+        Ok(self.key_of(k))
     }
 
-    pub fn for_each<F>(&mut self, trans: &BtreeTrans<'_>, f: F) -> Result<(), BchError>
-    where
-        F: for<'a> FnMut(BkeySC<'a>) -> ControlFlow<()>,
+    pub fn peek_max<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>, end: Bpos)
+        -> Result<Option<BkeySC<'k>>, BchError>
     {
-        self.for_each_max(trans, SPOS_MAX, f)
+        self.peek_in(t, |iter, t, paths| iter.peek_max_in(t, paths, end))
     }
 
-    pub fn for_each_commit<F>(
-        &mut self,
-        trans:       &BtreeTrans<'t>,
-        disk_res:    Option<&DiskReservation<'_>>,
-        flags:       CommitOpts,
-        mut f:       F,
-    ) -> Result<(), BchError>
-    where
-        F: for<'a, 'k> FnMut(
-            TransAttempt<'a, 't>,
-            BkeySC<'k>,
-        ) -> Result<(TransAttempt<'a, 't>, ControlFlow<()>), TransError>,
+    /// At the iterator's level - new_level()'s; None if the btree isn't that deep.
+    pub fn peek_node<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<Option<LockedNode<'k, BtreeNode>>, BchError>
     {
-        let raw = &mut self.raw as *mut c::btree_iter;
-        loop {
-            let t = trans.begin();
-            let k = unsafe { c::bch2_btree_iter_peek(raw) };
-
-            match bkey_s_c_to_result(k) {
-                Err(e) if e.matches(bch_errcode::BCH_ERR_transaction_restart) => continue,
-                Err(e) => return Err(e),
-                Ok(None) => return Ok(()),
-                Ok(Some(k)) => {
-                    let Some((t, flow)) = retry_restart(f(t, k))? else {
-                        continue;
-                    };
-                    let Some(t) = retry_restart(t.commit(disk_res, flags))? else {
-                        continue;
-                    };
-
-                    t.verify_not_restarted();
-                    if let ControlFlow::Break(()) = flow {
-                        return Ok(());
-                    }
-                }
-            }
-
-            if !unsafe { c::bch2_btree_iter_advance(raw) } {
-                return Ok(());
-            }
-        }
+        self.peek_node_in(t, &mut t.trans().paths())
     }
 
-    pub fn for_each_max_commit<F>(
-        &mut self,
-        trans:       &BtreeTrans<'t>,
-        end:         bpos,
-        iter_flags:  BtreeIterFlags,
-        disk_res:    Option<&DiskReservation<'_>>,
-        flags:       CommitOpts,
-        mut f:       F,
-    ) -> Result<(), BchError>
-    where
-        F: for<'a, 'k> FnMut(
-            TransAttempt<'a, 't>,
-            BkeySC<'k>,
-        ) -> Result<(TransAttempt<'a, 't>, ControlFlow<()>), TransError>,
+    /// The key at the iterator's position, or a deleted key for a hole.
+    pub fn peek_slot<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<Option<BkeySC<'k>>, BchError>
     {
-        let raw = &mut self.raw as *mut c::btree_iter;
-        loop {
-            let t = trans.begin();
-            let k = unsafe {
-                c::bch2_btree_iter_peek_max_type(
-                    raw,
-                    end,
-                    c::btree_iter_update_trigger_flags(iter_flags.bits()),
-                )
-            };
-
-            match bkey_s_c_to_result(k) {
-                Err(e) if e.matches(bch_errcode::BCH_ERR_transaction_restart) => continue,
-                Err(e) => return Err(e),
-                Ok(None) => return Ok(()),
-                Ok(Some(k)) => {
-                    let Some((t, flow)) = retry_restart(f(t, k))? else {
-                        continue;
-                    };
-                    let Some(t) = retry_restart(t.commit(disk_res, flags))? else {
-                        continue;
-                    };
-
-                    t.verify_not_restarted();
-                    if let ControlFlow::Break(()) = flow {
-                        return Ok(());
-                    }
-                }
-            }
-
-            if !unsafe { c::bch2_btree_iter_advance(raw) } {
-                return Ok(());
-            }
-        }
+        self.peek_in(t, |iter, t, paths| iter.peek_slot_in(t, paths))
     }
 
-    pub fn for_each_reverse<F>(&mut self, trans: &BtreeTrans<'_>, min: bpos, mut f: F)
-        -> Result<(), BchError>
-    where
-        F: for<'a> FnMut(BkeySC<'a>) -> ControlFlow<()>,
+    /// peek_slot() with an end, past the position: for extents a hole ends
+    /// there at the latest, and with TRIM the key is cut to [position, @end).
+    pub fn peek_slot_max<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>, end: Bpos)
+        -> Result<Option<BkeySC<'k>>, BchError>
     {
-        let raw = &mut self.raw as *mut c::btree_iter;
-        loop {
-            let t = trans.begin();
-            let k = unsafe { c::bch2_btree_iter_peek_prev_min(raw, min) };
-
-            match bkey_s_c_to_result(k) {
-                Err(e) if e.matches(bch_errcode::BCH_ERR_transaction_restart) => continue,
-                Err(e) => return Err(e),
-                Ok(None) => return Ok(()),
-                Ok(Some(k)) => {
-                    t.verify_not_restarted();
-                    if let ControlFlow::Break(()) = f(k) {
-                        return Ok(());
-                    }
-                }
-            }
-            if !unsafe { c::bch2_btree_iter_rewind(raw) } {
-                return Ok(());
-            }
-        }
+        self.peek_in(t, |iter, t, paths| iter.peek_slot_max_in(t, paths, end))
     }
 
-    pub fn for_each_reverse_flags<F>(
-        &mut self,
-        trans: &BtreeTrans<'_>,
-        flags: BtreeIterFlags,
-        mut f: F,
-    ) -> Result<(), BchError>
-    where
-        F: for<'a> FnMut(BkeySC<'a>) -> ControlFlow<()>,
+    /// Back one position, and the key there, or a deleted key for a hole -
+    /// None if there's nowhere further back to go.
+    pub fn prev_slot<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<Option<BkeySC<'k>>, BchError>
     {
-        let raw = &mut self.raw as *mut c::btree_iter;
-        loop {
-            let t = trans.begin();
-            let k = unsafe {
-                c::bch2_btree_iter_peek_prev_type(
-                    raw,
-                    c::btree_iter_update_trigger_flags(flags.bits()),
-                )
-            };
-
-            match bkey_s_c_to_result(k) {
-                Err(e) if e.matches(bch_errcode::BCH_ERR_transaction_restart) => continue,
-                Err(e) => return Err(e),
-                Ok(None) => return Ok(()),
-                Ok(Some(k)) => {
-                    t.verify_not_restarted();
-                    if let ControlFlow::Break(()) = f(k) {
-                        return Ok(());
-                    }
-                }
-            }
-            if !unsafe { c::bch2_btree_iter_rewind(raw) } {
-                return Ok(());
-            }
-        }
+        self.peek_in(t, |iter, t, paths| iter.prev_slot_in(t, paths))
     }
 
-    pub fn advance(&mut self) {
-        unsafe {
-            c::bch2_btree_iter_advance(&mut self.raw);
+    /// The key here as a @K, its value in place: ENOENT_bkey_type_mismatch if
+    /// it isn't one.
+    pub fn peek_slot_typed<'k, K: BkeyFamily + ?Sized>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<BkeySC<'k, K::Validated>, BchError>
+    {
+        let k = self.peek_slot(t)?.expect("a slot always has a key");
+        bkey_arm::<K>(t.fs(), k)
+    }
+
+    /// As peek_slot(), for a key to update through this iterator: the
+    /// iterator comes back shared, for as long as the key is used, as
+    /// peek_slot_typed_shared().
+    pub fn peek_slot_shared<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<(&'k Self, BkeySC<'k>), BchError>
+    {
+        let (this, k) = self.peek_slot_with(t)?.expect("a slot always has a key");
+        Ok((this, k))
+    }
+
+    /// As peek_slot_typed(), for a key to update through this iterator: the
+    /// iterator comes back shared, for as long as the key is used - as the
+    /// for_each loops pass it - so the key can't be moved out from under.
+    pub fn peek_slot_typed_shared<'k, K: BkeyFamily + ?Sized>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<(&'k Self, BkeySC<'k, K::Validated>), BchError>
+    {
+        let (this, k) = self.peek_slot_shared(t)?;
+        Ok((this, bkey_arm::<K>(t.fs(), k)?))
+    }
+
+    pub fn peek_max_type<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>, end: Bpos,
+                                     flags: BtreeIterFlags)
+        -> Result<Option<BkeySC<'k>>, BchError>
+    {
+        self.peek_in(t, |iter, t, paths| iter.peek_max_type_in(t, paths, end, flags))
+    }
+
+    /// Peek with @peek, under attempt @t: the key, and the iterator it
+    /// borrows, shared - both from the one &mut borrow, so neither outlives
+    /// it and nothing moves the iterator while they're in use.
+    pub(super) fn peek_with<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>, paths: &mut Paths<'_>,
+                                peek: impl FnOnce(&mut Self, &TransAttempt<'_, '_>, &mut Paths<'_>) -> Peeked)
+        -> Result<Option<(&'k BtreeIter<'t>, BkeySC<'k>)>, BchError>
+    {
+        let k = peek(self, t, paths)?;
+        let this = &*self;
+        Ok(this.key_of(k).map(|k| (this, k)))
+    }
+
+    /// peek_slot(), and the iterator with the key, shared: for an update at
+    /// the key's position.
+    pub fn peek_slot_with<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<Option<(&'k BtreeIter<'t>, BkeySC<'k>)>, BchError>
+    {
+        self.peek_with(t, &mut t.trans().paths(), |iter, t, paths| iter.peek_slot_in(t, paths))
+    }
+
+    pub fn peek<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<Option<BkeySC<'k>>, BchError>
+    {
+        self.peek_max(t, SPOS_MAX)
+    }
+
+    pub fn peek_prev_min<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>, min: Bpos)
+        -> Result<Option<BkeySC<'k>>, BchError>
+    {
+        self.peek_in(t, |iter, t, paths| iter.peek_prev_min_in(t, paths, min))
+    }
+
+    pub fn peek_prev<'k>(&'k mut self, t: &'k TransAttempt<'_, 't>)
+        -> Result<Option<BkeySC<'k>>, BchError>
+    {
+        self.peek_prev_min(t, Bpos { inode: 0, offset: 0, snapshot: 0 })
+    }
+
+    pub fn traverse(&mut self, t: &TransAttempt<'_, 't>) -> Result<(), BchError> {
+        self.traverse_in(t, &mut t.trans().paths())
+    }
+
+    /// traverse(), its path at the iterator's position, not its search key -
+    /// one past it, for extents.
+    pub fn traverse_at_pos(&mut self, t: &TransAttempt<'_, 't>) -> Result<(), BchError> {
+        self.traverse_at_pos_in(t, &mut t.trans().paths())
+    }
+
+    /// Step past the key just returned: false at the end of the btree.
+    pub fn advance(&mut self) -> bool {
+        let trans = self.trans;
+        self.advance_in(&mut trans.paths())
+    }
+
+    /// Step back past the key just returned, for walking backwards: false at
+    /// the start of the btree.
+    pub fn rewind(&mut self) -> bool {
+        let trans = self.trans;
+        self.rewind_in(&mut trans.paths())
+    }
+
+    /// @f, under the write lock of the key cache entry at the iterator's
+    /// position, if there is one: cycling it advances the entry's lock
+    /// sequence, so the relock of anything that decided on the key fails.
+    /// The iterator holds its leaf intent locked, so an entry isn't created
+    /// meanwhile - the fill write locks the leaf.
+    pub fn with_key_cache_write_lock<R>(&self, t: &TransAttempt<'_, '_>, f: impl FnOnce() -> R)
+        -> Result<R, BchError>
+    {
+        let trans = t.trans();
+        ebug_assert!(ptr::eq(self.trans, trans), "an iterator of another transaction");
+        assert!(trans.paths()[self.path].intent_locked(0),
+                "cycling the key cache lock at {} without its leaf intent locked", self.pos);
+
+        let mut ck_iter = BtreeIter::new(t, self.btree(), self.pos,
+                                         BtreeIterFlags::INTENT | BtreeIterFlags::CACHED |
+                                         BtreeIterFlags::CACHED_NOFILL);
+        ck_iter.traverse(t)?;
+
+        let mut paths = trans.paths();
+        if paths[ck_iter.path].unlocked_node(0).is_none() {
+            return Ok(f());
         }
+
+        trans.node_lock_write(&mut paths, ck_iter.path, 0)?;
+        let ret = f();
+        trans.node_unlock_write(&mut paths, ck_iter.path, 0);
+        Ok(ret)
     }
 }
 
 impl<'t> Drop for BtreeIter<'t> {
     fn drop(&mut self) {
-        unsafe { c::bch2_trans_iter_exit(&mut self.raw) }
+        if self.holds_paths() {
+            let trans = self.trans;
+            self.exit_in(&mut trans.paths());
+        }
     }
 }
 
 pub struct BtreeNodeIter<'t> {
-    raw:   c::btree_iter,
-    trans: PhantomData<&'t BtreeTrans<'t>>,
+    pub(super) raw: BtreeIter<'t>,
 }
 
 impl<'t> BtreeNodeIter<'t> {
     pub fn new(
-        trans: &BtreeTrans<'t>,
+        trans: impl TransRef<'t>,
         btree: impl Into<u32>,
-        pos: bpos,
+        pos: Bpos,
         locks_want: u32,
         depth: u32,
         flags: BtreeIterFlags,
     ) -> BtreeNodeIter<'t> {
-        unsafe {
-            let mut iter: MaybeUninit<c::btree_iter> = MaybeUninit::uninit();
-            c::__bch2_trans_node_iter_init(
-                trans.raw,
-                iter.as_mut_ptr(),
-                c::btree_id::from_raw(btree.into()).expect("invalid btree id"),
-                pos,
-                locks_want,
-                depth,
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            );
-
-            BtreeNodeIter {
-                raw:   iter.assume_init(),
-                trans: PhantomData,
-            }
-        }
+        let trans = trans.trans();
+        let raw = BtreeIter::node_iter_init_in(trans, &mut trans.paths(), alive_btree(trans, btree.into()),
+                                               pos, locks_want, depth, flags, crate::ret_ip!());
+        BtreeNodeIter { raw }
     }
 
-    pub fn peek(&mut self) -> Result<Option<&c::btree>, BchError> {
-        unsafe {
-            let b = c::bch2_btree_iter_peek_node(&mut self.raw);
-            errptr_to_result_c(b).map(|b| if !b.is_null() { Some(&*b) } else { None })
+    pub fn peek(&mut self, t: &TransAttempt<'_, 't>) -> Result<Option<LockedNode<'_, BtreeNode>>, BchError> {
+        let trans = self.raw.trans;
+        self.raw.peek_node_in(t, &mut trans.paths())
+    }
+
+    /// peek(), the node held to update its key: btree_node_update_key()
+    /// takes it, with iter().
+    pub(crate) fn peek_ref(&mut self, t: &TransAttempt<'_, 't>) -> Result<Option<BtreeNodeRef>, BchError> {
+        Ok(self.peek(t)?.map(BtreeNodeRef::from))
+    }
+
+    /// At node @b, intent locked; btree_node_dying if @b's been freed.
+    ///
+    /// # Safety
+    /// @b's key is stable: the caller holds @b, or is writing it.
+    pub(crate) unsafe fn at_node(t: &TransAttempt<'t, 't>, b: &BtreeNode) -> Result<Self, BchError> {
+        let level = usize::from(b.c.level.get());
+        let pos = unsafe { b.contents() }.key.k.p;
+        let mut iter = BtreeNodeIter::new(t, b.c.btree_id.get(), pos, c::BTREE_MAX_DEPTH, b.c.level.get().into(),
+                                          BtreeIterFlags::INTENT);
+        iter.raw.traverse(t)?;
+
+        /* has node been freed? */
+        let at = t.trans().paths()[iter.raw.path].l[level].b.as_ptr();
+        if !ptr::eq(at.cast_const().cast(), b) {
+            /* node has been freed: */
+            assert!(b.flags.dying(), "a node no longer where its key is, and not dying");
+            return Err(t.fs().err(Errcode::btree_node_dying));
         }
+
+        assert!(b.hash_val() != 0, "a node in the btree, not hashed");
+        Ok(iter)
+    }
+
+    pub(crate) fn iter(&mut self) -> &mut BtreeIter<'t> {
+        &mut self.raw
     }
 
     pub fn peek_max_type<'i>(
         &'i mut self,
-        end: bpos,
+        t: &TransAttempt<'_, 't>,
+        end: Bpos,
         flags: BtreeIterFlags,
     ) -> Result<Option<BkeySC<'i>>, BchError> {
-        unsafe {
-            bkey_s_c_to_result(c::bch2_btree_iter_peek_max_type(
-                &mut self.raw,
-                end,
-                c::btree_iter_update_trigger_flags(flags.bits()),
-            ))
-        }
+        let trans = self.raw.trans;
+        let k = self.raw.peek_max_type_in(t, &mut trans.paths(), end, flags)?;
+        Ok(self.raw.key_of(k))
     }
 
-    pub fn for_each<F>(&mut self, trans: &BtreeTrans<'_>, mut f: F) -> Result<(), BchError>
-    where
-        F: for<'a> FnMut(&'a c::btree) -> ControlFlow<()>,
-    {
-        let raw = &mut self.raw as *mut c::btree_iter;
-        loop {
-            let t = trans.begin();
-            let b = unsafe { c::bch2_btree_iter_peek_node(raw) };
-            let b = match errptr_to_result_c(b) {
-                Err(e) if e.matches(bch_errcode::BCH_ERR_transaction_restart) => continue,
-                Err(e) => return Err(e),
-                Ok(b) if b.is_null() => return Ok(()),
-                Ok(b) => unsafe { &*b },
-            };
+}
 
-            t.verify_not_restarted();
+pub(crate) struct BtreeNodeRef {
+    raw: NonNull<BtreeNode>,
+}
 
-            // peek_node() leaves iter->pos at the node's min_key (so a restart
-            // re-finds the node across splits/merges), so we can't use
-            // bch2_btree_iter_advance(); advance explicitly off the node's
-            // max_key. set_pos + bpos_successor re-traverses from the root, so
-            // the journal overlay applies and journal-only nodes aren't skipped
-            // the way next_node()'s sibling walk did. Matches for_each_btree_node().
-            let end = b.key.k.p;
-            if let ControlFlow::Break(()) = f(b) {
-                return Ok(());
-            }
+impl BtreeNodeRef {
+    pub(crate) fn level(&self) -> u32 {
+        unsafe { self.raw.as_ref().c.level.get().into() }
+    }
 
-            if end == SPOS_MAX {
-                return Ok(());
-            }
-            unsafe { c::bch2_btree_iter_set_pos(raw, c::bpos_successor(end)) };
-        }
+    pub(crate) fn key(&self) -> &BkeyI {
+        // SAFETY: a node we hold
+        unsafe { self.raw.as_ref().contents() }.key_i()
+    }
+
+    pub(crate) fn key_sc(&self) -> BkeySC<'_, BtreePtrs> {
+        BkeySC::from(self.key()).arm::<BtreePtrs>().expect("a btree node's key, its pointer")
+    }
+
+    pub(crate) fn btree_id(&self) -> Btree {
+        Btree(unsafe { self.raw.as_ref().c.btree_id.get() }.into())
+    }
+
+    /// The node's identity, for telling whether it's the same node as
+    /// before - not for getting back to it.
+    pub(crate) fn addr(&self) -> usize {
+        self.raw.as_ptr() as usize
+    }
+
+    pub(crate) fn as_ptr(&self) -> *mut BtreeNode {
+        self.raw.as_ptr()
     }
 }
 
-impl<'t> Drop for BtreeNodeIter<'t> {
-    fn drop(&mut self) {
-        unsafe { c::bch2_trans_iter_exit(&mut self.raw) }
+/// A node an iterator returned - backpointer_get_node()'s, say: held by that
+/// iterator's path, as peek_ref()'s is.
+impl From<LockedNode<'_, BtreeNode>> for BtreeNodeRef {
+    fn from(b: LockedNode<'_, BtreeNode>) -> Self {
+        Self { raw: NonNull::from(b.node()) }
     }
 }
 
-#[cfg(feature = "std")]
-impl<'b, 'f> c::btree {
-    pub fn to_text(&'b self, fs: &'f Fs) -> BtreeNodeToText<'b, 'f> {
-        BtreeNodeToText { b: self, fs }
-    }
-
-    pub fn ondisk_to_text(&'b self, fs: &'f Fs) -> BtreeNodeOndiskToText<'b, 'f> {
-        BtreeNodeOndiskToText { b: self, fs }
-    }
+pub struct PathLeaf<'a> {
+    l:      *mut btree_path_level<BtreeNode>,
+    _trans: PhantomData<&'a ()>,
 }
 
-impl c::btree {
-    /// Check if this btree node is a fake/placeholder node.
-    pub fn is_fake(&self) -> bool {
-        (self.flags >> c::btree_flags::BTREE_NODE_fake as u64) & 1 != 0
+impl<'a> PathLeaf<'a> {
+    pub fn node(&self) -> LockedNode<'a, BtreeNode> {
+        unsafe { LockedNode::new((*self.l).b.get().ok().flatten().expect("a leaf with no node").as_ref()) }
     }
 
-    /// Iterate over unpacked keys within this btree node.
-    ///
-    /// Equivalent to the C `for_each_btree_node_key_unpack` macro.
-    /// The callback receives each key in order; return `Break` to
-    /// stop early.
-    pub fn for_each_key<F>(&self, mut f: F) -> ControlFlow<()>
-    where
-        F: for<'a> FnMut(BkeySC<'a>) -> ControlFlow<()>,
-    {
-        let b = self as *const _ as *mut c::btree;
-        let mut node_iter = c::btree_node_iter::default();
-        let mut unpacked: c::bkey = unsafe { core::mem::zeroed() };
-
-        unsafe { c::bch2_btree_node_iter_init_from_start(&mut node_iter, b) };
-
-        loop {
-            let k = unsafe {
-                c::bch2_btree_node_iter_peek_unpack(&mut node_iter, b, &mut unpacked)
-            };
-            if k.k.is_null() {
-                return ControlFlow::Continue(());
-            }
-            if f(BkeySC {
-                k: unsafe { &*k.k },
-                v: unsafe { &*k.v },
-                iter: PhantomData,
-            }).is_break() {
-                return ControlFlow::Break(());
-            }
-            unsafe { c::bch2_btree_node_iter_advance(&mut node_iter, b) };
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-pub struct BtreeNodeToText<'b, 'f> {
-    b:  &'b c::btree,
-    fs: &'f Fs,
-}
-
-#[cfg(feature = "std")]
-impl<'b, 'f> fmt::Display for BtreeNodeToText<'b, 'f> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        printbuf_to_formatter(f, |buf| unsafe {
-            c::bch2_btree_node_to_text(buf, self.fs.raw, self.b)
-        })
-    }
-}
-
-#[cfg(feature = "std")]
-pub struct BtreeNodeOndiskToText<'b, 'f> {
-    b:  &'b c::btree,
-    fs: &'f Fs,
-}
-
-#[cfg(feature = "std")]
-impl<'b, 'f> fmt::Display for BtreeNodeOndiskToText<'b, 'f> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        printbuf_to_formatter(f, |buf| unsafe {
-            c::bch2_btree_node_ondisk_to_text(buf, self.fs.raw, self.b)
-        })
+    /// Where the bset search tree failed at the path's key, if it did:
+    /// the node's bfloat_to_text(). Peeks the node iterator, moving it past deleted
+    /// keys.
+    pub fn bfloat_to_text(&self, out: &mut Printbuf) {
+        let b = self.node();
+        unsafe { b.btree_node_iter_bfloat_to_text(b.contents(), out, &mut (*self.l).iter) }
     }
 }

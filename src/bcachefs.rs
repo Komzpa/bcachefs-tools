@@ -5,10 +5,7 @@ mod device_multipath;
 mod device_scan;
 mod fs_context;
 mod key;
-mod dump_stack;
 mod logging;
-mod plymouth;
-mod prompt;
 mod unlock_socket;
 mod qcow2;
 mod recovery_display;
@@ -19,16 +16,16 @@ mod util;
 mod wrappers;
 pub mod http;
 #[cfg(test)]
-mod cuckoo_test;
-#[cfg(test)]
-mod eytzinger_test;
+mod backtrace_test;
 #[cfg(test)]
 mod percpu_test;
+#[cfg(test)]
+mod select_test;
 #[cfg(test)]
 mod workqueue_test;
 
 use std::process::ExitCode;
-use bch_bindgen::c;
+use bcachefs_kernel::c;
 
 #[derive(Debug)]
 pub struct ErrnoError(pub errno::Errno);
@@ -265,22 +262,125 @@ fn generate_cli_doc() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let path = dir.join("cli-reference.tex");
-    if let Err(e) = std::fs::write(&path, &out) {
-        eprintln!("error writing {}: {e}", path.display());
-        return ExitCode::FAILURE;
+    for (name, text) in [("cli-reference.tex", out), ("opts-table.tex", opts_table())] {
+        let path = dir.join(name);
+        if let Err(e) = std::fs::write(&path, &text) {
+            eprintln!("error writing {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+        eprintln!("wrote {}", path.display());
+    }
+    ExitCode::SUCCESS
+}
+
+/// The options reference, from the options table: those that may be set -
+/// not hidden, not internal plumbing set only by the code.
+fn opts_table() -> String {
+    use bcachefs_kernel::opts::{opt_to_text, OptType, DEFAULTS, OPTS};
+    use bcachefs_kernel::util::Printbuf;
+    use c::OptFlags as f;
+    use std::fmt::Write;
+
+    let scopes = [(f::fs, "fs"), (f::format, "format"), (f::mount, "mount"),
+                  (f::runtime, "runtime"), (f::device, "device"), (f::inode, "inode")];
+
+    let mut out = String::new();
+    out.push_str("% Generated from the options table by bcachefs _doc_gen - do not edit\n\n");
+    out.push_str("\\small\n\\begin{description}\n");
+
+    for opt in &OPTS {
+        let scope: Vec<_> = scopes.iter().filter(|(s, _)| opt.has(*s)).map(|(_, n)| *n).collect();
+        if scope.is_empty() || opt.has(f::hidden) || opt.has(f::nodoc) {
+            continue;
+        }
+
+        let ty = match opt.ty {
+            OptType::Bool => None,
+            OptType::Uint => Some("uint"),
+            OptType::Str(_) | OptType::StrMember { .. } => Some("str"),
+            OptType::Bitfield { .. } => Some("bitfield"),
+            OptType::Fn(_) => Some("fn"),
+        };
+        let v = DEFAULTS.get(opt.id);
+        let default = match opt.ty {
+            OptType::Bool => (if v != 0 { "true" } else { "false" }).to_string(),
+            _ => {
+                let mut p = Printbuf::new();
+                opt_to_text(&mut p, None, None, opt, v, 0);
+                p.as_str().to_string()
+            }
+        };
+
+        writeln!(out, "\\label{{opt:{}}}\\item[\\texttt{{{}}}] \\hfill \\\\",
+                 opt.name.replace('_', "-"), escape_latex(opt.name)).unwrap();
+        write!(out, "\t\\textit{{{}}}", scope.join(", ")).unwrap();
+        if let Some(ty) = ty {
+            write!(out, " \\quad {ty}").unwrap();
+        }
+        if !default.is_empty() && default != "0" {
+            write!(out, " \\quad default: {}", escape_latex(&default)).unwrap();
+        }
+        writeln!(out, " \\\\").unwrap();
+
+        let help: Vec<_> = opt.help.unwrap_or_default().split_whitespace().collect();
+        if !help.is_empty() {
+            writeln!(out, "\t{}", escape_latex(&help.join(" "))).unwrap();
+        }
+        out.push('\n');
     }
 
-    eprintln!("wrote {}", path.display());
-    ExitCode::SUCCESS
+    out.push_str("\\end{description}\n\\normalsize\n");
+    out
+}
+
+/*
+ * Fatal-signal handler: print signal name and a unified backtrace via
+ * dump_stack() (libunwind + util/demangle.rs + libdw line info), then
+ * re-raise. SA_RESETHAND means our handler ran once and the default
+ * disposition is restored, so re-raising terminates with the kernel's
+ * default action (core dump if ulimit -c permits).
+ *
+ * Strictly speaking dump_stack() allocates, which isn't async-signal-safe.
+ * In practice the failure paths that bring us here (NULL deref, assert,
+ * illegal insn) aren't on malloc's call path, so this works reliably; if it
+ * ever does deadlock, the user can SIGKILL and inspect the core file.
+ */
+extern "C" fn fatal_signal_handler(signo: core::ffi::c_int) {
+    let name: &[u8] = match signo {
+        libc::SIGSEGV => b"\nbcachefs: fatal SIGSEGV\n",
+        libc::SIGILL  => b"\nbcachefs: fatal SIGILL\n",
+        libc::SIGBUS  => b"\nbcachefs: fatal SIGBUS\n",
+        libc::SIGFPE  => b"\nbcachefs: fatal SIGFPE\n",
+        libc::SIGABRT => b"\nbcachefs: fatal SIGABRT\n",
+        _             => b"\nbcachefs: fatal signal\n",
+    };
+    let _ = rustix::io::write(rustix::stdio::stderr(), name);
+
+    bcachefs_kernel::util::backtrace::dump_stack();
+
+    unsafe {
+        libc::raise(signo);
+        libc::_exit(128 + signo);
+    }
+}
+
+fn install_fatal_signal_handlers() {
+    let mut sa: libc::sigaction = unsafe { core::mem::zeroed() };
+    sa.sa_sigaction = fatal_signal_handler as extern "C" fn(core::ffi::c_int) as libc::sighandler_t;
+    sa.sa_flags = libc::SA_NODEFER | libc::SA_RESETHAND;
+    unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+
+    for signo in [libc::SIGSEGV, libc::SIGILL, libc::SIGBUS, libc::SIGFPE, libc::SIGABRT] {
+        unsafe { libc::sigaction(signo, &sa, core::ptr::null_mut()) };
+    }
 }
 
 fn main() -> ExitCode {
     // panic = "abort" in Cargo.toml ensures Rust panics can't be swallowed
-    // by catch_unwind; this installs C-side handlers for SIGABRT/SIGSEGV/
-    // SIGILL/SIGBUS/SIGFPE so a panic or fatal fault prints a unified
-    // backtrace via bch2_prt_task_backtrace before the kernel core-dumps.
-    unsafe { c::bch2_install_fatal_signal_handlers(); }
+    // by catch_unwind; this installs handlers for SIGABRT/SIGSEGV/SIGILL/
+    // SIGBUS/SIGFPE so a panic or fatal fault prints a unified backtrace
+    // before the kernel core-dumps.
+    install_fatal_signal_handlers();
 
     // The Rust runtime starts with SIGPIPE ignored, so writing to a closed
     // pipe returns EPIPE - which println! reports by panicking. Restore
@@ -289,11 +389,13 @@ fn main() -> ExitCode {
     // disconnects block SIGPIPE locally instead (see http.rs).
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
 
+    let _ = bcachefs_kernel::os::debugfs::START_HTTP.set(http::start_lazy);
+
     // glibc and Rust stdlib buffer stdout independently; when piped, both
     // switch to block buffering which can reorder or lose output.
     // Set both to line-buffered.
     unsafe {
-        extern "C" { static stdout: *mut libc::FILE; }
+        unsafe extern "C" { static stdout: *mut libc::FILE; }
         libc::setvbuf(stdout, std::ptr::null_mut(), libc::_IOLBF, 0);
     }
 
@@ -338,8 +440,6 @@ fn main() -> ExitCode {
         }
     }
 
-    unsafe { c::raid_init() };
-
     let (cmd_name, argv) = if let Some(cmd) = symlink_cmd {
         let mut v = vec![cmd.to_string()];
         v.extend_from_slice(&args[1..]);
@@ -351,7 +451,7 @@ fn main() -> ExitCode {
     // fuse will call this after daemonizing, we can't create threads before
     // note that mount may invoke fusemount, via -t bcachefs.fuse
     if !commands::defers_shrinkers(cmd_name) {
-        unsafe { c::linux_shrinkers_init() };
+        bcachefs_kernel::os::shrinker::linux_shrinkers_init();
     }
 
     check_kernel_warnings();

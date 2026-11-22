@@ -52,21 +52,19 @@
 //! entry point - fspick(2) plus FSCONFIG_CMD_RECONFIGURE - and isn't
 //! implemented here.
 //!
-//! Constants are from uapi linux/mount.h. libc has the syscall numbers but not
-//! these; they're stable ABI.
+//! The calls are rustix's, but for status_fd(): its fsconfig(2) returns an fd,
+//! which rustix's drops. Its FSCONFIG_SET_FLAG is from uapi linux/mount.h -
+//! libc has the syscall numbers but not these; they're stable ABI.
 
 use std::{
     ffi::{CStr, CString},
     io,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
-const FSOPEN_CLOEXEC:  libc::c_uint = 0x0000_0001;
-const FSMOUNT_CLOEXEC: libc::c_uint = 0x0000_0001;
+use rustix::mount;
 
-const FSCONFIG_SET_FLAG:   libc::c_uint = 0;
-const FSCONFIG_SET_STRING: libc::c_uint = 1;
-const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
+const FSCONFIG_SET_FLAG: core::ffi::c_uint = 0;
 
 /// The most a single fsconfig(2) parameter value can carry.
 ///
@@ -84,24 +82,24 @@ const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
 /// everything else here reports failures through that log.
 pub const PARAM_VALUE_MAX: usize = 255;
 
-pub const MOUNT_ATTR_RDONLY:      libc::c_uint = 0x0000_0001;
-pub const MOUNT_ATTR_NOSUID:      libc::c_uint = 0x0000_0002;
-pub const MOUNT_ATTR_NODEV:       libc::c_uint = 0x0000_0004;
-pub const MOUNT_ATTR_NOEXEC:      libc::c_uint = 0x0000_0008;
-pub const MOUNT_ATTR_NOATIME:     libc::c_uint = 0x0000_0010;
-pub const MOUNT_ATTR_STRICTATIME: libc::c_uint = 0x0000_0020;
-pub const MOUNT_ATTR_NODIRATIME:  libc::c_uint = 0x0000_0080;
+pub const MOUNT_ATTR_RDONLY:      core::ffi::c_uint = 0x0000_0001;
+pub const MOUNT_ATTR_NOSUID:      core::ffi::c_uint = 0x0000_0002;
+pub const MOUNT_ATTR_NODEV:       core::ffi::c_uint = 0x0000_0004;
+pub const MOUNT_ATTR_NOEXEC:      core::ffi::c_uint = 0x0000_0008;
+pub const MOUNT_ATTR_NOATIME:     core::ffi::c_uint = 0x0000_0010;
+pub const MOUNT_ATTR_STRICTATIME: core::ffi::c_uint = 0x0000_0020;
+pub const MOUNT_ATTR_NODIRATIME:  core::ffi::c_uint = 0x0000_0080;
 
 /// MS_LAZYTIME, which libc doesn't define.
-pub const MS_LAZYTIME: libc::c_ulong = 1 << 25;
+pub const MS_LAZYTIME: core::ffi::c_ulong = 1 << 25;
 
 /// Translate the per-mount MS_* flags to the MOUNT_ATTR_* fsmount() takes.
 ///
 /// Flags with no per-mount equivalent are dropped here on purpose; see
 /// [`sb_flag_params`] for where the superblock ones go instead. The two sets
 /// are not disjoint: MS_RDONLY is both, and has to be sent both ways.
-pub fn mount_attrs(mountflags: libc::c_ulong) -> libc::c_uint {
-    const MAP: &[(libc::c_ulong, libc::c_uint)] = &[
+pub fn mount_attrs(mountflags: core::ffi::c_ulong) -> core::ffi::c_uint {
+    const MAP: &[(core::ffi::c_ulong, core::ffi::c_uint)] = &[
         (libc::MS_RDONLY,      MOUNT_ATTR_RDONLY),
         (libc::MS_NOSUID,      MOUNT_ATTR_NOSUID),
         (libc::MS_NODEV,       MOUNT_ATTR_NODEV),
@@ -125,8 +123,8 @@ pub fn mount_attrs(mountflags: libc::c_ulong) -> libc::c_uint {
 /// filesystem to open its devices read-only. Send only the former and a
 /// write-protected device fails the mount outright - the filesystem asks for
 /// O_RDWR and gets EACCES, and mount(8)'s read-only retry has nothing to change.
-pub fn sb_flag_params(mountflags: libc::c_ulong) -> Vec<&'static str> {
-    const MAP: &[(libc::c_ulong, &str)] = &[
+pub fn sb_flag_params(mountflags: core::ffi::c_ulong) -> Vec<&'static str> {
+    const MAP: &[(core::ffi::c_ulong, &str)] = &[
         (libc::MS_RDONLY,      "ro"),
         (libc::MS_SYNCHRONOUS, "sync"),
         (libc::MS_DIRSYNC,     "dirsync"),
@@ -172,19 +170,11 @@ impl FsContext {
     pub fn open(fstype: &str) -> io::Result<Option<Self>> {
         let fstype = CString::new(fstype).map_err(|_| invalid_input("filesystem type"))?;
 
-        let fd = unsafe {
-            libc::syscall(libc::SYS_fsopen, fstype.as_ptr(), FSOPEN_CLOEXEC)
-        } as libc::c_int;
-
-        if fd < 0 {
-            let err = io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(libc::ENOSYS) => Ok(None),
-                _ => Err(err),
-            };
+        match mount::fsopen(fstype.as_c_str(), mount::FsOpenFlags::FSOPEN_CLOEXEC) {
+            Ok(fd)                        => Ok(Some(Self { fd })),
+            Err(rustix::io::Errno::NOSYS) => Ok(None),
+            Err(e)                        => Err(e.into()),
         }
-
-        Ok(Some(Self { fd: unsafe { OwnedFd::from_raw_fd(fd) } }))
     }
 
     /// fsconfig(2): set one parameter, with a value (`Some`) or as a bare flag
@@ -195,12 +185,11 @@ impl FsContext {
             .map(|v| CString::new(v).map_err(|_| invalid_input("parameter value")))
             .transpose()?;
 
-        let (cmd, value_ptr) = match &c_value {
-            Some(v) => (FSCONFIG_SET_STRING, v.as_ptr()),
-            None    => (FSCONFIG_SET_FLAG,   std::ptr::null()),
-        };
-
-        self.fsconfig(cmd, c_key.as_ptr(), value_ptr)
+        match &c_value {
+            Some(v) => mount::fsconfig_set_string(self.fd.as_fd(), c_key.as_c_str(), v.as_c_str())?,
+            None    => mount::fsconfig_set_flag(self.fd.as_fd(), c_key.as_c_str())?,
+        }
+        Ok(())
     }
 
     /// Ask bcachefs for a status channel, and get the file descriptor back.
@@ -221,7 +210,7 @@ impl FsContext {
                 self.fd.as_raw_fd(),
                 FSCONFIG_SET_FLAG,
                 key.as_ptr(),
-                std::ptr::null::<libc::c_char>(),
+                std::ptr::null::<core::ffi::c_char>(),
                 0,
             )
         };
@@ -243,21 +232,14 @@ impl FsContext {
     /// where a filesystem does its real work, and where it has the most to say
     /// if it fails.
     pub fn create(&self) -> io::Result<()> {
-        self.fsconfig(FSCONFIG_CMD_CREATE, std::ptr::null(), std::ptr::null())
+        Ok(mount::fsconfig_create(self.fd.as_fd())?)
     }
 
     /// fsmount(2): turn the created superblock into a detached mount. Attach it
     /// with [`move_mount`].
-    pub fn fsmount(&self, attrs: libc::c_uint) -> io::Result<OwnedFd> {
-        let fd = unsafe {
-            libc::syscall(libc::SYS_fsmount, self.fd.as_raw_fd(), FSMOUNT_CLOEXEC, attrs)
-        } as libc::c_int;
-
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    pub fn fsmount(&self, attrs: core::ffi::c_uint) -> io::Result<OwnedFd> {
+        Ok(mount::fsmount(self.fd.as_fd(), mount::FsMountFlags::FSMOUNT_CLOEXEC,
+                          mount::MountAttrFlags::from_bits_retain(attrs))?)
     }
 
     /// Read out everything the kernel has logged against this context.
@@ -274,14 +256,12 @@ impl FsContext {
         // the log is empty. Any other error also ends the loop; there's nothing
         // useful to do about it while already reporting a failure.
         loop {
-            let n = unsafe {
-                libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len())
+            let n = match rustix::io::read(&self.fd, &mut buf[..]) {
+                Ok(n) if n > 0 => n,
+                _ => break,
             };
-            if n <= 0 {
-                break;
-            }
 
-            let line = String::from_utf8_lossy(&buf[..n as usize]);
+            let line = String::from_utf8_lossy(&buf[..n]);
             let line = line.trim_end_matches('\n');
 
             let (level, text) = match line.split_once(' ') {
@@ -297,23 +277,6 @@ impl FsContext {
 
         msgs
     }
-
-    fn fsconfig(
-        &self,
-        cmd: libc::c_uint,
-        key: *const libc::c_char,
-        value: *const libc::c_char,
-    ) -> io::Result<()> {
-        let ret = unsafe {
-            libc::syscall(libc::SYS_fsconfig, self.fd.as_raw_fd(), cmd, key, value, 0)
-        };
-
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(())
-    }
 }
 
 /// move_mount(2): attach a detached mount from [`FsContext::fsmount`] to a path.
@@ -321,20 +284,7 @@ impl FsContext {
 /// Dropping the mount fd without doing this discards the mount and releases the
 /// superblock.
 pub fn move_mount(mnt: &OwnedFd, target: &CStr) -> io::Result<()> {
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_move_mount,
-            mnt.as_raw_fd(), c"".as_ptr(),
-            libc::AT_FDCWD,  target.as_ptr(),
-            libc::MOVE_MOUNT_F_EMPTY_PATH,
-        )
-    };
-
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(())
+    Ok(mount::move_mount(mnt.as_fd(), c"", rustix::fs::CWD, target, mount::MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH)?)
 }
 
 #[cfg(test)]
