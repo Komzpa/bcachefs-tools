@@ -1,0 +1,288 @@
+// SPDX-License-Identifier: GPL-2.0
+
+/* Inserting into a given leaf node (last stage of insert): */
+
+use core::sync::atomic::Ordering::Relaxed;
+
+
+use super::aux_tree::pack_pos_or_unpacked;
+use super::iter::KeyIter;
+use super::keys::key_at;
+use super::sort::maybe_compact_whiteouts;
+use super::{BtreeNode, NodeContents};
+use crate::btree::bkey::{BkeyI, BkeyP, BKEY_U64S};
+use crate::btree::trans_attempt::lockrestart_do;
+use crate::btree::interior::check_topology_msg;
+use crate::btree::iter::{BtreeTrans, TransAttempt};
+use crate::btree::path::{LockedNode, PathIdx, Paths, PathsUpdates, Write};
+use crate::btree::types::BtreeWriteType;
+use crate::btree::write::{init_next, node_write, post_write_cleanup, BtreeWriteFlags};
+use crate::c;
+use crate::errcode::{BchError, Errcode};
+use crate::format::{BkeyType, Bpos};
+use crate::fs::Fs;
+use crate::journal::pins::PinHolder;
+use crate::types::Le64;
+use crate::os::kernel::unlikely;
+use crate::util::log::LogMsg;
+
+/// A whiteout for @pos - packed, if it packs - in @b's unwritten whiteouts:
+/// for a deletion of a key a write still has to see deleted.
+fn push_whiteout(b: &mut LockedNode<'_, BtreeNode, Write>, pos: Bpos) {
+    assert!(b.keys_u64s_remaining(b.contents()) >= BKEY_U64S, "no room in a node for a whiteout");
+    ebug_assert!(!b.flags.just_written());
+
+    let mut k = pack_pos_or_unpacked(b.node(), pos);
+    let (buf, at) = k.as_buf_mut();
+    let k = &mut buf[usize::from(at)..];
+    let p = BkeyP::from_slice_mut(k).expect("a key just packed");
+    p.set_needs_whiteout(true);
+    let u64s = p.u64s();
+
+    b.whiteout_u64s.set(b.whiteout_u64s.get() + u64s as u16);
+    let at = b.unwritten_whiteouts().start;
+    b.keys_mut().buf[at..at + u64s].copy_from_slice(&k[..u64s]);
+}
+
+impl BtreeNode {
+    #[inline]
+    pub fn add_journal_pin(&self, fs: &Fs, seq: u64) {
+        fs.journal.pin_add(seq, self.current_write(), journal_pin_type_btree(self.c.level.get()));
+    }
+}
+
+fn journal_pin_type_btree(level: u8) -> c::JournalPinType {
+    c::JournalPinType::from_bits(c::JournalPinType::JOURNAL_PIN_TYPE_btree0 as u32 - u32::from(level))
+}
+
+impl<const I: usize> PinHolder<crate::field!(writes[I])> for BtreeNode {
+    fn journal_flush(&self, fs: &Fs, seq: u64) -> Result<(), BchError> {
+        /*
+         * The journal pin doesn't pin the node: another thread can write the
+         * node and drop the pin while we run, and reclaim can then reuse the
+         * node's memory. Snapshot the identity to arm the reuse check: gone
+         * already (unhashed nodes can't be dirty), or going while we'd sleep
+         * on the lock (aborting the attempt), means the pinned write is done
+         * and there's nothing to flush.
+         */
+        let hash_val = self.hash_val();
+        if hash_val == 0 {
+            return Ok(());
+        }
+
+        let trans = crate::btree_trans!(fs);
+        let ret = lockrestart_do(&trans, |t| {
+            let trans = t.trans();
+            let path_idx = trans.node_lock_with_path(&mut trans.paths(), &self.c, c::SixLockType::SIX_LOCK_read,
+                                                     hash_val)?;
+
+            let _ = self.flags.fetch_update(Relaxed, Relaxed, |f| {
+                (f.dirty() && f.write_idx() as usize == I && self.writes[I].seq() == seq).then(|| {
+                    f.with_write_type(BtreeWriteType::journal_reclaim)
+                     .with_need_write(true)
+                })
+            });
+
+            let held = trans.paths().held_btree_node(path_idx, self.c.level.get().into())
+                .expect("the node, locked by node_lock_with_path()");
+            node_write(fs, held, BtreeWriteType::initial, BtreeWriteFlags::only_if_need);
+
+            let mut paths = trans.paths();
+            trans.node_unlock(&mut paths, path_idx, self.c.level.get().into());
+            trans.path_put(&mut paths, path_idx, true);
+            Ok(())
+        });
+
+        match ret {
+            Err(e) if e.matches(Errcode::no_btree_node_reused) => Ok(()),
+            r => r,
+        }
+    }
+}
+
+impl BtreeTrans<'_> {
+    #[inline]
+    pub(in crate::btree) fn node_prep_for_write(&self, t: &TransAttempt<'_, '_>, pu: &mut PathsUpdates<'_, '_>,
+                                                b: &mut LockedNode<'_, BtreeNode, Write>) {
+        let fs = self.fs();
+
+        if unlikely(b.flags.just_written()) && post_write_cleanup(fs, b) {
+            self.node_reinit_iter(t, pu, b.held());
+        }
+
+        /*
+         * If the last bset has been written, or if it's gotten too big - start
+         * a new bset to insert into:
+         */
+        if b.want_new_bset(b.contents(), fs).is_some() {
+            init_next(t, pu, b);
+        }
+    }
+
+    /// Handle overwrites and do insert, for non extents.
+    ///
+    /// # Safety
+    /// @b is path @idx's node at its level; @node_iter is the path's iterator
+    /// there, or one of the caller's.
+    #[inline(always)]
+    pub(crate) unsafe fn bset_insert_key(&self, paths: &mut Paths<'_>, idx: PathIdx,
+                                         b: &mut LockedNode<'_, BtreeNode, Write>, node_iter: *mut KeyIter,
+                                         insert: &mut BkeyI) -> bool {
+        let deleting = insert.k.key_type().is_deleted();
+
+        let k = {
+            let contents = b.contents();
+            let keys = b.keys(contents);
+
+            ebug_assert!(!b.flags.just_written());
+            ebug_assert!(!b.bset_written(contents.last_set()));
+            ebug_assert!(!(deleting && insert.k.val_u64s() != 0));
+            ebug_assert!(insert.k.p >= contents.data().min_key);
+            ebug_assert!(insert.k.p <= contents.data().max_key);
+            ebug_assert!(usize::from(insert.k.u64s) <= b.keys_u64s_remaining(contents));
+            ebug_assert!(b.c.level.get() != 0 || insert.k.p == paths[idx].pos);
+
+            let k = unsafe { &*node_iter }.peek_all()
+                .filter(|&k| contents.cmp_left_packed(keys.key_at(k), &insert.k.p).is_eq());
+
+            /* @k is the key being overwritten/deleted, if any: */
+            ebug_assert!(!k.is_some_and(|k| keys.key_at(k).key_type().is_deleted()));
+            k
+        };
+
+        /* Deleting, but not found? nothing to do: */
+        if deleting && k.is_none() {
+            return false;
+        }
+
+        let k_writeable = k.is_some_and(|k| k >= b.contents().last_set().first_offset());
+        let mut clobber_u64s = 0;
+
+        if let Some(k) = k {
+            let needs_whiteout = {
+                let mut keys = b.keys_mut();
+                let set = keys.as_keys().bkey_to_bset(k);
+
+                keys.nr.account_key_drop(set, key_at(keys.buf, k));
+
+                let key = keys.key_at_mut(k);
+                key.set_key_type(BkeyType::deleted);
+                if k_writeable {
+                    clobber_u64s = key.u64s() as u16;
+                }
+
+                let needs_whiteout = key.needs_whiteout();
+                key.set_needs_whiteout(false);
+                needs_whiteout
+            };
+
+            if needs_whiteout {
+                if deleting {
+                    push_whiteout(b, insert.k.p);
+                } else {
+                    insert.k.format_bits.set_needs_whiteout(1);
+                }
+            }
+
+            if !k_writeable {
+                self.path_fix_key_modified(paths, b.held(), k);
+            }
+        }
+
+        let (where_, new_u64s) = {
+            let mut keys = b.keys_mut();
+
+            if deleting {
+                let k = k.expect("a deletion with no key to delete returned above");
+                if k_writeable {
+                    keys.bset_delete(k, clobber_u64s);
+                }
+                (k, 0)
+            } else {
+                let where_ = match k {
+                    Some(k) if k_writeable => k,
+                    _ => unsafe { &*node_iter }.bset_pos(keys.sets.last().expect("a node has a bset")),
+                };
+
+                keys.bset_insert(where_, insert, clobber_u64s);
+                (where_, key_at(keys.buf, where_).u64s() as u16)
+            }
+        };
+
+        if clobber_u64s != new_u64s {
+            unsafe { self.node_iter_fix(paths, idx, b.held(), node_iter, where_, clobber_u64s, new_u64s) };
+        }
+
+        true
+    }
+
+    #[inline(never)]
+    fn insert_topology_check(&self, t: &TransAttempt<'_, '_>, b: LockedNode<'_, BtreeNode>) -> bool {
+        let fs = self.fs();
+        let mut msg = LogMsg::new(fs);
+        msg.set_suppressed(true);
+
+        let bad = check_topology_msg(t, b, &mut msg).is_err();
+        if bad {
+            crate::prt!(&mut msg, "Btree update created topology error:\n");
+            self.updates_to_text(&mut msg);
+            fs.emergency_read_only(&mut msg);
+        }
+        bad
+    }
+
+    /// Insert one key into a leaf node: path @idx is at @insert's pos, and
+    /// @journal_seq is the sequence number of the journal reservation.
+    #[inline]
+    pub(in crate::btree) fn insert_key_leaf(&self, t: &TransAttempt<'_, '_>, pu: &mut PathsUpdates<'_, '_>,
+                                            idx: PathIdx, insert: &mut BkeyI, journal_seq: u64) {
+        let fs = self.fs();
+        let paths = &mut pu.paths;
+        let level = paths[idx].level() as usize;
+        let mut b = paths.write_locked_node(idx, level);
+        let node_iter = &raw mut paths[idx].l[level].iter;
+
+        let set_u64s = |c: &NodeContents| c.last_set().u64s() as isize;
+        let live_u64s = |c: &NodeContents| c.nr.live_u64s as isize;
+        let (old_u64s, old_live_u64s) = (set_u64s(b.contents()), live_u64s(b.contents()));
+
+        if unlikely(!unsafe { self.bset_insert_key(paths, idx, &mut b, node_iter, insert) }) {
+            return;
+        }
+
+        if unlikely(b.c.level.get() != 0 && self.insert_topology_check(t, b.held())) {
+            return;
+        }
+
+        {
+            let set = b.contents().last_set().data_offset;
+            let mut keys = b.keys_mut();
+            let i = keys.bset_head_mut(set);
+            i.journal_seq = Le64::new(journal_seq.max(i.journal_seq.get()));
+        }
+
+        b.add_journal_pin(fs, journal_seq);
+
+        if unlikely(!b.flags.dirty()) {
+            fs.btree_node_set_dirty(b.node());
+        }
+
+        let live_u64s_added = live_u64s(b.contents()) - old_live_u64s;
+        let u64s_added = set_u64s(b.contents()) - old_u64s;
+
+        if live_u64s_added < 0 {
+            let contents = b.contents();
+            let live = contents.nr.live_u64s as isize;
+            for sib in &contents.sib_u64s {
+                if sib.get() != u16::MAX {
+                    sib.set(live.max(sib.get() as isize + live_u64s_added) as u16);
+                }
+            }
+        }
+
+        if u64s_added > live_u64s_added && unlikely(maybe_compact_whiteouts(&mut b)) {
+            self.node_reinit_iter(t, pu, b.held());
+        }
+    }
+}
+

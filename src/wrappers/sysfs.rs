@@ -4,6 +4,7 @@ use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bcachefs_kernel::format::MetadataVersion;
 
 use crate::device_multipath::preferred_multipath_devnode_for_block_name;
 
@@ -93,17 +94,20 @@ pub fn read_sysfs_fd_str(dirfd: BorrowedFd<'_>, path: &str) -> io::Result<String
 
 const KERNEL_VERSION_PATH: &str = "/sys/module/bcachefs/parameters/version";
 
-/// Read the bcachefs kernel module metadata version.
-/// Returns 0 if the module isn't loaded.
-pub fn bcachefs_kernel_version() -> u64 {
-    read_sysfs_u64(Path::new(KERNEL_VERSION_PATH)).unwrap_or(0)
+/// Read the bcachefs kernel module metadata version: None if the module isn't
+/// loaded.
+pub fn bcachefs_kernel_version() -> Option<MetadataVersion> {
+    read_sysfs_u64(Path::new(KERNEL_VERSION_PATH)).ok()
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|&v| v != 0)
+        .map(MetadataVersion)
 }
 
 /// Write a string value to a sysfs attribute file relative to a directory fd.
 ///
 /// Both failures are returned rather than discarded: a non-runtime option's
-/// attribute is created 0444 (`fs/opts.c`: `.attr.mode = (_flags) & OPT_RUNTIME
-/// ? 0644 : 0444`), so opening it O_WRONLY fails with EACCES, and a caller that
+/// attribute is created 0444 (OPT_FILES, fs/debug/sysfs.rs), so opening it
+/// O_WRONLY fails with EACCES, and a caller that
 /// ignored that reported success while changing nothing.
 pub fn sysfs_write_str(
     sysfs_fd: BorrowedFd<'_>,

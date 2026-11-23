@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kent.overstreet@linux.dev>
+Date: Mon, 16 Nov 2026 16:42:27 -0500
+Subject: [PATCH] helpers for kernels older than the tree
+
+bcachefs.ko carries this stack to kernels built without Rust, back to
+6.16, so the helpers can't assume REF's C:
+
+  - vrealloc_node_align_noprof is exported only from 7.0 (d60769075013).
+    Before that the helper WARNs and fails: bcachefs's Vmalloc, in
+    os/linux_kernel/alloc.rs, calls __vmalloc_noprof() and vfree()
+    there instead; KVmalloc goes through the exported kvrealloc.
+  - krealloc_node_align()/kvrealloc_node_align() are 6.18+. Before that,
+    pad the size to the alignment and call krealloc()/kvrealloc(): the slab
+    allocators' alignment guarantees make that the requested alignment, as
+    the kernel's own Rust allocator relied on before the API existed.
+  - _copy_{from,to}_user() on an arch that inlines copy_{from,to}_user()
+    (arm64): before 7.2 (c02be2ad2b88) it says so with
+    INLINE_COPY_FROM_USER/INLINE_COPY_TO_USER rather than INLINE_COPY_USER;
+    and before 6.19 the header declares them there while lib/usercopy.c
+    defines them only with CONFIG_RUST, so supply them, as it would.
+  - Srcu's: before 7.3, __init_srcu_struct() exists only with
+    CONFIG_DEBUG_LOCK_ALLOC - init_srcu_struct() is the function without
+    it - and srcu_readers_active() is srcutree.c's own, so Srcu's drop
+    doesn't get to warn of a leaked guard; cleanup_srcu_struct() still
+    WARNs of live readers.
+  - EFSBADCRC and EFSCORRUPTED are errno.h's from 7.0 (602544773763);
+    before, the filesystems defined them, as EBADMSG and EUCLEAN, which
+    the bindings do there. EFTYPE is a new errno in 7.2 (cf1b04aaef8b),
+    so error::code has no EFTYPE: an older kernel has no such error.
+  - ARCH_WARN_ASM, which warn_on!'s asm embeds the bug table entry with,
+    is 6.17's on every arch (rust-6.17): before, warn_on! is the WARN_ON()
+    helper, as on LoongArch and ARM. Srcu's drop is its user.
+
+Each goes when the oldest kernel bcachefs supports has what it stands in
+for.
+
+---
+
+diff --git a/bindings/bindings_helper.h b/bindings/bindings_helper.h
+index 58830be7d1c2..ecc398be5890 100644
+--- a/bindings/bindings_helper.h
++++ b/bindings/bindings_helper.h
+@@ -69,6 +69,17 @@
+ #include <linux/workqueue.h>
+ #include <linux/xarray.h>
+ 
++/*
++ * vendored: errno.h's since 7.0; before, the filesystems' own headers
++ * defined them, to these
++ */
++#ifndef EFSBADCRC
++#define EFSBADCRC	EBADMSG
++#endif
++#ifndef EFSCORRUPTED
++#define EFSCORRUPTED	EUCLEAN
++#endif
++
+ /* `bindgen` gets confused at certain things. */
+ const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
+ const size_t RUST_CONST_HELPER_ARCH_KMALLOC_MINALIGN = ARCH_KMALLOC_MINALIGN;
+diff --git a/helpers/slab.c b/helpers/slab.c
+index 9279f082467d..8010967743aa 100644
+--- a/helpers/slab.c
++++ b/helpers/slab.c
+@@ -1,17 +1,35 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
++#include <linux/align.h>
+ #include <linux/slab.h>
++#include <linux/version.h>
+ 
+ __rust_helper void *__must_check __realloc_size(2)
+ rust_helper_krealloc_node_align(const void *objp, size_t new_size, unsigned long align,
+ 				gfp_t flags, int node)
+ {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+ 	return krealloc_node_align(objp, new_size, align, flags, node);
++#else
++	/*
++	 * krealloc_node_align() is 6.18+. Pad size to a multiple of align:
++	 * with the slab allocators' alignment guarantees that satisfies the
++	 * requested alignment - it's what the kernel's own Rust allocator
++	 * (Kmalloc::aligned_layout) relied on before this API existed. The
++	 * NUMA hint is dropped; krealloc has no node variant here.
++	 */
++	return krealloc(objp, ALIGN(new_size, align), flags);
++#endif
+ }
+ 
+ __rust_helper void *__must_check __realloc_size(2)
+ rust_helper_kvrealloc_node_align(const void *p, size_t size, unsigned long align,
+ 				 gfp_t flags, int node)
+ {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+ 	return kvrealloc_node_align(p, size, align, flags, node);
++#else
++	/* As above; the vmalloc fallback is page-aligned regardless. */
++	return kvrealloc(p, ALIGN(size, align), flags);
++#endif
+ }
+diff --git a/helpers/srcu.c b/helpers/srcu.c
+index 1a2f563640e0..66a6ae0816d3 100644
+--- a/helpers/srcu.c
++++ b/helpers/srcu.c
+@@ -1,17 +1,36 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <linux/srcu.h>
++#include <linux/version.h>
+ 
+ __rust_helper int rust_helper_init_srcu_struct_with_key(struct srcu_struct *ssp,
+ 							const char *name,
+ 							struct lock_class_key *key)
+ {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0) || defined(CONFIG_DEBUG_LOCK_ALLOC)
+ 	return __init_srcu_struct(ssp, name, key);
++#else
++	/*
++	 * Before 7.3, __init_srcu_struct() is lockdep's: without
++	 * CONFIG_DEBUG_LOCK_ALLOC, init_srcu_struct() is the function, and has
++	 * no use for the name or key.
++	 */
++	return init_srcu_struct(ssp);
++#endif
+ }
+ 
+ __rust_helper bool rust_helper_srcu_readers_active(struct srcu_struct *ssp)
+ {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
+ 	return srcu_readers_active(ssp);
++#else
++	/*
++	 * Before 7.3 srcu_readers_active() is srcutree.c's own. Srcu's drop asks
++	 * only to warn of a leaked guard and wait it out; cleanup_srcu_struct()
++	 * still WARNs of live readers itself.
++	 */
++	return false;
++#endif
+ }
+ 
+ __rust_helper int rust_helper_srcu_read_lock(struct srcu_struct *ssp)
+diff --git a/helpers/uaccess.c b/helpers/uaccess.c
+index 6e59cc9c665c..b87105b008d3 100644
+--- a/helpers/uaccess.c
++++ b/helpers/uaccess.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <linux/uaccess.h>
++#include <linux/version.h>
+ 
+ __rust_helper unsigned long
+ rust_helper_copy_from_user(void *to, const void __user *from, unsigned long n)
+@@ -14,16 +15,48 @@ rust_helper_copy_to_user(void __user *to, const void *from, unsigned long n)
+ 	return copy_to_user(to, from, n);
+ }
+ 
+-#ifdef INLINE_COPY_USER
++/*
++ * An arch that inlines copy_{from,to}_user() has no out-of-line
++ * _copy_{from,to}_user() for Rust to call. It says so with INLINE_COPY_USER
++ * - before 7.2, INLINE_COPY_FROM_USER and INLINE_COPY_TO_USER, which this
++ * build has to take too: it builds against kernels back to 6.16.
++ */
++#if defined(INLINE_COPY_USER) || defined(INLINE_COPY_FROM_USER)
+ __rust_helper
+ unsigned long rust_helper__copy_from_user(void *to, const void __user *from, unsigned long n)
+ {
+ 	return _inline_copy_from_user(to, from, n);
+ }
++#endif
+ 
++#if defined(INLINE_COPY_USER) || defined(INLINE_COPY_TO_USER)
+ __rust_helper
+ unsigned long rust_helper__copy_to_user(void __user *to, const void *from, unsigned long n)
+ {
+ 	return _inline_copy_to_user(to, from, n);
+ }
+ #endif
++
++/*
++ * Before 6.19 the header declares _copy_{from,to}_user() even on an arch that
++ * inlines them, and the kernel defines and exports them there only with
++ * CONFIG_RUST - so a pre-6.19 kernel without Rust, which is what this stack
++ * is for, has the declaration and no definition. The bindings take the
++ * declared function over the helpers above, so supply it, as lib/usercopy.c
++ * would.
++ */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0) && !defined(CONFIG_RUST)
++#ifdef INLINE_COPY_FROM_USER
++unsigned long _copy_from_user(void *to, const void __user *from, unsigned long n)
++{
++	return _inline_copy_from_user(to, from, n);
++}
++#endif
++
++#ifdef INLINE_COPY_TO_USER
++unsigned long _copy_to_user(void __user *to, const void *from, unsigned long n)
++{
++	return _inline_copy_to_user(to, from, n);
++}
++#endif
++#endif
+diff --git a/helpers/vmalloc.c b/helpers/vmalloc.c
+index 6aed13292313..b98188151ed7 100644
+--- a/helpers/vmalloc.c
++++ b/helpers/vmalloc.c
+@@ -1,13 +1,26 @@
+ // SPDX-License-Identifier: GPL-2.0
+ 
+ #include <linux/mm.h>
++#include <linux/version.h>
+ #include <linux/vmalloc.h>
+ 
+ __rust_helper void *__must_check __realloc_size(2)
+ rust_helper_vrealloc_node_align(const void *p, size_t size, unsigned long align,
+ 				gfp_t flags, int node)
+ {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+ 	return vrealloc_node_align(p, size, align, flags, node);
++#else
++	/*
++	 * vrealloc_node_align_noprof gained EXPORT_SYMBOL only in 7.0 (commit
++	 * d60769075013); on older kernels the bundled helper can't link it from a
++	 * module. bcachefs's Vmalloc, os/linux_kernel/alloc.rs's, calls
++	 * __vmalloc_noprof() and vfree() there instead, and doesn't come
++	 * here - WARN if that ever changes.
++	 */
++	WARN_ONCE(1, "bcachefs: Vmalloc realloc unsupported on this kernel (vrealloc not exported pre-7.0)\n");
++	return NULL;
++#endif
+ }
+ 
+ __rust_helper bool rust_helper_is_vmalloc_addr(const void *x)
+diff --git a/kernel/bug.rs b/kernel/bug.rs
+index 3b40b0bd37b5..feeb8803a8be 100644
+--- a/kernel/bug.rs
++++ b/kernel/bug.rs
+@@ -10,6 +10,7 @@
+ #[doc(hidden)]
+ #[cfg(not(testlib))]
+ #[cfg(all(CONFIG_BUG, not(CONFIG_UML), not(CONFIG_LOONGARCH), not(CONFIG_ARM)))]
++#[cfg(linux_ge = "6.17")]
+ #[cfg(CONFIG_DEBUG_BUGVERBOSE)]
+ macro_rules! warn_flags {
+     ($file:expr, $flags:expr) => {
+@@ -50,6 +51,7 @@ macro_rules! warn_flags {
+ #[doc(hidden)]
+ #[cfg(not(testlib))]
+ #[cfg(all(CONFIG_BUG, not(CONFIG_UML), not(CONFIG_LOONGARCH), not(CONFIG_ARM)))]
++#[cfg(linux_ge = "6.17")]
+ #[cfg(not(CONFIG_DEBUG_BUGVERBOSE))]
+ macro_rules! warn_flags {
+     ($file:expr, $flags:expr) => {
+@@ -106,7 +108,8 @@ macro_rules! warn_flags {
+ #[macro_export]
+ #[doc(hidden)]
+ #[cfg(not(testlib))]
+-#[cfg(all(CONFIG_BUG, any(CONFIG_LOONGARCH, CONFIG_ARM)))]
++// vendored: and before 6.17, which has no ARCH_WARN_ASM for the asm above
++#[cfg(all(CONFIG_BUG, any(CONFIG_LOONGARCH, CONFIG_ARM, all(not(CONFIG_UML), not(linux_ge = "6.17")))))]
+ macro_rules! warn_flags {
+     ($file:expr, $flags:expr) => {
+         if false {
+diff --git a/kernel/error.rs b/kernel/error.rs
+index 9003a1b86da8..008c58744bd2 100644
+--- a/kernel/error.rs
++++ b/kernel/error.rs
+@@ -166,7 +166,8 @@ pub mod code {
+     declare_err!(ENOTRECOVERABLE, "State not recoverable.");
+     declare_err!(ERFKILL, "Operation not possible due to RF-kill.");
+     declare_err!(EHWPOISON, "Memory page has hardware error.");
+-    declare_err!(EFTYPE, "Wrong file type for the intended operation.");
++    // vendored: EFTYPE, "Wrong file type for the intended operation." - a 7.2
++    // errno, which older kernels have no such error as
+ 
+     // From `include/linux/errno.h`.
+     declare_err!(ERESTARTSYS, "Restart the system call.");
